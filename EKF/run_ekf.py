@@ -16,7 +16,7 @@ IMU input: raw (freeze-corrected) or, with --imu_onnx, the learned correction.
 
 Run from the EKF folder, e.g.
     python run_ekf.py --imu_config ../IMU/configs/exp/UAV/tilt_rotate.conf ^
-        --splits inference --vo_dir vo_predictions --horizons 3000 6000 12000
+        --splits inference --vo_dir vo_predictions --horizons 30s 1m 2m 5m 10m --per_horizon
 """
 import argparse
 import csv
@@ -34,6 +34,7 @@ from ekf import pipeline as PL                                   # noqa: E402
 from ekf.eskf import ESKFParams                                  # noqa: E402
 from ekf.vo import load_vo_csv, simulate_vo                      # noqa: E402
 from ekf import vo_onnx                                          # noqa: E402
+from ekf import horizons as HZ                                   # noqa: E402
 
 
 def load_config(path):
@@ -104,15 +105,77 @@ def print_table(split, table, arms):
         "%-30s" % ("%s  [%s]" % (n, " / ".join(arms))) for n, _, _ in PL.SUMMARY)
     print(head)
     print("-" * len(head))
-    for h, n, res in table:
+    for h, n, nf, res in table:
+        if res is None:
+            print("%-8s %5d | no window this long (%d flights long enough)"
+                  % (HZ.label(h), 0, nf))
+            continue
         cells = []
         for name, _, _ in PL.SUMMARY:
             vals = " / ".join("%7.3f" % res[a][name] for a in arms)
             ratio = res["ekf"][name] / max(res["imu"][name], 1e-12) if "ekf" in res else float("nan")
             cells.append("%-30s" % ("%s  %4.2f" % (vals, ratio)))
-        print("%-8s %5d | %s" % ("%gs" % (h / 100.0), n, " | ".join(cells)))
+        print("%-8s %5d | %s   [%d flights]" % (HZ.label(h), n, " | ".join(cells), nf))
     print("units: vel m/s, dir deg, pos m.  *_rmse / pos_error AT the horizon (pos_error is the")
     print("mean over windows); *_max_error is the worst frame anywhere inside [0, T].")
+
+
+def evaluate(a, ctx, split, W, horizons, stats):
+    """Run the three arms on every window of length W; score the given horizons."""
+    cfg, params, aid, lever = ctx["cfg"], ctx["params"], ctx["aid"], ctx["lever"]
+    onnx, npz = ctx["onnx"], ctx["npz"]
+    rows, n = [], 0
+    step = min(HZ.parse(a.step), W) if a.step else None
+    for win in PL.load_windows(a.imu_config, split, W, csv=a.csv, data_root=a.data_root,
+                               max_flights=a.max_flights, first_only=a.first_only, step=step):
+        if a.max_windows and n >= a.max_windows:
+            break
+        vo = vo_for_flight(a, cfg, win["flight"], win)
+        if vo is None:
+            print("  [skip] %s: no VO file" % win["flight"])
+            continue
+        vo = vo.window(win["t"][0], win["t"][-1])
+        if len(vo) == 0:
+            print("  [skip] %s start %d: no VO sample inside the window -- check the "
+                  "clock (vo.time_offset_s)" % (win["flight"], win["start"]))
+            continue
+        # VO against GPS body velocity at the VO timestamps: a wrong clock offset or
+        # frame shows up here long before it shows up in the EKF numbers.
+        k = np.clip(np.searchsorted(win["t"], vo.t), 0, len(win["t"]) - 1)
+        vb_true = np.einsum("nji,nj->ni", PL.rot_source(win, "gt")[k], win["v_gt"][k])
+        stats["vo_err"].append(vo.v - vb_true)
+        if onnx is not None:
+            acc, gyro = PL.onnx_correct(win, onnx, ctx["att_source_net"])
+        else:
+            acc, gyro = win["acc"], win["gyro"]
+        arms = {}
+        arms["imu"] = PL.run_eskf(win, acc, gyro, params, aid)[:2]
+        arms["vo"] = PL.run_vo_dr(win, vo, aid.get("source") or "gt")
+        pe, ve, f = PL.run_eskf(win, acc, gyro, params, aid, vo=vo, lever=lever)
+        arms["ekf"] = (pe, ve)
+        stats["vel_ok"] += f.stats["vel"][0]
+        stats["vel_rej"] += f.stats["vel"][1]
+        stats["nis"] += f.stats["nis_vel"]
+        stats["ba"].append(f.ba)
+        stats["bg"].append(f.bg)
+        for h in horizons:
+            r = {"split": split, "flight": win["flight"], "start": win["start"],
+                 "window": W, "horizon": h, "tag": HZ.label(h), "vo_samples": len(vo)}
+            for arm, (p, v) in arms.items():
+                r.update({"%s_%s" % (arm, k): float(x)
+                          for k, x in PL.metrics_at(p, v, win, h).items()})
+            rows.append(r)
+        if a.out_npz:
+            key = "%s/%s/%d/%d" % (split, win["flight"], W, win["start"])
+            npz[key + "/t"] = win["t"][1:]
+            npz[key + "/gt_pos"], npz[key + "/gt_vel"] = win["p_gt"][1:], win["v_gt"][1:]
+            for arm, (p, v) in arms.items():
+                npz["%s/%s_pos" % (key, arm)], npz["%s/%s_vel" % (key, arm)] = p, v
+        if a.plot_dir:
+            plot_window(a.plot_dir, split, win, arms)
+        n += 1
+    stats["n"] += n
+    return rows
 
 
 def main(argv=None):
@@ -135,8 +198,16 @@ def main(argv=None):
     ap.add_argument("--vo_cache_dir", default=None,
                     help="--vo_onnx: save / reuse the VO output as <flight>_vo.csv here")
     ap.add_argument("--imu_onnx", default=None, help="learned IMU correction (export_onnx.py)")
-    ap.add_argument("--horizons", type=int, nargs="+", default=[3000, 6000, 12000],
-                    help="frames at 100 Hz; the window is the longest one")
+    ap.add_argument("--horizons", nargs="+", default=HZ.DEFAULT,
+                    help="30s 1m 2m ... 40m (or plain frames at 100 Hz, e.g. 3000)")
+    ap.add_argument("--per_horizon", action="store_true",
+                    help="score each horizon on its OWN windows of that length (every flight "
+                         "long enough for it counts).  Default: one window of the longest "
+                         "horizon, every shorter one read off its prefix -- paired rows, but "
+                         "only flights longer than the longest horizon count")
+    ap.add_argument("--step", default=None,
+                    help="spacing of window starts (e.g. 1m); default = the window length. "
+                         "Smaller lets long horizons fit shorter flights (overlapping windows)")
     ap.add_argument("--first_only", action="store_true")
     ap.add_argument("--max_flights", type=int, default=None)
     ap.add_argument("--max_windows", type=int, default=None)
@@ -155,7 +226,7 @@ def main(argv=None):
     params = ESKFParams.from_dict(cfg["eskf"])
     aid = cfg["attitude_aid"]
     lever = np.asarray(cfg["vo"].get("lever_arm_m", [0, 0, 0]), float)
-    horizons = sorted(a.horizons)
+    horizons = sorted(HZ.parse(h) for h in a.horizons)
     W = horizons[-1]
     onnx = None
     if a.imu_onnx:
@@ -164,76 +235,38 @@ def main(argv=None):
         print("[imu] learned correction: %s (%g s blocks)" % (a.imu_onnx, onnx.frames / 100.0))
     from pyhocon import ConfigFactory
     att_source_net = str(ConfigFactory.parse_file(a.imu_config).train.get("att_source", "gt"))
-    print("[ekf] window %g s | attitude aid %s | VO %s"
-          % (W / 100.0, aid.get("source"), "SIMULATED" if a.vo_sim else
+    print("[ekf] horizons %s | %s | attitude aid %s | VO %s"
+          % (" ".join(HZ.label(h) for h in horizons),
+             "own windows per horizon" if a.per_horizon else "nested in one %s window" % HZ.label(W),
+             aid.get("source"), "SIMULATED" if a.vo_sim else
              ("onnx %s" % a.vo_onnx if a.vo_onnx else (a.vo_csv or a.vo_dir))))
 
     all_rows, results, npz = [], {}, {}
+    ctx = dict(cfg=cfg, params=params, aid=aid, lever=lever, onnx=onnx,
+               att_source_net=att_source_net, npz=npz)
     for split in a.splits:
-        rows, n, t0 = [], 0, time.time()
-        stats = {"vel_ok": 0, "vel_rej": 0, "nis": [], "ba": [], "bg": [], "vo_err": []}
-        for win in PL.load_windows(a.imu_config, split, W, csv=a.csv, data_root=a.data_root,
-                                   max_flights=a.max_flights, first_only=a.first_only):
-            if a.max_windows and n >= a.max_windows:
-                break
-            vo = vo_for_flight(a, cfg, win["flight"], win)
-            if vo is None:
-                print("  [skip] %s: no VO file" % win["flight"])
-                continue
-            vo = vo.window(win["t"][0], win["t"][-1])
-            if len(vo) == 0:
-                print("  [skip] %s start %d: no VO sample inside the window -- check the "
-                      "clock (vo.time_offset_s)" % (win["flight"], win["start"]))
-                continue
-            # VO against GPS body velocity at the VO timestamps: a wrong clock offset or
-            # frame shows up here long before it shows up in the EKF numbers.
-            k = np.clip(np.searchsorted(win["t"], vo.t), 0, len(win["t"]) - 1)
-            vb_true = np.einsum("nji,nj->ni", PL.rot_source(win, "gt")[k], win["v_gt"][k])
-            stats["vo_err"].append(vo.v - vb_true)
-            if onnx is not None:
-                acc, gyro = PL.onnx_correct(win, onnx, att_source_net)
-            else:
-                acc, gyro = win["acc"], win["gyro"]
-            arms = {}
-            arms["imu"] = PL.run_eskf(win, acc, gyro, params, aid)[:2]
-            arms["vo"] = PL.run_vo_dr(win, vo, aid.get("source") or "gt")
-            pe, ve, f = PL.run_eskf(win, acc, gyro, params, aid, vo=vo, lever=lever)
-            arms["ekf"] = (pe, ve)
-            stats["vel_ok"] += f.stats["vel"][0]
-            stats["vel_rej"] += f.stats["vel"][1]
-            stats["nis"] += f.stats["nis_vel"]
-            stats["ba"].append(f.ba)
-            stats["bg"].append(f.bg)
-            for h in horizons:
-                r = {"split": split, "flight": win["flight"], "start": win["start"],
-                     "horizon": h, "vo_samples": len(vo)}
-                for arm, (p, v) in arms.items():
-                    r.update({"%s_%s" % (arm, k): float(x)
-                              for k, x in PL.metrics_at(p, v, win, h).items()})
-                rows.append(r)
-            if a.out_npz:
-                key = "%s/%s/%d" % (split, win["flight"], win["start"])
-                npz[key + "/t"] = win["t"][1:]
-                npz[key + "/gt_pos"], npz[key + "/gt_vel"] = win["p_gt"][1:], win["v_gt"][1:]
-                for arm, (p, v) in arms.items():
-                    npz["%s/%s_pos" % (key, arm)], npz["%s/%s_vel" % (key, arm)] = p, v
-            if a.plot_dir:
-                plot_window(a.plot_dir, split, win, arms)
-            n += 1
+        rows, t0 = [], time.time()
+        stats = {"n": 0, "vel_ok": 0, "vel_rej": 0, "nis": [], "ba": [], "bg": [], "vo_err": []}
+        groups = [(h, [h]) for h in horizons] if a.per_horizon else [(W, horizons)]
+        for win_len, hs in groups:
+            rows += evaluate(a, ctx, split, win_len, hs, stats)
         if not rows:
             print("[%s] no window" % split)
             continue
         table = []
         for h in horizons:
             hr = [r for r in rows if r["horizon"] == h]
-            table.append((h, len(hr), {arm: PL.reduce(hr, arm) for arm in ("imu", "vo", "ekf")}))
+            nf = len(set(r["flight"] for r in hr))
+            table.append((h, len(hr), nf,
+                          {arm: PL.reduce(hr, arm) for arm in ("imu", "vo", "ekf")} if hr else None))
         nis = np.array(stats["nis"])
         print("\n[%s] %d windows in %.1f s | VO updates %d accepted, %d gated out | "
               "VO NIS mean %.2f (3.0 = consistent) | final |ba| %.4f m/s^2, |bg| %.4f deg/s"
-              % (split, n, time.time() - t0, stats["vel_ok"], stats["vel_rej"],
+              % (split, stats["n"], time.time() - t0, stats["vel_ok"], stats["vel_rej"],
                  nis.mean() if len(nis) else float("nan"),
-                 np.linalg.norm(stats["ba"], axis=1).mean(),
-                 np.degrees(np.linalg.norm(stats["bg"], axis=1).mean())))
+                 np.linalg.norm(stats["ba"], axis=1).mean() if stats["ba"] else float("nan"),
+                 np.degrees(np.linalg.norm(stats["bg"], axis=1).mean()) if stats["bg"]
+                 else float("nan")))
         if stats["vo_err"]:
             e = np.concatenate(stats["vo_err"])
             print("[%s] VO vs GPS body velocity (FLU) at VO times: bias %s  rmse %s m/s"
@@ -243,6 +276,12 @@ def main(argv=None):
             print("*** VO IS SIMULATED from GPS truth: these numbers test the filter, they are "
                   "NOT a VO result.")
         print_table(split, table, ("imu", "vo", "ekf"))
+        if any(t[3] is None for t in table) and not a.step:
+            print("(a flight fits a horizon only if it is ~2x as long with non-overlapping "
+                  "windows; add --step 1m, or use run_stream.py, for long horizons)")
+        if not a.per_horizon and any(t[3] is None for t in table):
+            print("(nested mode: only flights longer than %s count for EVERY row; add "
+                  "--per_horizon to score the short horizons on all flights)" % HZ.label(W))
         results[split] = table
         all_rows += rows
 

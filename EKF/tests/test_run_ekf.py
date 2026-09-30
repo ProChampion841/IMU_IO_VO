@@ -59,8 +59,8 @@ def test_vo_csv_ekf_beats_imu_only(flight):
                               "--out_csv", str(flight["dir"] / "rows.csv"),
                               "--out_npz", str(flight["dir"] / "traj.npz"),
                               "--plot_dir", str(flight["dir"] / "plots")])
-    h, n, r = res["inference"][-1]
-    assert h == 6000 and n >= 1
+    h, n, nf, r = res["inference"][-1]
+    assert h == 6000 and n >= 1 and nf == 1
     assert r["ekf"]["pos_error"] < r["imu"]["pos_error"]
     assert r["ekf"]["vel_rmse"] < r["imu"]["vel_rmse"]
     assert r["ekf"]["vel_rmse"] < 0.5                 # VO noise 0.5 m/s, filtered
@@ -109,3 +109,31 @@ def test_onnx_block_correction_matches_imu_pipeline(flight, tmp_path):
     win2 = next(PL.load_windows(IMU_CFG, "inference", 2500, csv=flight["csv"]))
     acc2, gyro2 = PL.onnx_correct(win2, model)
     assert acc2.shape == (2500, 3) and np.isfinite(acc2).all()
+
+
+def test_horizon_notation_and_per_horizon(flight):
+    from ekf import horizons as HZ
+    assert [HZ.parse(x) for x in ("30s", "1m", "2m", "40m", "3000")] == [3000, 6000, 12000,
+                                                                          240000, 3000]
+    assert HZ.parse("90", plain="seconds") == 9000
+    assert [HZ.label(h) for h in (3000, 6000, 240000, 4500)] == ["30s", "1m", "40m", "45s"]
+    # 200 s flight, 15 s freeze: 30 s and 1 m fit, 5 m does not
+    res, rows = run_ekf.main(["--imu_config", IMU_CFG, "--csv", flight["csv"], "--vo_sim",
+                              "--horizons", "30s", "1m", "5m", "--per_horizon"])
+    tab = {h: (n, nf, r) for h, n, nf, r in res["inference"]}
+    assert tab[3000][0] > tab[6000][0] >= 1          # short horizon: more windows
+    assert tab[30000][2] is None                     # 5 min: no window, reported, no crash
+
+
+def test_run_stream_many_flights_long_horizons(flight, capsys):
+    import run_stream
+    rc = run_stream.main(["--csv", flight["csv"], flight["csv"], "--vo_sim", "--gps_s", "30",
+                          "--horizons", "30s", "1m", "2m", "10m",
+                          "--out_csv", str(flight["dir"] / "stream_rows.csv")])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "vel_rmse" in out and "dir_max_error" in out and "pos_error" in out
+    assert "10m" in out and "no flight long enough" in out     # 200 s log
+    import csv
+    rows = list(csv.DictReader(open(str(flight["dir"] / "stream_rows.csv"))))
+    assert {r["tag"] for r in rows} == {"30s", "1m", "2m"} and len(rows) == 6

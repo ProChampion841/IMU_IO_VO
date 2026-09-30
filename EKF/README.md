@@ -144,6 +144,25 @@ ratio **ekf / imu** (below 1 means VO helped). It also reports:
   VO variance is too small, below means it is too big)
 - the final bias estimates
 
+## Horizons 30 s … 40 min
+
+Both scripts take `--horizons 30s 1m 2m 3m 4m 5m 10m 15m 20m 30m 40m`, which is
+also the default. A plain number still means frames at 100 Hz in `run_ekf.py`
+and seconds in `run_stream.py`. A horizon is scored only on flights long enough
+for it; the others are listed as "no window / no flight long enough".
+
+| script | how long horizons are scored | use |
+|---|---|---|
+| `run_ekf.py --per_horizon --step 1m` | each horizon on its own windows. Starts every minute (overlapping) so a 10 min horizon fits an 11–12 min flight | offline comparison imu / vo / ekf |
+| `run_stream.py` (many flights) | one outage per flight after `--gps_s` of GPS; every horizon that fits in the rest of the log | real use: EKF vs IMU-only |
+
+Without `--per_horizon`, `run_ekf.py` reads every horizon off one window as long
+as the longest horizon. Then only flights longer than 40 min count at all.
+
+Long horizons are slow in Python: about 1.5 min per 17-minute flight in
+`run_stream.py`, and a few minutes offline with `--step 1m`. The C++ build runs
+at about 2.6 µs per message.
+
 ## Stream mode (real use) and C++
 
 The offline evaluator above starts every window from GPS truth. On the
@@ -156,7 +175,7 @@ aircraft the filter works like this instead:
 
 ```bash
 python run_stream.py --csv <flight>_sensor_data.csv --vo_onnx ../VO/export/onnx \
-    --vo_dataset <VO flight folder> --gps_s 60 --horizons_s 30 60 120 180 240 300 \
+    --vo_dataset <VO flight folder> --gps_s 60 --horizons 30s 1m 2m 5m 10m \
     --events_out events.csv --cpp cpp/build/ekf_replay
 ```
 

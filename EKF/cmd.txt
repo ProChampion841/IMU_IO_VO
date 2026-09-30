@@ -54,7 +54,7 @@ python run_ekf.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
 :: GPS for 60 s (biases learned), then outage: EKF vs IMU-only at 30 s .. 5 min
 python run_stream.py --csv 2026_02_06_143_23_sensor_data.csv ^
   --vo_onnx ..\VO\export\onnx --vo_dataset ..\VO\data_split\test --vo_cache vo_143_23.csv ^
-  --gps_s 60 --horizons_s 30 60 120 180 240 300
+  --gps_s 60 --horizons 30s 1m 2m 3m 4m 5m
 
 :: ---------------------------------------------------------------- C++ (Jetson)
 cd cpp
@@ -64,3 +64,15 @@ cd ..
 :: run the C++ on the same message log as Python and compare (prints PASS/FAIL)
 python run_stream.py --csv 2026_02_06_143_23_sensor_data.csv --vo_csv vo_143_23.csv ^
   --events_out events.csv --cpp cpp\build\ekf_replay
+
+:: ---------------------------------------------------------------- ALL HORIZONS 30s .. 40m
+:: horizons can be written 30s 1m 2m 3m 4m 5m 10m 15m 20m 30m 40m (that list is the default)
+:: OFFLINE: each horizon on its own windows; --step 1m lets long horizons fit shorter flights
+python run_ekf.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --vo_dir vo_cache --per_horizon --step 1m ^
+  --horizons 30s 1m 2m 3m 4m 5m 10m 15m 20m 30m 40m --out_csv ekf_all_horizons.csv
+
+:: ONLINE / STREAM: every flight of the split, GPS 60 s then outage, horizons into the outage
+python run_stream.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --vo_dir vo_cache --gps_s 60 ^
+  --horizons 30s 1m 2m 3m 4m 5m 10m 15m 20m 30m 40m --out_csv stream_all_horizons.csv

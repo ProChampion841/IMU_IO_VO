@@ -32,8 +32,14 @@ G_PAD = 9.81007                   # the constant padding_collate uses
 # windows from the IMU project's dataset
 # ---------------------------------------------------------------------------
 def load_windows(imu_config, split, window, csv=None, data_root=None, max_flights=None,
-                 first_only=False):
-    """Yield one dict of NumPy arrays per window (W IMU samples, W+1 states)."""
+                 first_only=False, step=None):
+    """Yield one dict of NumPy arrays per window (W IMU samples, W+1 states).
+
+    step (frames) is the spacing of window starts; default = window (no overlap).
+    The first window of a flight starts at 0 and is dropped for lack of freeze
+    history, so with step = window a horizon only fits flights ~2x its length;
+    a smaller step (e.g. 1 min) lets long horizons fit any flight a little longer
+    than the horizon, at the price of overlapping (correlated) windows."""
     from pyhocon import ConfigFactory
     from datasets import SeqeuncesDataset
     from utils import pypose_compat
@@ -42,7 +48,7 @@ def load_windows(imu_config, split, window, csv=None, data_root=None, max_flight
     conf = ConfigFactory.parse_file(imu_config)
     dc = copy.deepcopy(conf.dataset[split])
     for e in dc.data_list:
-        e["window_size"], e["step_size"] = int(window), int(window)
+        e["window_size"], e["step_size"] = int(window), int(step or window)
         if csv:
             e["data_drive"] = [os.path.basename(csv)]
             if os.path.dirname(csv):

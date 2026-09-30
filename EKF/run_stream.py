@@ -1,18 +1,25 @@
-"""Stream (real-use) test on a flight: GPS up at first, then an outage.
+"""Stream (real-use) evaluation: GPS up at first, then an outage -- over one or many flights.
 
-The filter starts from the nav state at --start_s, is corrected by GPS velocity
-for --gps_s seconds (it learns the IMU biases there -- no offline bias freeze),
-then GPS is lost and it runs on IMU + attitude + VO only.  Errors are reported at
-fixed times INTO the outage, for the EKF and for the same filter without VO.
+Per flight, the filter starts from the nav state at --start_s and is corrected by
+GPS velocity for --gps_s seconds. That is where it learns the IMU biases; there is
+no offline bias freeze. Then GPS is lost and it runs on IMU + attitude + VO only.
+Messages are fed in arrival order, exactly as on the aircraft (ekf/stream.py).
 
-Messages are fed in arrival order exactly as on the aircraft (EKF/ekf/stream.py).
---events_out writes that message log; --cpp runs the C++ ekf_replay on it and
-reports the C++ vs Python difference -- the check to run before trusting the
-Jetson build on your data.
+For every horizon INTO the outage (30s 1m 2m ... 40m) it reports, over all flights
+whose log is long enough, for the EKF and for the same filter without VO:
 
-    python run_stream.py --csv flight_sensor_data.csv --vo_sim --gps_s 60 --duration_s 360
-    python run_stream.py --csv flight_sensor_data.csv --vo_onnx ../VO/export/onnx \
-        --vo_dataset ../VO/data_split/test --events_out events.csv --cpp cpp/build/ekf_replay
+    vel_rmse       RMS over flights of |v - v_gps| AT the horizon          m/s
+    vel_max_error  worst |v - v_gps| anywhere in [outage, outage + h]      m/s
+    dir_rmse       RMS of the velocity-direction error AT the horizon      deg
+    dir_max_error  worst direction error anywhere in the interval          deg
+    pos_error      mean |p - p_gps| AT the horizon                         m
+
+--events_out writes the message log of the FIRST flight; --cpp runs the C++
+ekf_replay on it and checks it matches Python.
+
+    python run_stream.py --imu_config ../IMU/configs/exp/UAV/tilt_rotate.conf \
+        --splits inference --vo_dir vo_cache --gps_s 60
+    python run_stream.py --csv f1_sensor_data.csv f2_sensor_data.csv --vo_sim
 """
 import argparse
 import os
@@ -25,132 +32,216 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from ekf import pipeline as PL                                        # noqa: E402
+from ekf import horizons as HZ                                        # noqa: E402
 from ekf.events import build_events, run_stream, stream_from_config, write_events  # noqa: E402
 from ekf.vo import load_vo_csv, simulate_vo                           # noqa: E402
 from ekf import vo_onnx                                               # noqa: E402
 import run_ekf                                                        # noqa: E402
 
+ARMS = ("ekf", "imu")
 
-def errors_at(fl, rows, t_query):
+
+def flight_list(a):
+    if a.csv:
+        return [(os.path.dirname(c) or ".", os.path.basename(c)) for c in a.csv]
+    from pyhocon import ConfigFactory
+    conf = ConfigFactory.parse_file(a.imu_config)
     out = []
-    for tq in t_query:
-        i = int(np.searchsorted(rows[:, 0], tq))
-        if i >= len(rows):
-            out.append(None)
-            continue
-        k = int(np.clip(np.searchsorted(fl["t"], rows[i, 0]), 0, len(fl["t"]) - 1))
-        v, g = rows[i, 4:7], fl["v_gt"][k]
-        cos = v @ g / max(np.linalg.norm(v) * np.linalg.norm(g), 1e-9)
-        out.append((np.linalg.norm(rows[i, 1:4] - fl["p_gt"][k]), np.linalg.norm(v - g),
-                    np.degrees(np.arccos(np.clip(cos, -1, 1)))))
-    return out
+    for split in a.splits:
+        for e in conf.dataset[split].data_list:
+            root = a.data_root or e["data_root"]
+            out += [(root, f) for f in e["data_drive"]]
+    return out[:a.max_flights] if a.max_flights else out
+
+
+def vo_for(a, cfg, fl, root, name):
+    vc = cfg["vo"]
+    stem = os.path.splitext(name)[0]
+    if a.vo_sim:
+        s = cfg["vo_sim"]
+        return simulate_vo(fl["t"], fl["R_gt"], fl["v_gt"], rate_hz=s["rate_hz"],
+                           white_std=s["white_std"], bias_std=s["bias_std"], tau_s=s["tau_s"],
+                           seed=s["seed"], var_scale=vc["var_scale"])
+    kw = dict(time_offset=vc["time_offset_s"], var_scale=vc["var_scale"], min_std=vc["min_std"])
+    if a.vo_csv or a.vo_dir:
+        path = a.vo_csv
+        if a.vo_dir:
+            path = None
+            for cand in (stem + "_vo.csv", stem.replace("_sensor_data", "") + "_vo.csv"):
+                if os.path.isfile(os.path.join(a.vo_dir, cand)):
+                    path = os.path.join(a.vo_dir, cand)
+                    break
+            if path is None:
+                return None
+        return load_vo_csv(path, frame=vc["frame"], min_interval_s=vc.get("min_interval_s", 0.5),
+                           fresh_only=vc.get("fresh_only", True), **kw)
+    folder = a.vo_dataset
+    if a.vo_datasets:
+        folder = None
+        for cand in (stem, stem.replace("_sensor_data", "")):
+            if os.path.isdir(os.path.join(a.vo_datasets, cand)):
+                folder = os.path.join(a.vo_datasets, cand)
+                break
+        if folder is None:
+            return None
+    cache = os.path.join(a.vo_cache_dir, stem + "_vo.csv") if a.vo_cache_dir else None
+    if cache and os.path.isfile(cache):
+        return load_vo_csv(cache, **kw)
+    return vo_onnx.replay(a.vo_onnx, folder, save_csv=cache, **kw)
+
+
+def score(fl, rows, t_out, h_s):
+    """The five quantities for one flight at h_s seconds into the outage, or None."""
+    t_h = t_out + h_s
+    if rows[-1, 0] < t_h - 0.05:
+        return None
+    i0, i1 = np.searchsorted(rows[:, 0], [t_out, t_h])
+    i1 = min(i1, len(rows) - 1)
+    seg = rows[i0:i1 + 1]
+    k = np.clip(np.searchsorted(fl["t"], seg[:, 0]), 0, len(fl["t"]) - 1)
+    ve = np.linalg.norm(seg[:, 4:7] - fl["v_gt"][k], axis=1)
+    cos = (seg[:, 4:7] * fl["v_gt"][k]).sum(1) / np.maximum(
+        np.linalg.norm(seg[:, 4:7], axis=1) * np.linalg.norm(fl["v_gt"][k], axis=1), 1e-9)
+    de = np.degrees(np.arccos(np.clip(cos, -1, 1)))
+    pe = np.linalg.norm(seg[-1, 1:4] - fl["p_gt"][k[-1]])
+    return {"vel": ve[-1], "vel_peak": ve.max(), "dir": de[-1], "dir_peak": de.max(), "pos": pe}
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--csv", required=True, help="IMU flight log (*_sensor_data.csv)")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--csv", nargs="+", help="IMU flight log(s) (*_sensor_data.csv)")
+    src.add_argument("--imu_config", help="IMU config: take the flights of --splits")
+    ap.add_argument("--splits", nargs="+", default=["inference"],
+                    choices=["train", "test", "eval", "inference"])
+    ap.add_argument("--data_root", default=None)
+    ap.add_argument("--max_flights", type=int, default=None)
     ap.add_argument("--ekf_config", default=os.path.join(HERE, "configs", "ekf_default.json"))
     vo = ap.add_mutually_exclusive_group(required=True)
-    vo.add_argument("--vo_onnx", help="VO ONNX export folder; needs --vo_dataset")
-    vo.add_argument("--vo_csv", help="VO predictions CSV of this flight")
+    vo.add_argument("--vo_onnx", help="VO ONNX export folder (with --vo_dataset / --vo_datasets)")
+    vo.add_argument("--vo_csv", help="VO predictions CSV (one flight)")
+    vo.add_argument("--vo_dir", help="folder of VO CSVs, <flight>_vo.csv")
     vo.add_argument("--vo_sim", action="store_true", help="SIMULATED VO (tests the filter only)")
-    ap.add_argument("--vo_dataset", help="VO flight folder (flight.csv + images/)")
-    ap.add_argument("--vo_cache", default=None, help="save / reuse the VO ONNX output CSV")
+    ap.add_argument("--vo_dataset", help="VO flight folder (flight.csv + images/), one flight")
+    ap.add_argument("--vo_datasets", help="root with one VO flight folder per IMU flight")
+    ap.add_argument("--vo_cache_dir", default=None, help="save / reuse VO ONNX output here")
     ap.add_argument("--start_s", type=float, default=1.0, help="filter start, s after log start")
     ap.add_argument("--gps_s", type=float, default=60.0, help="GPS-aided seconds before outage")
-    ap.add_argument("--duration_s", type=float, default=None, help="total (default gps_s + 300)")
-    ap.add_argument("--horizons_s", type=float, nargs="+", default=[30, 60, 120, 180, 240, 300])
+    ap.add_argument("--horizons", nargs="+", default=HZ.DEFAULT,
+                    help="into the outage: 30s 1m 2m ... 40m (a bare number = seconds)")
     ap.add_argument("--gps_std", type=float, default=0.1, help="GPS velocity noise, m/s")
     ap.add_argument("--vo_latency_s", type=float, default=0.0,
                     help="extra delay between a VO output's timestamp and its arrival")
     ap.add_argument("--imu_drop", type=float, default=0.0, help="fraction of IMU samples lost")
-    ap.add_argument("--events_out", default=None, help="write the message log (C++ input)")
-    ap.add_argument("--cpp", default=None, help="path to ekf_replay: run it and compare")
-    ap.add_argument("--out_csv", default=None, help="EKF states after every IMU sample")
+    ap.add_argument("--events_out", default=None, help="message log of the first flight (C++)")
+    ap.add_argument("--cpp", default=None, help="path to ekf_replay: run it on the first flight")
+    ap.add_argument("--out_csv", default=None, help="one row per (flight, horizon)")
     a = ap.parse_args(argv)
+    if (a.vo_csv or a.vo_dataset) and (not a.csv or len(a.csv) != 1):
+        ap.error("--vo_csv / --vo_dataset belong to ONE flight: give exactly one --csv")
+    if a.vo_onnx and not (a.vo_dataset or a.vo_datasets):
+        ap.error("--vo_onnx needs --vo_dataset or --vo_datasets")
 
     cfg = run_ekf.load_config(a.ekf_config)
-    vc = cfg["vo"]
-    fl = PL.load_flight(a.csv)
-    t_start = fl["t"][0] + a.start_s
-    t_out = t_start + a.gps_s
-    t_end = t_start + (a.duration_s or a.gps_s + max(a.horizons_s))
-    if a.vo_sim:
-        s = cfg["vo_sim"]
-        vo = simulate_vo(fl["t"], fl["R_gt"], fl["v_gt"], rate_hz=s["rate_hz"],
-                         white_std=s["white_std"], bias_std=s["bias_std"], tau_s=s["tau_s"],
-                         seed=s["seed"], var_scale=vc["var_scale"])
-    elif a.vo_csv:
-        vo = load_vo_csv(a.vo_csv, frame=vc["frame"], time_offset=vc["time_offset_s"],
-                         var_scale=vc["var_scale"], min_std=vc["min_std"],
-                         min_interval_s=vc.get("min_interval_s", 0.5),
-                         fresh_only=vc.get("fresh_only", True))
-    else:
-        if not a.vo_dataset:
-            ap.error("--vo_onnx needs --vo_dataset")
-        if a.vo_cache and os.path.isfile(a.vo_cache):
-            vo = load_vo_csv(a.vo_cache, time_offset=vc["time_offset_s"],
-                             var_scale=vc["var_scale"], min_std=vc["min_std"])
-        else:
-            vo = vo_onnx.replay(a.vo_onnx, a.vo_dataset, time_offset=vc["time_offset_s"],
-                                var_scale=vc["var_scale"], min_std=vc["min_std"],
-                                save_csv=a.vo_cache)
-    print("[vo] %s" % vo.source)
-
-    att = cfg["attitude_aid"].get("source") or "gt"
-    kw = dict(t_init=t_start, t_end=t_end, gps_until=t_out, gps_std=a.gps_std, att_source=att,
-              vo_latency_s=a.vo_latency_s, imu_drop=a.imu_drop, seed=0)
-    ev = build_events(fl, vo, **kw)
-    ev_imu = build_events(fl, None, **kw)
     make = stream_from_config(cfg)
-    rows, s = run_stream(ev, make)
-    rows_imu, _ = run_stream(ev_imu, make)
-
-    q = [t_out + h for h in a.horizons_s]
-    e, e0 = errors_at(fl, rows, q), errors_at(fl, rows_imu, q)
-    i = int(np.searchsorted(rows[:, 0], t_out))
-    print("\n[stream] %s | start %.1f s, GPS for %.0f s, outage at %.1f s | %d messages"
-          % (fl["flight"], t_start, a.gps_s, t_out, len(ev)))
-    print("  at the outage: |ba| %.4f m/s^2  |bg| %.4f deg/s (learned while GPS was up)"
-          % (np.linalg.norm(rows[i, 11:14]), np.degrees(np.linalg.norm(rows[i, 14:17]))))
-    print("  counters: %s" % s.counters)
-    nis = np.array(s.f.stats["nis_vel"])
-    if len(nis):
-        print("  VO NIS mean %.2f (3.0 = VO variance right; >3: VO trusted too much -> raise "
-              "vo.var_scale; <3: lower it)" % nis.mean())
-    print("\n  into outage |   pos error [m]   |  vel error [m/s]  |  dir error [deg]")
-    print("              |  ekf    imu-only  |  ekf    imu-only  |  ekf    imu-only")
-    for h, x, y in zip(a.horizons_s, e, e0):
-        if x is None:
-            print("  %8.0f s   | (past the end of the log)" % h)
+    hs = sorted(HZ.parse(h, plain="seconds") for h in a.horizons)       # frames
+    h_max_s = hs[-1] / HZ.RATE_HZ
+    att = cfg["attitude_aid"].get("source") or "gt"
+    rows_out, first_ev, nis_all = [], None, []
+    flights = flight_list(a)
+    print("[stream] %d flight(s) | GPS %.0f s then outage | horizons %s"
+          % (len(flights), a.gps_s, " ".join(HZ.label(h) for h in hs)))
+    for root, name in flights:
+        try:
+            fl = PL.load_flight(os.path.join(root, name))
+        except Exception as e:                                            # noqa: BLE001
+            print("  [skip] %s: %s" % (name, e))
             continue
-        print("  %8.0f s   | %6.2f   %7.2f   | %6.3f   %7.3f   | %6.2f   %7.2f"
-              % (h, x[0], y[0], x[1], y[1], x[2], y[2]))
+        vo = vo_for(a, cfg, fl, root, name)
+        if vo is None:
+            print("  [skip] %s: no VO for this flight" % name)
+            continue
+        t_start = fl["t"][0] + a.start_s
+        t_out = t_start + a.gps_s
+        if fl["t"][-1] < t_out + hs[0] / HZ.RATE_HZ:
+            print("  [skip] %s: %.0f s log, too short for the first horizon"
+                  % (name, fl["t"][-1] - fl["t"][0]))
+            continue
+        kw = dict(t_init=t_start, t_end=min(fl["t"][-1], t_out + h_max_s + 1.0),
+                  gps_until=t_out, gps_std=a.gps_std, att_source=att,
+                  vo_latency_s=a.vo_latency_s, imu_drop=a.imu_drop, seed=0)
+        ev = build_events(fl, vo, **kw)
+        res = {"ekf": run_stream(ev, make), "imu": run_stream(build_events(fl, None, **kw), make)}
+        if first_ev is None:
+            first_ev = (name, ev, res["ekf"][0])
+        nis_all += res["ekf"][1].f.stats["nis_vel"]
+        i = int(np.searchsorted(res["ekf"][0][:, 0], t_out))
+        ba = res["ekf"][0][min(i, len(res["ekf"][0]) - 1), 11:14]
+        n_ok = 0
+        for h in hs:
+            per = {arm: score(fl, res[arm][0], t_out, h / HZ.RATE_HZ) for arm in ARMS}
+            if per["ekf"] is None:
+                continue
+            n_ok += 1
+            r = {"flight": name, "horizon": h, "tag": HZ.label(h), "ba_at_outage": np.linalg.norm(ba)}
+            for arm in ARMS:
+                r.update({"%s_%s" % (arm, k): float(v) for k, v in per[arm].items()})
+            rows_out.append(r)
+        print("  %-40s %5.0f s log | |ba| at outage %.4f m/s^2 | %d horizons fit | %s"
+              % (name[:40], fl["t"][-1] - fl["t"][0], np.linalg.norm(ba), n_ok, vo.source[:60]))
+
+    if not rows_out:
+        print("no flight long enough")
+        return 1
+    print("\n=== STREAM: into the outage, over flights; each cell = ekf / imu-only (ratio) ===")
+    head = "%-6s %4s | " % ("horizon", "fl") + " | ".join("%-26s" % n for n, _, _ in PL.SUMMARY)
+    print(head)
+    print("-" * len(head))
+    for h in hs:
+        hr = [r for r in rows_out if r["horizon"] == h]
+        if not hr:
+            print("%-7s %4d | no flight long enough (needs %s + %.0f s of GPS)"
+                  % (HZ.label(h), 0, HZ.label(h), a.gps_s + a.start_s))
+            continue
+        m = {arm: PL.reduce(hr, arm) for arm in ARMS}
+        cells = ["%8.3f / %8.3f (%4.2f)" % (m["ekf"][n], m["imu"][n],
+                                             m["ekf"][n] / max(m["imu"][n], 1e-12))
+                 for n, _, _ in PL.SUMMARY]
+        print("%-7s %4d | %s" % (HZ.label(h), len(hr), " | ".join("%-26s" % c for c in cells)))
+    print("units: vel m/s, dir deg, pos m.  *_rmse / pos_error AT the horizon (pos_error is the")
+    print("mean over flights); *_max_error = worst moment in [outage, outage + h].")
+    if nis_all:
+        print("VO NIS mean %.2f (3.0 = VO variance right; >3 raise vo.var_scale, <3 lower it)"
+              % np.mean(nis_all))
     if a.vo_sim:
         print("*** VO IS SIMULATED from GPS truth: a filter test, NOT a VO result.")
 
     if a.out_csv:
-        np.savetxt(a.out_csv, rows, delimiter=",", fmt="%.9f",
-                   header="t,px,py,pz,vx,vy,vz,qw,qx,qy,qz,bax,bay,baz,bgx,bgy,bgz,std_p,std_v",
-                   comments="")
-    if a.events_out or a.cpp:
+        import csv
+        with open(a.out_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows_out[0].keys()))
+            w.writeheader()
+            w.writerows(rows_out)
+        print("per-flight results -> %s" % a.out_csv)
+    if (a.events_out or a.cpp) and first_ev:
+        name, ev, rows = first_ev
         path = a.events_out or "events.csv"
         write_events(path, ev)
-        print("\nmessage log -> %s" % path)
-    if a.cpp:
-        out = os.path.splitext(path)[0] + "_cpp_states.csv"
-        r = subprocess.run([a.cpp, path, out, a.ekf_config], capture_output=True, text=True)
-        print("[cpp] " + (r.stdout.strip() or r.stderr.strip()))
-        cpp = np.loadtxt(out, delimiter=",", skiprows=1)
-        if cpp.shape != rows.shape:
-            print("[cpp] FAIL: %s states vs Python %s" % (cpp.shape, rows.shape))
-            return 1
-        dp = np.abs(cpp[:, 1:4] - rows[:, 1:4]).max()
-        dv = np.abs(cpp[:, 4:7] - rows[:, 4:7]).max()
-        ok = dp < 1e-4 and dv < 1e-6
-        print("[cpp] C++ vs Python: max |dp| %.2e m, |dv| %.2e m/s -> %s"
-              % (dp, dv, "PASS" if ok else "FAIL"))
-        return 0 if ok else 1
+        print("\nmessage log of %s -> %s" % (name, path))
+        if a.cpp:
+            out = os.path.splitext(path)[0] + "_cpp_states.csv"
+            r = subprocess.run([a.cpp, path, out, a.ekf_config], capture_output=True, text=True)
+            print("[cpp] " + (r.stdout.strip() or r.stderr.strip()))
+            cpp = np.loadtxt(out, delimiter=",", skiprows=1)
+            if cpp.shape != rows.shape:
+                print("[cpp] FAIL: %s states vs Python %s" % (cpp.shape, rows.shape))
+                return 1
+            dp = np.abs(cpp[:, 1:4] - rows[:, 1:4]).max()
+            dv = np.abs(cpp[:, 4:7] - rows[:, 4:7]).max()
+            ok = dp < 1e-4 and dv < 1e-6
+            print("[cpp] C++ vs Python: max |dp| %.2e m, |dv| %.2e m/s -> %s"
+                  % (dp, dv, "PASS" if ok else "FAIL"))
+            return 0 if ok else 1
     return 0
 
 
