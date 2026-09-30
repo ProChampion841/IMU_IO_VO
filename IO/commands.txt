@@ -82,3 +82,10 @@ python train.py --config configs/exp/UAV/velnet_v3.conf --device cuda:0
 # outputs: vel_body (B,F,3) m/s, vel_cov (B,F,3) (m/s)^2
 # ---------------------------------------------------------------------------
 python -m tools.export_onnx --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --out experiments/UAV/velnet_v3/velnet_6000.onnx --frames 6000
+
+# ONNX inference on flight CSVs (numpy + pandas + onnxruntime only, no PyTorch).
+# Raw logs with GPS columns also get vel_rmse/vel_max/dir_rmse/dir_max/pos_error.
+python -m tools.onnx_inference --onnx experiments/UAV/velnet_v3/velnet_6000.onnx --csv /path/to/flight_sensor_data.csv --out pred.csv
+
+# Check the ONNX script against the PyTorch pipeline (synthetic flight if no --csv)
+python -m tools.check_onnx_inference --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --onnx experiments/UAV/velnet_v3/velnet_6000.onnx
