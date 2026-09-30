@@ -119,7 +119,20 @@ def attitude_feature(rot, mode="gravity", eps=1e-6):
     if mode == "none":
         return torch.zeros(_batch_shape(rot) + (0,), dtype=rot.dtype, device=rot.device)
 
-    g = gravity_direction(rot)
+    return gravity_feature(gravity_direction(rot), mode, eps)
+
+
+def gravity_feature(g, mode="gravity", eps=1e-6):
+    """Attitude feature from an already-computed ``g_body`` (..., 3).
+
+    The rotation-free half of :func:`attitude_feature`.  It exists so an exported
+    graph (tools/export_onnx.py) can take ``g_body`` as a plain tensor input -- a
+    pypose LieTensor cannot cross the ONNX boundary -- and still build EXACTLY the
+    same channels the network was trained on.
+    """
+    mode = "none" if mode is None else str(mode)
+    if mode == "none":
+        return g[..., :0]
     if mode == "gravity":
         return g
 

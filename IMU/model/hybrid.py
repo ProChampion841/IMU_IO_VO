@@ -728,12 +728,23 @@ class HybridNet(ModelBase):
 
     def inference(self, data):
         """Pure network output.  Consumed by inference.py, which passes `data` only."""
-        frame_len = data["acc"].shape[1] - self.interval
+        return self.inference_from_input(self._net_input(data), data["acc"], data["gyro"])
 
-        feature = self.encoder(self._net_input(data))[:, 1:, :]
+    def inference_from_input(self, net_in, acc, gyro):
+        """Everything after input assembly, on plain tensors.
 
-        raw_acc = data["acc"][:, self.interval:, :]
-        raw_gyro = data["gyro"][:, self.interval:, :]
+        net_in    (B, F+interval, in_dim)  the output of _net_input()
+        acc, gyro (B, F+interval, 3)       the padded raw signals
+
+        Split out of inference() so tools/export_onnx.py traces THIS function: the
+        exported graph and the trained network are one code path, not two copies.
+        """
+        frame_len = acc.shape[1] - self.interval
+
+        feature = self.encoder(net_in)[:, 1:, :]
+
+        raw_acc = acc[:, self.interval:, :]
+        raw_gyro = gyro[:, self.interval:, :]
 
         corrected_acc = self._correct(raw_acc, feature, frame_len,
                                       self.accdecoder, self.accscale_decoder, self.acc_std,

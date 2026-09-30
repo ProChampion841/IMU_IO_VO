@@ -97,3 +97,13 @@ python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_rotate.conf ^
   --ckpt experiments/UAV/tilt_rotate/ckpt/best_model.ckpt ^
   --splits inference --horizons 3000 6000 12000 18000 24000 30000 ^
   --batch_size 4 --out tilt_rotate_horizons_all.csv
+
+:: ---------------------------------------------------------------- ONNX export
+:: needs:  pip install onnx onnxruntime
+:: Exports the NETWORK only (raw IMU -> corrected IMU + uncertainty) for ONE
+:: window length, then checks ONNX Runtime against PyTorch and prints PASS/FAIL.
+python -m tools.export_onnx --config configs/exp/UAV/tilt_rotate.conf ^
+  --ckpt experiments/UAV/tilt_rotate/ckpt/best_model.ckpt ^
+  --frames 6000 --out tilt_rotate_6000.onnx
+
+:: tests (CPU, no data):  python -m pytest tests -q
