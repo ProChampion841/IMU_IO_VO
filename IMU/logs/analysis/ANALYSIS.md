@@ -12,7 +12,7 @@ about 4.5 min per epoch). Plot: `tilt_aware_training.png`.
 - **Splits:** 55 train flights plus `train.csv`. `test` and `eval` use **the same 11 flights**
   plus `valid1.csv`; they are the checkpoint-selection flights, **not held-out data**.
   `inference` has the 11 held-out flights, and it **is not scored anywhere in this log.**
-- **Horizons:** **training windows are 40 s** (4000 frames, step 1000 s per `parameters.yaml`). Primary
+- **Horizons:** **training windows are 40 s** (4000 frames, step 1000 frames, per `parameters.yaml`). Primary
   validation is **60 s**, because `metric_horizons[0]` = 6000 overrides the test window; the extra val
   horizons are 30 s and 120 s. The `eval/*` columns use 40 s windows.
   *Correction:* an earlier version of this note said training ran at 60 s. The CSV column
