@@ -68,6 +68,11 @@ from vio.data.fixedwing_vo import (  # noqa: E402
     reference_body_velocity,
 )
 from vio.data.image_pairs import resize_camera_matrix  # noqa: E402
+from vio.models.frontend_factory import (  # noqa: E402
+    build_frontend,
+    frontend_class,
+    resolve_velocity_mode,
+)
 from vio.models.velocity_horizons import (  # noqa: E402
     DEFAULT_HORIZON_MINUTES,
     encode_span_tokens,
@@ -75,11 +80,13 @@ from vio.models.velocity_horizons import (  # noqa: E402
     parse_horizon_minutes,
     run_span_horizons,
 )
-from vio.models.vision_mamba_vo import (  # noqa: E402
-    VisionMambaFlowFrontend,
-    VisionMambaVO,
-)
+from vio.models.vision_mamba_vo import VisionMambaVO  # noqa: E402
 from vio.utils.checkpoint_io import load_checkpoint  # noqa: E402
+from vio.utils.stratify import (  # noqa: E402
+    flight_conditions,
+    format_stratified,
+    stratified_errors,
+)
 from vio.utils.horizon_plots import save_split_plots  # noqa: E402
 
 SPLIT_NAMES = ("train", "validation", "test", "full")
@@ -161,6 +168,17 @@ def build_parser() -> argparse.ArgumentParser:
              "axis, error growth over the run, and a summary against horizon "
              "length. The first three are drawn from the WHOLE split, not per "
              "horizon, because a horizon is a prefix of that same single run.",
+    )
+    parser.add_argument(
+        "--stratify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Break the whole-split error down by turn rate, bank angle, "
+             "altitude and ground speed (vio.utils.stratify), printed and "
+             "written to the JSON under splits.<name>.stratified. A single RMSE "
+             "averages cruise, where the camera sees a clean translation, with "
+             "banked turns, where it does not; this says which one a model is "
+             "losing on.",
     )
     parser.add_argument(
         "--plot-dir",
@@ -312,6 +330,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         stride=1,
         warmup=0,
         max_visual_events=1,
+        # RGB frames for an RGB-trained stem; absent means grayscale, the only
+        # thing a checkpoint written before --color existed can have used.
+        grayscale=not bool(saved.get("color", False)),
     )
     total = int(attitude.times_s.size)
     ranges = _resolve_ranges(saved, total, dataset_root=dataset_root)
@@ -352,7 +373,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # strict=True below cannot tell them apart: it would load a v2 checkpoint
     # silently and score it under a measurement it was never trained with.
     saved_frontend = saved.get("frontend_id")
-    current_frontend = str(VisionMambaFlowFrontend.frontend_id)
+    # Which frontend CLASS the run used decides which id this build computes
+    # for it; absent means the original frontend, the only one that existed.
+    frontend_kind = str(saved.get("frontend", "mamba_correlation") or "mamba_correlation")
+    current_frontend = str(frontend_class(frontend_kind).frontend_id)
     if saved_frontend is None:
         raise SystemExit(
             f"{args.checkpoint} records no frontend_id, so it predates "
@@ -374,7 +398,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # SHAPE change, not (say) an ablation flag that flips between training
     # and evaluation while keeping every tensor the same size.
     saved_temporal_input = saved.get("temporal_input_id")
-    current_temporal_input = str(VisionMambaVO.temporal_input_id)
+    # Absent velocity_mode means the factored heads, the only mode a checkpoint
+    # written before geometric_residual existed can have used.
+    velocity_mode = resolve_velocity_mode(
+        {"frontend": frontend_kind, "velocity_mode": saved.get("velocity_mode", "heads")}
+    )
+    current_temporal_input = str(VisionMambaVO.temporal_input_id_for(velocity_mode))
     if saved_temporal_input is None:
         raise SystemExit(
             f"{args.checkpoint} records no temporal_input_id, so it predates "
@@ -407,41 +436,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             + " zeroed (recorded at training time)"
         )
 
-    frontend = VisionMambaFlowFrontend(
-        visual_dim=int(saved.get("visual_dim", 64)),
-        d_model=int(saved.get("stem_dim", 64)),
-        depth=int(saved.get("stem_depth", 2)),
-        patch_size=int(saved.get("patch_size", 8)),
-        image_size=image_size,
-        context_grid=tuple(int(v) for v in saved.get("context_grid", (12, 16))),
-        token_grid=int(saved.get("token_grid", 6)),
-        correlation_radius=int(saved.get("correlation_radius", 4)),
-        # Changes rotation.map's SHAPE (3x3 field vs 2x3 constant), so a
-        # mismatch against the checkpoint being loaded is a hard failure below
-        # at load_state_dict(strict=True) - but a silent one if it happens to
-        # agree with this build's default ("field") by coincidence rather than
-        # by being read from the run that actually trained it. Absence means a
-        # checkpoint written before the field mode existed, so it can only
-        # have been the constant - the same convention train_fixedwing_vo.py's
-        # FINGERPRINT_DEFAULTS uses for this key.
-        rotation_mode=str(saved.get("rotation_mode", "constant")),
-        # The reliability gate changes what the frontend MEASURES without
-        # changing any tensor shape, so load_state_dict(strict=True) below
-        # cannot catch a mismatch and frontend_id does not move with it. Read
-        # from the checkpoint's own args or a gated run would be scored by an
-        # ungated frontend - every cell and every pair kept, a different token
-        # from the one the weights were trained against, and no warning
-        # anywhere. Absent keys mean a checkpoint written before the gate
-        # existed, whose only possible setting is "off": the same convention
-        # rotation_mode uses above.
-        min_pool_weight=float(saved.get("min_pool_weight", 1e-4)),
-        max_cell_entropy=float(saved.get("max_cell_entropy", 1.0)),
-        min_cell_confidence=float(saved.get("min_cell_confidence", 0.0)),
-        min_score_margin=float(saved.get("min_score_margin", 0.0)),
-        reject_boundary_peaks=bool(saved.get("reject_boundary_peaks", False)),
-        min_reliable_cell_fraction=float(
-            saved.get("min_reliable_cell_fraction", 0.0)
-        ),
+    # Every setting that changes what the frontend MEASURES without changing a
+    # tensor shape - rotation_mode, the reliability gate, the planar geometry -
+    # is read back from the checkpoint by the same factory the trainer used,
+    # never re-defaulted here: load_state_dict(strict=True) below cannot see
+    # any of them, and frontend_id does not move with them. Absent keys mean a
+    # checkpoint written before the setting existed, whose only possible value
+    # is the historical one (rotation_mode "constant", gate off, grayscale).
+    frontend = build_frontend(
+        saved,
+        camera_from_body=saved.get("camera_from_body"),
+        prior_velocity=saved.get("prior_velocity_body"),
         dropout=0.0,
     ).to(device)
     frontend.load_state_dict(checkpoint["frontend"], strict=True)
@@ -451,6 +456,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         fusion_dim=int(saved.get("fusion_dim", 96)),
         dropout=0.0,
         frontend=frontend,
+        velocity_mode=velocity_mode,
     ).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
@@ -598,6 +604,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             num_workers=args.num_workers,
             disable_visual=disable_visual,
             progress=progress,
+            attitude=attitude,
         )
         print(f"    {len(tokens)} visual events encoded")
         # ONE pass: the split streamed from its first tick to its last, state
@@ -619,7 +626,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             block_ticks=args.block_ticks,
             baseline=baseline,
             rotation_body_to_ned=rotation,
-            collect_series=bool(args.plots),
+            collect_series=bool(args.plots or args.stratify),
             progress=progress,
             ablate_body_rate=ablate_body_rate,
             ablate_visual_age=ablate_visual_age,
@@ -630,6 +637,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     if key.startswith("pos_") or key == "path_length_m":
                         entry.pop(key)
         print(format_horizon_table(results))
+        stratified = None
+        if args.stratify and span_entry.get("fits") and "series" in span_entry:
+            series = span_entry["series"]
+            ticks = int(span[1] - span[0])
+            predicted = np.asarray(series["vel_predicted_body"])[0, :ticks]
+            target = np.asarray(series["vel_target_body"])[0, :ticks]
+            conditions = flight_conditions(
+                dataset.aiding[span[0]:span[1]],
+                dataset.log_altitude[span[0]:span[1]],
+                dataset.velocity_body[span[0]:span[1]],
+            )
+            stratified = stratified_errors(predicted, target, conditions)
+            print("  whole-split error by flight condition:")
+            print(format_stratified(stratified))
         if args.plots:
             # Two of the three figures are drawn from the run's series. If it
             # scored nothing they are skipped and only the summary figure -
@@ -644,6 +665,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             plotted.extend(save_split_plots(plot_dir, name, span_entry, results))
             span_entry.pop("series", None)
             report.setdefault("whole_span", {})[name] = span_entry
+        span_entry.pop("series", None)
         report["splits"][name] = {
             "range": [int(span[0]), int(span[1])],
             "minutes": minutes,
@@ -651,6 +673,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "visual_events": len(tokens),
             "horizons": results,
         }
+        if stratified is not None:
+            report["splits"][name]["stratified"] = stratified
 
     if plotted:
         print(f"\nwrote {len(plotted)} figure(s) to {plot_dir}")

@@ -47,6 +47,7 @@ from .attitude import (
     aiding_features,
     body_rates_from_quaternions,
     load_attitude_altitude,
+    pair_geometry,
 )
 from .image_pairs import VisualPairSource
 
@@ -332,17 +333,42 @@ class FixedWingVODataset(Dataset):
                           valid: torch.Tensor) -> torch.Tensor:
         """Attitude-derived body rate averaged over each pair's exposure."""
 
+        return self._event_inputs(start, end)["visual_event_body_rate"]
+
+    def _event_inputs(self, start: int, end: int) -> Dict[str, torch.Tensor]:
+        """Everything read from the attitude log for each of a window's events.
+
+        The body rate over the exposure (what the older frontend centres its
+        search with) and the pair's exact geometry - relative rotation, ground
+        normal in the body frame, altitude at both exposures - which the
+        flat-ground frontend needs (:func:`vio.data.attitude.pair_geometry`).
+        Both are produced for every window whichever frontend trains, because
+        they are a few hundred bytes against the megabytes of pixels beside
+        them, and a frontend reading only what it needs keeps one dataset
+        serving both.
+
+        The event selection is exactly :meth:`VisualPairSource.window_pairs`'s,
+        so slot ``k`` here always describes the pixels in slot ``k`` there.
+        Padding slots hold an identity rotation, a level ground normal and a
+        unit altitude - finite values a frontend can run through harmlessly;
+        ``visual_event_valid`` is what says they are not real.
+        """
+
         selected = self.image_source.events_in_window(
             start, end, min_capture_tick=self._range_start(start)
         )
-        rates = torch.zeros(self.max_visual_events, 3)
-        if selected.size > self.max_visual_events:
+        slots = self.max_visual_events
+        rates = torch.zeros(slots, 3)
+        rotation = torch.eye(3).repeat(slots, 1, 1)
+        down = torch.zeros(slots, 3)
+        down[:, 2] = 1.0
+        altitude = torch.ones(slots, 2)
+        if selected.size > slots:
             pick = np.unique(
-                np.linspace(0, selected.size - 1, self.max_visual_events)
-                .round()
-                .astype(np.int64)
+                np.linspace(0, selected.size - 1, slots).round().astype(np.int64)
             )
             selected = selected[pick]
+        plan = self.image_source.plan
         for slot, event in enumerate(selected):
             rates[slot] = torch.from_numpy(
                 self.image_source.rate_over_exposure(
@@ -351,7 +377,20 @@ class FixedWingVODataset(Dataset):
                     int(event),
                 ).astype(np.float32)
             )
-        return rates
+            geometry = pair_geometry(
+                self.attitude,
+                float(plan.exposure_t0_s[event]),
+                float(plan.exposure_t1_s[event]),
+            )
+            rotation[slot] = torch.from_numpy(geometry["relative_rotation"])
+            down[slot] = torch.from_numpy(geometry["down_body"])
+            altitude[slot] = torch.from_numpy(geometry["altitude_m"])
+        return {
+            "visual_event_body_rate": rates,
+            "visual_event_rotation": rotation,
+            "visual_event_down": down,
+            "visual_event_altitude": altitude,
+        }
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         start = int(self.starts[index])
@@ -381,9 +420,7 @@ class FixedWingVODataset(Dataset):
             start, end, self.max_visual_events, min_capture_tick=range_start
         )
         item.update(pairs)
-        item["visual_event_body_rate"] = self._event_body_rates(
-            start, end, pairs["visual_event_offset"], pairs["visual_event_valid"]
-        )
+        item.update(self._event_inputs(start, end))
         # A window whose visual events all land before its first usable tick
         # would train the fusion on presence bits that never fire.
         item["visual_event_valid"] = pairs["visual_event_valid"]
@@ -545,6 +582,7 @@ def build_vo_dataset(
     images_rectified: bool = False,
     distortion: Optional[Sequence[float]] = None,
     normalizer: Optional[VONormalizer] = None,
+    grayscale: bool = True,
     **window_kwargs,
 ) -> Tuple[FixedWingVODataset, VONormalizer, AttitudeAltitude]:
     """Assemble a VO dataset from one flight directory.
@@ -555,6 +593,9 @@ def build_vo_dataset(
     previously read by :mod:`vio.data.calibration` and then never passed here,
     so a calibration file with real distortion had it silently ignored by
     every caller of this function.
+
+    ``grayscale=False`` loads the frames as RGB (three channels). It must
+    agree with the frontend's ``input_channels``: 1 for grayscale, 3 for RGB.
     """
 
     root = Path(dataset_root).expanduser().resolve()
@@ -591,7 +632,7 @@ def build_vo_dataset(
         calibration_image_size=calibration_image_size,
         images_rectified=images_rectified,
         distortion=distortion,
-        grayscale=True,
+        grayscale=bool(grayscale),
     )
     if normalizer is None:
         normalizer = VONormalizer.from_range(attitude, index_range)
@@ -659,6 +700,83 @@ def scatter_visual_tokens(
         quality_field[sample, ticks] = quality[sample, slots] * keep[sample, slots]
         present[sample, ticks] = keep[sample, slots]
     return token_field, quality_field, present
+
+
+def hold_visual_velocity(
+    velocity: torch.Tensor,
+    offsets: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    window_length: int,
+    delivered: Optional[torch.Tensor] = None,
+    carry: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Per-pair geometric velocities as a zero-order-hold field over ticks.
+
+    ``velocity`` is ``(B, E, 3)``, one metric velocity per visual event, placed
+    at the same ``ready_tick`` offsets :func:`scatter_visual_tokens` uses and
+    then HELD until the next delivered event replaces it. That is what a
+    deployed estimator has at any tick: the most recent measurement, not a
+    zero between measurements. Returns ``(held (B, T, 3), held_valid
+    (B, T, 1), new_carry)``, where ``held_valid`` is 0 until the first
+    delivered event and 1 from then on.
+
+    A refused pair (``delivered`` 0) does not update the hold - the previous
+    measurement stays in force, as ``visual_age`` keeps growing from it -
+    and neither does an invalid or out-of-window slot. Gradient flows to the
+    velocities that are held, so the frontend learns from every tick its
+    measurement stands in for.
+
+    ``carry`` is the ``(value (B, 3), valid (B,))`` pair this function
+    returned for the previous chunk of the same lanes (TBPTT), and fills the
+    ticks before this chunk's first delivery. ``None`` is a reset. Mask it
+    between chunks with :func:`mask_velocity_carry`.
+    """
+
+    if velocity.ndim != 3 or velocity.shape[-1] != 3:
+        raise ValueError("velocity must have shape (B, E, 3)")
+    batch, events, _ = velocity.shape
+    device, dtype = velocity.device, velocity.dtype
+    length = int(window_length)
+    inside = (offsets >= 0) & (offsets < length) & (valid > 0)
+    if delivered is not None:
+        inside = inside & (delivered.reshape(batch, events).to(device) > 0)
+    field = torch.zeros(batch, length, 3, device=device, dtype=dtype)
+    fired = torch.zeros(batch, length, dtype=torch.bool, device=device)
+    for sample in range(batch):
+        slots = torch.nonzero(inside[sample], as_tuple=False).flatten()
+        if slots.numel() == 0:
+            continue
+        ticks = offsets[sample, slots]
+        field[sample, ticks] = velocity[sample, slots]
+        fired[sample, ticks] = True
+    index = torch.arange(length, device=device).expand(batch, length)
+    latest, _ = torch.cummax(torch.where(fired, index, torch.full_like(index, -1)), dim=1)
+    seen = latest >= 0
+    held = field.gather(1, latest.clamp_min(0).unsqueeze(-1).expand(batch, length, 3))
+    if carry is not None:
+        carried_value, carried_valid = carry
+        if carried_value.shape != (batch, 3) or carried_valid.shape != (batch,):
+            raise ValueError("carry must be ((B, 3), (B,))")
+        before = (~seen).unsqueeze(-1)
+        held = torch.where(before, carried_value.to(device=device, dtype=dtype).unsqueeze(1), held)
+        seen = seen | carried_valid.to(device=device).bool().unsqueeze(1)
+    held = held * seen.unsqueeze(-1).to(dtype)
+    new_carry = (held[:, -1].detach(), seen[:, -1])
+    return held, seen.unsqueeze(-1).to(dtype), new_carry
+
+
+def mask_velocity_carry(
+    carry: Tuple[torch.Tensor, torch.Tensor], keep: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The held-velocity counterpart of ``mask_stream_state``: a reset lane
+    forgets its last measurement entirely (value zeroed, validity cleared)."""
+
+    value, valid = carry
+    if keep.shape != valid.shape:
+        raise ValueError("keep must have one entry per lane")
+    keep_bool = keep.to(device=valid.device).bool()
+    return value * keep_bool.unsqueeze(-1).to(value.dtype), valid & keep_bool
 
 
 #: Sentinel meaning "no image has ever been delivered" in a carried age-carry
@@ -776,7 +894,9 @@ __all__ = [
     "FixedWingVODataset",
     "VONormalizer",
     "build_vo_dataset",
+    "hold_visual_velocity",
     "mask_age_carry",
+    "mask_velocity_carry",
     "normalize_index_ranges",
     "reference_body_frame",
     "reference_body_velocity",

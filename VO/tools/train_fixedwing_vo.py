@@ -62,6 +62,7 @@ from vio.data.fixedwing_vo import (
     VO_AIDING_CHANNELS,
     VONormalizer,
     build_vo_dataset,
+    hold_visual_velocity,
     normalize_index_ranges,
     reference_body_frame,
     scatter_visual_tokens,
@@ -75,6 +76,11 @@ from vio.models.velocity_horizons import (
     horizon_metric_names,
     parse_horizon_minutes,
     stream_horizon_metrics,
+)
+from vio.models.frontend_factory import (
+    build_frontend,
+    frontend_class,
+    resolve_velocity_mode,
 )
 from vio.models.vision_mamba_vo import (
     VOStreamState,
@@ -319,6 +325,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Permit GPSNavEul* as an input. This is a leakage ablation and "
              "its result must be reported separately.",
     )
+    data.add_argument(
+        "--color", action="store_true",
+        help="Load the frames as RGB (three channels) instead of grayscale. "
+             "Worth it for a colour camera: vegetation, soil and water that are "
+             "one grey level can be three distinct colours, which is texture the "
+             "matcher can use. Triples image transport; no effect on JPEGs that "
+             "are single-channel on disk.",
+    )
 
     window = parser.add_argument_group("windows")
     window.add_argument("--window-length", type=int, default=600)
@@ -463,6 +477,76 @@ def build_parser() -> argparse.ArgumentParser:
              "rotation is removed from the first step instead of being learned "
              "through the correlator.",
     )
+    model.add_argument(
+        "--frontend", default="mamba_correlation",
+        choices=("mamba_correlation", "planar"),
+        help="'mamba_correlation' (default) is the original frontend: a learned "
+             "small-angle rotation field centres the search and the network "
+             "learns the scale. 'planar' removes rotation EXACTLY by warping "
+             "with the attitude, matches coarse-to-fine, and solves the camera "
+             "translation over a flat ground plane in closed form, with "
+             "RelativeAlt pinning the vertical - a metric velocity per pair "
+             "before any training. Built for a nadir camera well above the "
+             "terrain relief (hundreds of metres) and a long --frame-gap; see "
+             "tools/check_motion_budget.py for the gap and "
+             "tools/estimate_camera_mounting.py for --camera-mounting.",
+    )
+    model.add_argument(
+        "--velocity-mode", default="auto",
+        choices=("auto", "heads", "geometric_residual"),
+        help="How the output velocity is formed. 'heads': the original factored "
+             "direction x altitude x bearing-rate heads. 'geometric_residual': "
+             "the latest per-pair velocity from --frontend planar, held between "
+             "pairs, plus a learned correction that starts at zero - so the "
+             "untrained model already outputs the geometric estimate. 'auto' "
+             "(default) picks geometric_residual for --frontend planar and heads "
+             "otherwise.",
+    )
+
+    planar = parser.add_argument_group("planar frontend (--frontend planar)")
+    planar.add_argument(
+        "--camera-mounting", default=None, metavar="NAME|MATRIX|FILE",
+        help="Camera-to-body rotation. One of top_forward, right_forward, "
+             "left_forward, bottom_forward (which image edge faces the nose, "
+             "optical axis straight down); or a 3x3 camera_from_body matrix as "
+             "JSON; or a JSON file with a camera_from_body key (the output of "
+             "tools/estimate_camera_mounting.py). Default: the calibration "
+             "file's mounting.camera_from_body. Required for --frontend planar: "
+             "a wrong one swaps or negates the forward and lateral axes.",
+    )
+    planar.add_argument(
+        "--prior-velocity", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
+        help="Body velocity (m/s) the coarse search is centred on. Default: the "
+             "training split's mean velocity. The coarse window reaches +/- "
+             "(--coarse-radius x --coarse-factor) cells around it.",
+    )
+    planar.add_argument("--coarse-factor", type=int, default=4,
+                        help="Feature pooling for the coarse stage (default 4).")
+    planar.add_argument("--coarse-radius", type=int, default=6,
+                        help="Coarse search radius in pooled cells (default 6).")
+    planar.add_argument("--coarse-highpass", type=int, default=5,
+                        help="Local-mean kernel removed from coarse features (odd; 1 = off).")
+    planar.add_argument("--fine-highpass", type=int, default=9,
+                        help="Local-mean kernel removed from fine features (odd; 1 = off).")
+    planar.add_argument("--fine-iterations", type=int, default=2,
+                        help="Fine correlate-and-fit passes (the last is differentiated).")
+    planar.add_argument("--huber-cells", type=float, default=1.0,
+                        help="Robust-fit residual, in cells, beyond which a cell stops counting fully.")
+    planar.add_argument(
+        "--altitude-constraint", type=float, default=300.0,
+        help="Weight of the altimeter row n.t = h0 - h1 in the planar fit, "
+             "relative to the image's own information. The image sees the "
+             "vertical only as a percent-level scale change; the altimeter "
+             "measures it. 0 = image only.",
+    )
+    planar.add_argument("--no-learn-mounting", action="store_true",
+                        help="Freeze the mounting (no learned misalignment correction).")
+    planar.add_argument("--mounting-lr-scale", type=float, default=0.1,
+                        help="Learning-rate multiplier for the mounting correction.")
+    planar.add_argument("--max-geometric-speed", type=float, default=80.0,
+                        help="A per-pair velocity faster than this (m/s) is refused.")
+    planar.add_argument("--min-fit-cells", type=float, default=8.0,
+                        help="Minimum confidence-weighted cell count for a pair's fit.")
 
     train = parser.add_argument_group("training")
     train.add_argument(
@@ -508,6 +592,28 @@ def build_parser() -> argparse.ArgumentParser:
              "Below it the penalty is quadratic, above it linear, so a GPS "
              "glitch or a mis-timed frame costs a bounded amount instead of "
              "dominating its batch.",
+    )
+    train.add_argument(
+        "--photometric-augment", type=float, default=0.0, metavar="STRENGTH",
+        help="Training-only exposure jitter: random gain, offset and gamma per "
+             "pair, slightly different between the two images of a pair (what an "
+             "auto-exposure camera does). STRENGTH is the standard deviation of "
+             "the shared log-gain; 0.1-0.2 is sensible. 0 (default) is off.",
+    )
+    train.add_argument(
+        "--patience", type=int, default=0, metavar="EPOCHS",
+        help="Stop when the --select-on metric has not improved by --min-delta "
+             "for this many epochs. 0 (default) never stops early. best.pt is "
+             "the selected checkpoint either way.",
+    )
+    train.add_argument("--min-delta", type=float, default=0.0,
+                       help="Improvement smaller than this does not reset --patience.")
+    train.add_argument(
+        "--lr-warmup-epochs", type=int, default=0,
+        help="Ramp the learning rate linearly from 1/N to full over the first N "
+             "epochs before the cosine decay. Large effective batches "
+             "(--lr-scaling linear over many ranks) are the usual reason a "
+             "first epoch spikes; a short warm-up avoids it. 0 = none.",
     )
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -756,11 +862,96 @@ def resolve_lever_arm(args: argparse.Namespace) -> Optional[List[float]]:
     return arm if any(v != 0.0 for v in arm) else None
 
 
+def build_schedule(
+    optimizer: torch.optim.Optimizer, epochs: int, warmup_epochs: int = 0
+) -> torch.optim.lr_scheduler.LRScheduler:
+    """Cosine decay to zero over ``epochs``, stepped once per epoch.
+
+    With ``warmup_epochs`` the first N epochs ramp linearly from 1/N of the
+    rate to all of it, then the same cosine takes over. Without it this is
+    exactly the CosineAnnealingLR every earlier run used, so resuming one of
+    those restores the same schedule object it saved.
+    """
+
+    if warmup_epochs <= 0:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    warm = int(warmup_epochs)
+    total = max(int(epochs), 1)
+
+    def factor(epoch: int) -> float:
+        if epoch < warm:
+            return (epoch + 1) / warm
+        return 0.5 * (1.0 + math.cos(math.pi * min(epoch, total) / total))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+
+
+def parse_camera_mounting(value: Any) -> List[List[float]]:
+    """A camera_from_body rotation from a name, a matrix, JSON text or a file.
+
+    Accepts what ``--camera-mounting`` and a calibration's
+    ``mounting.camera_from_body`` may hold: one of
+    :data:`~vio.models.planar_geometry.NADIR_MOUNTINGS`' names, a 3x3 nested
+    list, that list as JSON text, or the path of a JSON file with a
+    ``camera_from_body`` key (top level or under ``mounting``) - which is what
+    ``tools/estimate_camera_mounting.py`` writes. Validated as a proper
+    rotation either way.
+    """
+
+    from vio.models.planar_geometry import NADIR_MOUNTINGS, mounting_matrix
+
+    candidate = value
+    if isinstance(candidate, str):
+        text = candidate.strip()
+        if text in NADIR_MOUNTINGS:
+            return mounting_matrix(text).tolist()
+        if text.startswith("["):
+            candidate = json.loads(text)
+        else:
+            path = Path(text).expanduser()
+            if not path.is_file():
+                raise SystemExit(
+                    f"--camera-mounting {value!r} is not a mounting name "
+                    f"({', '.join(sorted(NADIR_MOUNTINGS))}), a JSON matrix, or a file"
+                )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            candidate = payload.get("camera_from_body") or payload.get(
+                "mounting", {}
+            ).get("camera_from_body")
+            if candidate is None:
+                raise SystemExit(f"{path} has no camera_from_body")
+            if isinstance(candidate, str):
+                return mounting_matrix(candidate).tolist()
+    try:
+        return mounting_matrix(candidate).tolist()
+    except ValueError as error:
+        raise SystemExit(f"invalid camera mounting {value!r}: {error}") from error
+
+
+def resolve_camera_mounting(args: argparse.Namespace) -> Optional[List[List[float]]]:
+    """``--camera-mounting``, else the calibration's mounting, else None."""
+
+    if getattr(args, "camera_mounting", None):
+        return parse_camera_mounting(args.camera_mounting)
+    if args.calibration is not None:
+        mounting = json.loads(
+            Path(args.calibration).read_text(encoding="utf-8")
+        ).get("mounting", {})
+        recorded = mounting.get("camera_from_body")
+        if recorded is not None:
+            return parse_camera_mounting(recorded)
+    return None
+
+
 def resume_fingerprint(
     args: argparse.Namespace,
     source,
     normalizer: VONormalizer,
     ranges: Mapping[str, Union[Tuple[int, int], Sequence[Tuple[int, int]]]],
+    *,
+    frontend_id: Optional[str] = None,
+    temporal_input_id: Optional[str] = None,
+    planar: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Everything a resumed run must still agree with the original about.
 
@@ -773,6 +964,12 @@ def resume_fingerprint(
     Deliberately absent: --epochs, --learning-rate, --batch-size and the rest
     of the optimisation knobs. Changing those on a resume is a legitimate
     thing to do and is reported rather than refused.
+
+    ``frontend_id`` / ``temporal_input_id`` are the BUILT modules' ids (the
+    planar frontend and the geometric-residual fusion have their own);
+    omitted, the original frontend's and fusion's are assumed. ``planar`` is
+    the resolved flat-ground geometry (mounting, prior, search settings) or
+    None for the original frontend.
     """
 
     camera: Dict[str, object] = {}
@@ -829,6 +1026,10 @@ def resume_fingerprint(
             "ablate_body_rate": bool(args.ablate_body_rate),
             "ablate_visual_age": bool(args.ablate_visual_age),
             "normalizer": normalizer.as_dict(),
+            # Grayscale and RGB frames are different pixels AND a different
+            # stem shape; a resume across them would fail to load anyway, but
+            # the refusal should say why.
+            "color": bool(getattr(args, "color", False)),
             "camera": {
                 key: camera.get(key)
                 for key in ("fx", "fy", "cx", "cy", "width", "height",
@@ -865,7 +1066,7 @@ def resume_fingerprint(
             # motion differently. Deliberately absent from FINGERPRINT_DEFAULTS:
             # a checkpoint predating this key cannot be shown to have used the
             # current algorithm, so it is refused rather than assumed.
-            "frontend_id": str(VisionMambaFlowFrontend.frontend_id),
+            "frontend_id": str(frontend_id or VisionMambaFlowFrontend.frontend_id),
             # Changes the SHAPE of rotation.map (3x3 against 2x3) as well as
             # the geometry, so a mismatch is a hard load failure rather than a
             # silent one - but naming it here makes the refusal say why.
@@ -878,7 +1079,13 @@ def resume_fingerprint(
             # same shape - deliberately absent from FINGERPRINT_DEFAULTS, for
             # the same reason frontend_id is: a checkpoint predating this key
             # cannot be shown to have used the current contract.
-            "temporal_input_id": str(VisionMambaVO.temporal_input_id),
+            "temporal_input_id": str(temporal_input_id or VisionMambaVO.temporal_input_id),
+            # Which frontend and how its output becomes a velocity. Both change
+            # what the weights mean, and the planar geometry below changes
+            # what the frontend measures without changing any tensor shape.
+            "frontend": str(getattr(args, "frontend", "mamba_correlation")),
+            "velocity_mode": resolve_velocity_mode(args),
+            "planar": None if planar is None else dict(planar),
         },
     }
 
@@ -919,6 +1126,13 @@ FINGERPRINT_DEFAULTS: Dict[str, object] = {
     "min_score_margin": 0.0,
     "reject_boundary_peaks": False,
     "min_reliable_cell_fraction": 0.0,
+    # The planar frontend, RGB input and the geometric output all postdate
+    # every earlier checkpoint, which therefore ran the original frontend on
+    # grayscale frames with the factored heads.
+    "color": False,
+    "frontend": "mamba_correlation",
+    "velocity_mode": "heads",
+    "planar": None,
 }
 
 
@@ -1339,6 +1553,7 @@ def run_horizon_pass(
         num_workers=args.num_workers,
         disable_visual=args.disable_visual_input,
         progress=not args.no_progress,
+        attitude=dataset.attitude,
     )
     results = stream_horizon_metrics(
         model,
@@ -1441,48 +1656,143 @@ def encode_pairs(
     live tensor when chunking was supposed to bound memory.
     """
 
-    def encode(first, second, interval, rate):
+    encoded = encode_pair_batch(
+        frontend, image0, image1, pair_dt_s, body_rate_rad_s,
+        camera_matrix=camera_matrix, chunk=chunk,
+    )
+    return encoded["visual_token"], encoded["visual_quality"], encoded["pair_reliable"]
+
+
+#: Per-pair frontend outputs :func:`encode_pair_batch` collects, beyond the
+#: token/quality/verdict every frontend returns. Only the flat-ground frontend
+#: produces them.
+GEOMETRIC_OUTPUTS = ("geometric_velocity", "geometric_log_variance", "geometric_valid")
+
+#: Per-pair inputs the flat-ground frontend reads, in the order they are
+#: chunked. Keyword names of PlanarFlowFrontend.forward.
+PAIR_GEOMETRY_INPUTS = ("relative_rotation", "down_body", "altitude_m")
+
+
+def photometric_parameters(
+    pairs: int, channels: int, strength: float, *, device: torch.device,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Random per-pair exposure changes, ``(pairs, 2, channels + 2)``.
+
+    For each of the two images: a per-channel gain (brightness and, on RGB, a
+    white-balance shift), an additive offset, and a gamma. The two images
+    share most of it - a scene lit differently along the flight - and differ
+    by a smaller amount, which is what an auto-exposure camera does between
+    two frames a second apart. ``strength`` is the standard deviation of the
+    shared log-gain; everything else is scaled from it. Drawn OUTSIDE the
+    checkpointed frontend call and handed in as a tensor, so the recompute in
+    the backward pass applies exactly the same change as the forward did.
+    """
+
+    def normal(*shape: int) -> torch.Tensor:
+        return torch.randn(*shape, generator=generator, device=device)
+
+    shared_gain = normal(pairs, 1, 1) * strength
+    colour = normal(pairs, 1, channels) * (0.25 * strength if channels > 1 else 0.0)
+    per_image = normal(pairs, 2, 1) * (0.5 * strength)
+    gain = torch.exp(shared_gain + colour + per_image)
+    offset = normal(pairs, 2, 1) * (0.1 * strength)
+    gamma = torch.exp(normal(pairs, 1, 1) * (0.5 * strength) + normal(pairs, 2, 1) * (0.2 * strength))
+    return torch.cat((gain, offset, gamma), dim=-1)
+
+
+def apply_photometric(image: torch.Tensor, parameters: torch.Tensor) -> torch.Tensor:
+    """``image`` ``(N, C, H, W)`` in [0, 1], ``parameters`` ``(N, C + 2)``."""
+
+    channels = image.shape[1]
+    gain = parameters[:, :channels].view(-1, channels, 1, 1)
+    offset = parameters[:, channels:channels + 1].view(-1, 1, 1, 1)
+    gamma = parameters[:, channels + 1:channels + 2].view(-1, 1, 1, 1)
+    return (image.clamp_min(1e-6).pow(gamma) * gain + offset).clamp(0.0, 1.0)
+
+
+def encode_pair_batch(
+    frontend: torch.nn.Module,
+    image0: torch.Tensor,
+    image1: torch.Tensor,
+    pair_dt_s: torch.Tensor,
+    body_rate_rad_s: torch.Tensor,
+    *,
+    camera_matrix: Optional[torch.Tensor] = None,
+    chunk: int = 0,
+    pair_geometry: Optional[Mapping[str, torch.Tensor]] = None,
+    photometric: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """:func:`encode_pairs`, generalised: any per-pair inputs, a dict out.
+
+    ``pair_geometry`` holds :data:`PAIR_GEOMETRY_INPUTS` for the flat-ground
+    frontend, one row per pair, and is chunked with the images.
+    ``photometric`` is :func:`photometric_parameters`' output, applied to the
+    float images inside the chunk. The returned dict always has
+    ``visual_token``, ``visual_quality`` and ``pair_reliable``, plus
+    :data:`GEOMETRIC_OUTPUTS` when the frontend produces them. Chunking and
+    checkpointing behave exactly as :func:`encode_pairs` documents.
+    """
+
+    # A frontend that takes pair geometry also returns a metric velocity; the
+    # attribute, not the outputs of one call, decides it, so every chunk of
+    # every batch returns the same tuple layout.
+    geometric = bool(getattr(frontend, "requires_pair_geometry", False))
+    geometry_names = tuple(pair_geometry) if pair_geometry is not None else ()
+    geometry_values = tuple(pair_geometry[name] for name in geometry_names) if pair_geometry else ()
+    with_photometric = photometric is not None
+
+    def encode(first, second, interval, rate, *extra):
+        first = first.float().div(255.0)
+        second = second.float().div(255.0)
+        if with_photometric:
+            parameters = extra[-1]
+            extra = extra[:-1]
+            first = apply_photometric(first, parameters[:, 0])
+            second = apply_photometric(second, parameters[:, 1])
+        keywords = dict(zip(geometry_names, extra))
         out = frontend(
-            first.float().div(255.0), second.float().div(255.0), pair_dt_s=interval,
-            body_rate_rad_s=rate, camera_matrix=camera_matrix,
+            first, second, pair_dt_s=interval,
+            body_rate_rad_s=rate, camera_matrix=camera_matrix, **keywords,
         )
-        return out["visual_token"], out["visual_quality"], out["pair_reliable"]
+        results = [out["visual_token"], out["visual_quality"], out["pair_reliable"]]
+        if geometric:
+            results += [out[name] for name in GEOMETRIC_OUTPUTS]
+        return tuple(results)
+
+    names = ["visual_token", "visual_quality", "pair_reliable"]
+    inputs = (image0, image1, pair_dt_s, body_rate_rad_s, *geometry_values)
+    if with_photometric:
+        inputs = inputs + (photometric,)
 
     if chunk <= 0:
-        return encode(image0, image1, pair_dt_s, body_rate_rad_s)
-
-    checkpointing = torch.is_grad_enabled()
-    tokens, qualities, reliabilities = [], [], []
-    for start in range(0, image0.shape[0], chunk):
-        stop = min(start + chunk, image0.shape[0])
-        if checkpointing:
-            # use_reentrant=False keeps this working with a frontend whose inputs
-            # do not all require grad, which is the case here: the images never do.
-            # checkpoint() carries no return annotation, so a checker infers it
-            # from torch's own branches and lands on "... | None", which cannot be
-            # unpacked. It returns exactly what `encode` returned, which is the
-            # pair named here.
-            piece, quality, reliable = cast(
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                checkpoint(
-                    encode, image0[start:stop], image1[start:stop],
-                    pair_dt_s[start:stop], body_rate_rad_s[start:stop],
-                    use_reentrant=False,
-                ),
-            )
-        else:
-            # Nothing will ever call backward() through this - checkpoint()'s
-            # save-input/recompute-later machinery exists only to serve one,
-            # so skip it and call the frontend directly. Chunking above still
-            # bounds the correlator's peak tensor to this chunk's pair count.
-            piece, quality, reliable = encode(
-                image0[start:stop], image1[start:stop],
-                pair_dt_s[start:stop], body_rate_rad_s[start:stop],
-            )
-        tokens.append(piece)
-        qualities.append(quality)
-        reliabilities.append(reliable)
-    return torch.cat(tokens), torch.cat(qualities), torch.cat(reliabilities)
+        pieces = [encode(*inputs)]
+    else:
+        checkpointing = torch.is_grad_enabled()
+        pieces = []
+        for start in range(0, image0.shape[0], chunk):
+            stop = min(start + chunk, image0.shape[0])
+            sliced = tuple(value[start:stop] for value in inputs)
+            if checkpointing:
+                # use_reentrant=False keeps this working with a frontend whose
+                # inputs do not all require grad, which is the case here: the
+                # images never do. checkpoint() carries no return annotation,
+                # so a checker infers it from torch's own branches and lands
+                # on "... | None"; it returns exactly what `encode` returned.
+                pieces.append(
+                    cast(tuple, checkpoint(encode, *sliced, use_reentrant=False))
+                )
+            else:
+                # Nothing will ever call backward() through this, so skip
+                # checkpoint()'s save-input/recompute machinery. Chunking still
+                # bounds the correlator's peak tensor to this chunk.
+                pieces.append(encode(*sliced))
+    if geometric:
+        names += list(GEOMETRIC_OUTPUTS)
+    return {
+        name: torch.cat([piece[index] for piece in pieces])
+        for index, name in enumerate(names)
+    }
 
 
 class VOStep(torch.nn.Module):
@@ -1497,6 +1807,13 @@ class VOStep(torch.nn.Module):
 
     Single-GPU runs go through exactly this path too, so there is no untested
     second branch.
+
+    With the flat-ground frontend (``requires_pair_geometry``) each pair also
+    carries its attitude geometry in, and a metric velocity out; that velocity
+    is held between pairs (:func:`hold_visual_velocity`) and handed to a
+    ``geometric_residual`` model as the base of its prediction.
+    ``photometric_augment`` (training only) jitters each pair's exposure before
+    the frontend sees it - see :func:`photometric_parameters`.
     """
 
     #: Declared so a type checker knows what register_buffer put here.
@@ -1518,6 +1835,7 @@ class VOStep(torch.nn.Module):
         camera_matrix: Optional[torch.Tensor] = None,
         ablate_body_rate: bool = False,
         ablate_visual_age: bool = False,
+        photometric_augment: float = 0.0,
     ) -> None:
         super().__init__()
         self.model = model
@@ -1528,6 +1846,17 @@ class VOStep(torch.nn.Module):
         self.deployment_latency_s = float(deployment_latency_s)
         self.ablate_body_rate = bool(ablate_body_rate)
         self.ablate_visual_age = bool(ablate_visual_age)
+        self.photometric_augment = float(photometric_augment)
+        frontend = model.frontend
+        self.requires_geometry = bool(
+            frontend is not None and getattr(frontend, "requires_pair_geometry", False)
+        )
+        self.geometric_residual = model.velocity_mode == "geometric_residual"
+        if self.geometric_residual and not self.requires_geometry and not disable_visual:
+            raise ValueError(
+                "velocity_mode 'geometric_residual' needs a frontend that produces "
+                "a metric velocity (--frontend planar)"
+            )
         # Last batch's pair accounting, for logging only. Plain floats rather
         # than buffers: they are a report on the batch that just went through,
         # not state the model depends on, and a buffer would be checkpointed
@@ -1535,6 +1864,9 @@ class VOStep(torch.nn.Module):
         # after forward() and accumulates its own epoch totals.
         self._pairs_offered = 0.0
         self._pairs_delivered = 0.0
+        # The held-velocity carry from the last forward_stream call, for a
+        # TBPTT caller to mask and hand back (see forward_batch_stream).
+        self.last_velocity_carry: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         # A buffer, so .to(device) and DDP's device checks handle it and it is
         # never silently left on the CPU while the images are not.
         self.register_buffer(
@@ -1554,22 +1886,30 @@ class VOStep(torch.nn.Module):
         valid: torch.Tensor,
         times_s: torch.Tensor,
         age_carry: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The frontend + scatter + age pipeline shared by :meth:`forward` and
-        :meth:`forward_stream` - the two differ only in which of
-        ``VisionMambaVO.forward``/``forward_stream`` they hand this to.
+        geometry: Optional[Mapping[str, torch.Tensor]] = None,
+        velocity_carry: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Dict[str, Any]:
+        """The frontend + scatter + age (+ held velocity) pipeline shared by
+        :meth:`forward` and :meth:`forward_stream` - the two differ only in
+        which of ``VisionMambaVO.forward``/``forward_stream`` they hand this to.
 
-        Returns ``(token, quality, present, age, new_age_carry)``; ``forward``
-        discards ``new_age_carry`` (a reset every window, by design), only
-        :meth:`forward_stream` threads it onward.
+        Returns a dict: ``token``, ``quality``, ``present``, ``age``,
+        ``age_carry`` and - for a ``geometric_residual`` model -
+        ``visual_velocity``, ``visual_velocity_valid`` and ``velocity_carry``.
+        ``forward`` discards the carries (a reset every window, by design);
+        only :meth:`forward_stream` threads them onward.
         """
 
         batch_size, events = image0.shape[:2]
+        held = held_valid = new_velocity_carry = None
         if self.disable_visual:
             shape = (batch_size, self.window_length, self.visual_dim)
             token = aiding.new_zeros(shape)
             quality = aiding.new_zeros((batch_size, self.window_length, 1))
             present = aiding.new_zeros((batch_size, self.window_length, 1))
+            if self.geometric_residual:
+                held = aiding.new_zeros((batch_size, self.window_length, 3))
+                held_valid = aiding.new_zeros((batch_size, self.window_length, 1))
         else:
             # disable_visual and "the model has a frontend" are separate facts,
             # so this can be None here. Saying so is both what narrows the type
@@ -1581,10 +1921,28 @@ class VOStep(torch.nn.Module):
                     "visual input is enabled but the model has no frontend; "
                     "pass one to VisionMambaVO or set disable_visual"
                 )
-            tokens, qualities, reliable = encode_pairs(
+            pair_geometry = None
+            if self.requires_geometry:
+                if geometry is None:
+                    raise RuntimeError(
+                        "the planar frontend needs each pair's geometry "
+                        "(visual_event_rotation/down/altitude in the batch)"
+                    )
+                pair_geometry = {
+                    "relative_rotation": geometry["rotation"].flatten(0, 1),
+                    "down_body": geometry["down"].flatten(0, 1),
+                    "altitude_m": geometry["altitude"].flatten(0, 1),
+                }
+            photometric = None
+            if self.training and self.photometric_augment > 0.0:
+                photometric = photometric_parameters(
+                    batch_size * events, int(image0.shape[2]), self.photometric_augment,
+                    device=image0.device,
+                )
+            encoded = encode_pair_batch(
                 frontend,
                 # Raw uint8 CHW pairs, deliberately not converted to float
-                # here: encode_pairs does that per chunk, so the whole
+                # here: encode_pair_batch does that per chunk, so the whole
                 # batch's images are never live as float at once.
                 image0.flatten(0, 1),
                 image1.flatten(0, 1),
@@ -1592,6 +1950,8 @@ class VOStep(torch.nn.Module):
                 body_rate.flatten(0, 1),
                 camera_matrix=self.camera_matrix,
                 chunk=self.frontend_chunk,
+                pair_geometry=pair_geometry,
+                photometric=photometric,
             )
             # A pair the frontend judged unreliable becomes an ABSENT pair,
             # not a zeroed token delivered as though an image had arrived:
@@ -1607,18 +1967,26 @@ class VOStep(torch.nn.Module):
             # from the index set would take the frontend out of the autograd
             # graph entirely on a batch where every pair was refused, which
             # static_graph DDP does not survive. See scatter_visual_tokens.
-            reliable = reliable.reshape(batch_size, events)
+            reliable = encoded["pair_reliable"].reshape(batch_size, events)
             delivered = valid.to(reliable.dtype) * reliable
             self._pairs_offered = float(valid.sum().detach())
             self._pairs_delivered = float(delivered.sum().detach())
             token, quality, present = scatter_visual_tokens(
-                tokens.reshape(batch_size, events, self.visual_dim),
-                qualities.reshape(batch_size, events, 1),
+                encoded["visual_token"].reshape(batch_size, events, self.visual_dim),
+                encoded["visual_quality"].reshape(batch_size, events, 1),
                 offsets, valid,
                 window_length=self.window_length,
                 visual_dim=self.visual_dim,
                 delivered=reliable,
             )
+            if self.geometric_residual:
+                held, held_valid, new_velocity_carry = hold_visual_velocity(
+                    encoded["geometric_velocity"].reshape(batch_size, events, 3),
+                    offsets, valid,
+                    window_length=self.window_length,
+                    delivered=reliable,
+                    carry=velocity_carry,
+                )
         age, new_age_carry = visual_age_seconds(
             present, times_s, self.deployment_latency_s, carry=age_carry
         )
@@ -1628,7 +1996,16 @@ class VOStep(torch.nn.Module):
             # ablation flags a run happens to set, or a checkpoint from one
             # combination could never even load into another.
             age = torch.zeros_like(age)
-        return token, quality, present, age, new_age_carry
+        return {
+            "token": token,
+            "quality": quality,
+            "present": present,
+            "age": age,
+            "age_carry": new_age_carry,
+            "visual_velocity": held,
+            "visual_velocity_valid": held_valid,
+            "velocity_carry": new_velocity_carry,
+        }
 
     def _maybe_ablate_body_rate(self, aiding: torch.Tensor) -> torch.Tensor:
         if not self.ablate_body_rate:
@@ -1636,6 +2013,16 @@ class VOStep(torch.nn.Module):
         aiding = aiding.clone()
         aiding[..., BODY_RATE_AIDING_SLICE] = 0.0
         return aiding
+
+    @staticmethod
+    def _geometry(
+        rotation: Optional[torch.Tensor],
+        down: Optional[torch.Tensor],
+        altitude: Optional[torch.Tensor],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if rotation is None or down is None or altitude is None:
+            return None
+        return {"rotation": rotation, "down": down, "altitude": altitude}
 
     def forward(
         self,
@@ -1648,13 +2035,20 @@ class VOStep(torch.nn.Module):
         offsets: torch.Tensor,
         valid: torch.Tensor,
         times_s: torch.Tensor,
+        rotation: Optional[torch.Tensor] = None,
+        down: Optional[torch.Tensor] = None,
+        altitude: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         aiding = self._maybe_ablate_body_rate(aiding)
-        token, quality, present, age, _ = self._encode_visual(
-            aiding, image0, image1, pair_dt_s, body_rate, offsets, valid, times_s
+        visual = self._encode_visual(
+            aiding, image0, image1, pair_dt_s, body_rate, offsets, valid, times_s,
+            geometry=self._geometry(rotation, down, altitude),
         )
         return self.model(
-            aiding, token, present, age, visual_quality=quality, log_altitude=log_altitude
+            aiding, visual["token"], visual["present"], visual["age"],
+            visual_quality=visual["quality"], log_altitude=log_altitude,
+            visual_velocity=visual["visual_velocity"],
+            visual_velocity_valid=visual["visual_velocity_valid"],
         )
 
     def forward_stream(
@@ -1670,6 +2064,10 @@ class VOStep(torch.nn.Module):
         times_s: torch.Tensor,
         state: Optional[VOStreamState],
         age_carry: Optional[torch.Tensor] = None,
+        rotation: Optional[torch.Tensor] = None,
+        down: Optional[torch.Tensor] = None,
+        altitude: Optional[torch.Tensor] = None,
+        velocity_carry: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[Dict[str, torch.Tensor], VOStreamState, torch.Tensor]:
         """:meth:`forward` for TBPTT: threads recurrent state across
         chronologically-adjacent windows instead of resetting it every window.
@@ -1678,7 +2076,10 @@ class VOStep(torch.nn.Module):
         :func:`~vio.data.fixedwing_vo.visual_age_seconds` and
         :func:`~vio.data.fixedwing_vo.mask_age_carry` - so a continuing lane's
         staleness keeps growing from where the previous chunk left it instead
-        of resetting to 0 at every window boundary.
+        of resetting to 0 at every window boundary. ``velocity_carry`` is the
+        same for a ``geometric_residual`` model's held velocity; the new one is
+        left in :attr:`last_velocity_carry` (mask it with
+        :func:`~vio.data.fixedwing_vo.mask_velocity_carry`).
 
         Local-only scaffold (see ``PLAN_TBPTT.txt``): correct only when
         ``self`` is the bare module, not wrapped in
@@ -1689,15 +2090,30 @@ class VOStep(torch.nn.Module):
         """
 
         aiding = self._maybe_ablate_body_rate(aiding)
-        token, quality, present, age, new_age_carry = self._encode_visual(
+        visual = self._encode_visual(
             aiding, image0, image1, pair_dt_s, body_rate, offsets, valid, times_s,
             age_carry=age_carry,
+            geometry=self._geometry(rotation, down, altitude),
+            velocity_carry=velocity_carry,
         )
+        self.last_velocity_carry = visual["velocity_carry"]
         prediction, state = self.model.forward_stream(
-            aiding, token, present, age,
-            visual_quality=quality, log_altitude=log_altitude, state=state,
+            aiding, visual["token"], visual["present"], visual["age"],
+            visual_quality=visual["quality"], log_altitude=log_altitude, state=state,
+            visual_velocity=visual["visual_velocity"],
+            visual_velocity_valid=visual["visual_velocity_valid"],
         )
-        return prediction, state, new_age_carry
+        return prediction, state, visual["age_carry"]
+
+
+#: Batch keys carrying each pair's attitude geometry, in VOStep.forward's
+#: trailing positional order. Always produced by FixedWingVODataset; only the
+#: flat-ground frontend reads them.
+PAIR_GEOMETRY_KEYS = ("visual_event_rotation", "visual_event_down", "visual_event_altitude")
+
+
+def _geometry_arguments(batch: Mapping[str, torch.Tensor], to) -> List[Optional[torch.Tensor]]:
+    return [to(name) if name in batch else None for name in PAIR_GEOMETRY_KEYS]
 
 
 def forward_batch(
@@ -1723,6 +2139,7 @@ def forward_batch(
         to("visual_event_offset"),
         to("visual_event_valid"),
         to("telemetry_time_s"),
+        *_geometry_arguments(batch, to),
     )
     return prediction, to("target_velocity_body"), to("loss_mask")
 
@@ -1733,6 +2150,7 @@ def forward_batch_stream(
     device: torch.device,
     state: Optional[VOStreamState],
     age_carry: Optional[torch.Tensor] = None,
+    velocity_carry: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, VOStreamState, torch.Tensor]:
     """TBPTT counterpart of :func:`forward_batch`: threads recurrent state
     across chronologically-adjacent windows (see ChronologicalWindowSampler in
@@ -1740,9 +2158,12 @@ def forward_batch_stream(
 
     Local-only scaffold: ``step`` must be the bare :class:`VOStep`, never a
     ``DistributedDataParallel`` wrapper - see :meth:`VOStep.forward_stream`.
+    A ``geometric_residual`` model's new held-velocity carry is left in
+    ``step.last_velocity_carry``.
     """
 
     to = lambda name: batch[name].to(device, non_blocking=True)
+    rotation, down, altitude = _geometry_arguments(batch, to)
     prediction, state, age_carry = step.forward_stream(
         to("aiding"),
         to("log_altitude"),
@@ -1755,6 +2176,10 @@ def forward_batch_stream(
         to("telemetry_time_s"),
         state,
         age_carry,
+        rotation=rotation,
+        down=down,
+        altitude=altitude,
+        velocity_carry=velocity_carry,
     )
     return prediction, to("target_velocity_body"), to("loss_mask"), state, age_carry
 
@@ -1911,6 +2336,7 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             normalizer=normalizer, window_length=args.window_length,
             stride=args.stride, warmup=args.warmup,
             max_visual_events=args.max_visual_events,
+            grayscale=not args.color,
         )
         if normalizer is None:
             normalizer = built
@@ -1935,6 +2361,28 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
 
     if "train" not in datasets:
         raise SystemExit("The training split is shorter than one window.")
+
+    # Every window is a cold start: nothing is delivered before one pair
+    # interval plus the deployment latency has passed since the window began.
+    # Ticks before that are scored as if the model had vision - with a long
+    # --frame-gap (one second at 20 Hz for gap 20) that is a fifth of a 6 s
+    # window of pure attitude-only guessing mixed into every metric.
+    train_pairs = datasets["train"].image_source.plan.pair_dt_s
+    if train_pairs.size and not args.disable_visual_input:
+        tick_interval = float(np.median(np.diff(source.times_s)))
+        if tick_interval > 0:
+            blind_ticks = int(np.ceil(
+                (args.deployment_latency_s + float(np.median(train_pairs))) / tick_interval
+            ))
+            if args.warmup < blind_ticks:
+                world.log(
+                    f"  WARNING --warmup {args.warmup} ticks is shorter than the "
+                    f"~{blind_ticks} ticks every window spends before its first "
+                    f"image pair can arrive (pair interval "
+                    f"{float(np.median(train_pairs)):.3f} s + latency "
+                    f"{args.deployment_latency_s:.3f} s); those ticks are scored "
+                    f"blind. Consider --warmup {blind_ticks + 5}."
+                )
     if "validation" not in datasets:
         # Training without validation is not a degraded run, it is an unscored
         # one: nothing selects a checkpoint, nothing detects overfitting, and
@@ -1968,7 +2416,7 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
         "product": "visual_odometry_velocity",
         "raw_imu_used": False,
         "image_input": {
-            "kind": "grayscale_frame_pair",
+            "kind": "rgb_frame_pair" if args.color else "grayscale_frame_pair",
             "height": int(args.image_size[0]),
             "width": int(args.image_size[1]),
             "frame_gap": int(args.frame_gap),
@@ -1991,6 +2439,15 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             "velocity_log_variance_z",
         ],
     }
+    input_contract["frontend"] = str(args.frontend)
+    input_contract["velocity_mode"] = resolve_velocity_mode(args)
+    if args.frontend == "planar":
+        input_contract["telemetry_input"]["planar_geometry"] = (
+            "per pair: relative rotation between the exposures (NavEul*, exact), "
+            "ground normal from roll/pitch, and altitude at both exposures; "
+            "the image is de-rotated by warping and the translation solved over "
+            "a flat ground plane"
+        )
     (args.run_dir / "input_contract.json").write_text(
         json.dumps(input_contract, indent=2) + "\n", encoding="utf-8"
     )
@@ -2010,19 +2467,63 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
     baseline = train_velocity.mean(axis=0)
     world.log("train mean velocity baseline: [%.2f %.2f %.2f] m/s" % tuple(baseline))
 
-    frontend = VisionMambaFlowFrontend(
-        visual_dim=args.visual_dim, d_model=args.stem_dim, depth=args.stem_depth,
-        patch_size=args.patch_size, image_size=tuple(args.image_size),
-        context_grid=tuple(args.context_grid), token_grid=args.token_grid,
-        correlation_radius=args.correlation_radius, dropout=args.dropout,
-        rotation_mode=args.rotation_mode,
-        min_pool_weight=args.min_pool_weight,
-        max_cell_entropy=args.max_cell_entropy,
-        min_cell_confidence=args.min_cell_confidence,
-        min_score_margin=args.min_score_margin,
-        reject_boundary_peaks=args.reject_boundary_peaks,
-        min_reliable_cell_fraction=args.min_reliable_cell_fraction,
+    velocity_mode = resolve_velocity_mode(args)
+    camera_from_body = resolve_camera_mounting(args)
+    prior_velocity = (
+        [float(v) for v in args.prior_velocity]
+        if args.prior_velocity is not None
+        else [float(v) for v in baseline]
+    )
+    planar_settings: Optional[Dict[str, Any]] = None
+    if args.frontend == "planar":
+        if camera_matrix is None:
+            raise SystemExit(
+                "--frontend planar needs --calibration: a metric velocity is "
+                "focal length times angle"
+            )
+        if camera_from_body is None:
+            raise SystemExit(
+                "--frontend planar needs the camera mounting: pass --camera-mounting "
+                "(top_forward / right_forward / left_forward / bottom_forward, or the "
+                "matrix tools/estimate_camera_mounting.py prints), or put "
+                "mounting.camera_from_body in the calibration file"
+            )
+        if args.rotation_map is not None:
+            raise SystemExit(
+                "--rotation-map seeds the learned small-angle rotation field, which "
+                "--frontend planar does not have: it removes rotation exactly from "
+                "the attitude"
+            )
+        planar_settings = {
+            "camera_from_body": camera_from_body,
+            "prior_velocity_body": prior_velocity,
+            "coarse_factor": int(args.coarse_factor),
+            "coarse_radius": int(args.coarse_radius),
+            "coarse_highpass": int(args.coarse_highpass),
+            "fine_highpass": int(args.fine_highpass),
+            "fine_iterations": int(args.fine_iterations),
+            "huber_cells": float(args.huber_cells),
+            "altitude_constraint": float(args.altitude_constraint),
+            "learn_mounting": not args.no_learn_mounting,
+            "max_geometric_speed": float(args.max_geometric_speed),
+            "min_fit_cells": float(args.min_fit_cells),
+        }
+    elif velocity_mode == "geometric_residual":
+        raise SystemExit(
+            "--velocity-mode geometric_residual needs --frontend planar, the only "
+            "frontend that measures a metric velocity"
+        )
+    frontend = build_frontend(
+        args, camera_from_body=camera_from_body, prior_velocity=prior_velocity,
+        dropout=args.dropout,
     ).to(device)
+    if args.frontend == "planar":
+        mounting_text = np.asarray(camera_from_body).round(3).tolist()
+        world.log(
+            f"frontend: planar (camera_from_body {mounting_text}, prior velocity "
+            f"[{prior_velocity[0]:.1f} {prior_velocity[1]:.1f} {prior_velocity[2]:.1f}] m/s, "
+            f"velocity mode {velocity_mode})"
+        )
     if args.rotation_map is not None:
         payload = json.loads(Path(args.rotation_map).read_text(encoding="utf-8"))
         try:
@@ -2075,6 +2576,7 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
     model = VisionMambaVO(
         visual_dim=args.visual_dim, aiding_dim=args.aiding_dim,
         fusion_dim=args.fusion_dim, dropout=args.dropout, frontend=frontend,
+        velocity_mode=velocity_mode,
     ).to(device)
     # The frontend is a submodule of the model, so model.parameters()
     # already covers it. Listing both hands the optimizer a duplicate
@@ -2114,6 +2616,7 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
         camera_matrix=camera_tensor,
         ablate_body_rate=args.ablate_body_rate,
         ablate_visual_age=args.ablate_visual_age,
+        photometric_augment=args.photometric_augment,
     ).to(device)
     if world.enabled:
         # static_graph lets DDP cope with gradient checkpointing, which
@@ -2144,10 +2647,29 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
     scale = {"none": 1.0, "linear": float(world.world_size),
              "sqrt": math.sqrt(world.world_size)}[args.lr_scaling]
     learning_rate = args.learning_rate * scale
+    # The mounting correction is a physical angle, not a feature weight: it gets
+    # a smaller step (its gradient is large - every pixel of every pair moves
+    # with it) and no weight decay (zero is not a prior worth pulling towards
+    # harder than the data says).
+    mounting_parameters = [
+        parameter for name, parameter in model.named_parameters()
+        if name.endswith("mounting_correction")
+    ]
+    mounting_ids = {id(parameter) for parameter in mounting_parameters}
+    groups: List[Dict[str, Any]] = [
+        {"params": [p for p in parameters if id(p) not in mounting_ids]}
+    ]
+    if mounting_parameters:
+        groups.append({
+            "params": mounting_parameters,
+            "lr": learning_rate * float(args.mounting_lr_scale),
+            "lr_scale": float(args.mounting_lr_scale),
+            "weight_decay": 0.0,
+        })
     optimizer = torch.optim.AdamW(
-        parameters, lr=learning_rate, weight_decay=args.weight_decay
+        groups, lr=learning_rate, weight_decay=args.weight_decay
     )
-    schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    schedule = build_schedule(optimizer, args.epochs, args.lr_warmup_epochs)
 
     samplers: Dict[str, Optional[DistributedSampler]] = {}
     loaders = {}
@@ -2391,12 +2913,20 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
 
     start_epoch = 1
     best = float("inf")
+    # Epochs since the selection metric last improved by --min-delta, for
+    # --patience. Carried in every checkpoint so a resumed run keeps counting.
+    stale_epochs = 0
     if normalizer is None:
         raise SystemExit(
             "no split produced a dataset, so there is nothing to train on; "
             "check --window-length against the split lengths above"
         )
-    fingerprint = resume_fingerprint(args, source, normalizer, ranges)
+    fingerprint = resume_fingerprint(
+        args, source, normalizer, ranges,
+        frontend_id=str(frontend.frontend_id),
+        temporal_input_id=str(model.temporal_input_id),
+        planar=planar_settings,
+    )
     if args.resume is not None:
         resume_path = (
             args.run_dir / "last.pt" if args.resume == "auto" else Path(args.resume)
@@ -2452,6 +2982,7 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             best = float(
                 saved.get("best_val_score", saved.get(f"best_val_{saved_metric}", float("inf")))
             )
+            stale_epochs = int(saved.get("stale_epochs", 0))
         else:
             world.log(
                 f"selection metric changed ({saved_metric} -> {args.select_on}), "
@@ -2468,11 +2999,12 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             # puts the optimizer exactly where the NEW cosine says this epoch
             # should be, which is what extending a run has to mean.
             for group in optimizer.param_groups:
-                group["lr"] = learning_rate
-                group["initial_lr"] = learning_rate
-            schedule = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=args.epochs
-            )
+                # Each group keeps its own multiple of the base rate (the
+                # mounting correction runs at --mounting-lr-scale of it).
+                rate = learning_rate * float(group.get("lr_scale", 1.0))
+                group["lr"] = rate
+                group["initial_lr"] = rate
+            schedule = build_schedule(optimizer, args.epochs, args.lr_warmup_epochs)
             # Walking the schedule forward without stepping the optimizer is
             # exactly what is wanted here - the optimizer's own state was
             # restored above - so torch's "step() before optimizer.step()"
@@ -2538,12 +3070,18 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
                 ),
                 # The frontend algorithm, so the evaluator can refuse a
                 # checkpoint whose weights fit but whose semantics do not.
-                "frontend_id": str(VisionMambaFlowFrontend.frontend_id),
+                "frontend_id": str(frontend.frontend_id),
                 # Same idea, for the fusion side: the aiding-vector layout and
                 # what gets concatenated onto the token. ablate_body_rate/
                 # ablate_visual_age need no separate entry here - they are
                 # plain argparse flags, already carried by vars(args) above.
-                "temporal_input_id": str(VisionMambaVO.temporal_input_id),
+                "temporal_input_id": str(model.temporal_input_id),
+                # RESOLVED planar geometry, under the names the evaluator reads:
+                # the flags alone do not capture a mounting read from the
+                # calibration file or a prior defaulted to the training mean.
+                "velocity_mode": velocity_mode,
+                "camera_from_body": camera_from_body,
+                "prior_velocity_body": prior_velocity,
                 # RESOLVED alignment, under the names the evaluator reads.
                 # vars(args) carries the raw flags -- image_time_offset and
                 # lever_arm -- and an evaluator asking for image_time_offset_s
@@ -2573,6 +3111,7 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             "uncertainty_trained": args.velocity_loss != "simple",
             "val_score": score,
             "best_val_score": best,
+            "stale_epochs": stale_epochs,
             "val_vel_rmse_y": score if args.select_on == "vel_rmse_y" else float("nan"),
             "best_val_vel_rmse_y": best if args.select_on == "vel_rmse_y" else float("nan"),
             "world_size": world.world_size,
@@ -2704,10 +3243,14 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             # Every rank has the same reduced metrics, so every rank agrees on
             # whether this epoch is the best - but only one writes the file.
             score = validation[args.select_on]
+            # --min-delta only decides whether patience resets; best.pt still
+            # follows every improvement, however small.
+            improved = score < best - float(args.min_delta)
             if score < best:
                 best = score
                 if world.is_main:
                     torch.save(checkpoint_payload(epoch, score), best_path)
+            stale_epochs = 0 if improved else stale_epochs + 1
             skill = validation["skill_vs_mean_y"]
             skill_text = "n/a" if math.isnan(skill) else f"{skill:+.3f}"
             world.log(
@@ -2815,6 +3358,17 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
                 prune_epoch_checkpoints(epochs_dir, args.keep_last)
             if metrics is not None:
                 metrics.append(row)
+
+        if args.patience > 0 and "validation" in loaders and stale_epochs >= args.patience:
+            # Every rank reduced the same validation metrics, so every rank
+            # reaches this decision on the same epoch - no collective is left
+            # waiting on a rank that stopped.
+            world.log(
+                f"early stop: val_{args.select_on} has not improved by "
+                f"{args.min_delta:g} for {stale_epochs} epochs (--patience "
+                f"{args.patience}); best {best:.4f} is in {best_path}"
+            )
+            break
 
     world.log(f"\nbest val_{args.select_on} {best:.4f}  ->  {best_path}")
     return 0

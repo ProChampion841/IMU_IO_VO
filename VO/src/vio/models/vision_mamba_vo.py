@@ -948,7 +948,35 @@ class VisionMambaVO(nn.Module):
     #   v1: [sin_roll, cos_roll, sin_pitch, cos_pitch, log_altitude, dt] aiding
     #       (6-wide), fusion input [aiding, token, visual_present] (no age).
     #   v2: aiding gained p/q/r (9-wide); fusion input gained visual_age.
+    #   v2+geometric_residual: v2, plus the held per-pair geometric velocity
+    #       and its validity bit on the fusion input, and the output is that
+    #       velocity plus a learned correction. See ``temporal_input_id_for``.
     temporal_input_id = "vo_temporal_fusion_v2"
+
+    #: How the velocity is produced. ``heads`` is the original factored
+    #: direction x (altitude x bearing rate) output. ``geometric_residual``
+    #: outputs the most recent per-pair metric velocity from a
+    #: :class:`~vio.models.planar_frontend.PlanarFlowFrontend`, held between
+    #: pairs, plus a zero-initialised learned correction - so an untrained model
+    #: already reproduces the closed-form estimate and training only has to
+    #: learn what the geometry leaves out (latency, a moving target within
+    #: the pair interval, residual mounting and timing error).
+    VELOCITY_MODES = ("heads", "geometric_residual")
+
+    @classmethod
+    def temporal_input_id_for(cls, velocity_mode: str = "heads") -> str:
+        """The fusion contract id a model built with ``velocity_mode`` has.
+
+        The default mode keeps the historical id, so every checkpoint written
+        before the geometric mode existed still loads and evaluates exactly as
+        it did.
+        """
+
+        if velocity_mode not in cls.VELOCITY_MODES:
+            raise ValueError(f"velocity_mode must be one of {cls.VELOCITY_MODES}")
+        if velocity_mode == "heads":
+            return cls.temporal_input_id
+        return f"{cls.temporal_input_id}+{velocity_mode}"
 
     def __init__(
         self,
@@ -969,12 +997,23 @@ class VisionMambaVO(nn.Module):
         log_bearing_rate_init: float = -1.386,
         max_log_speed: float = 5.0,
         frontend: Optional[VisionMambaFlowFrontend] = None,
+        velocity_mode: str = "heads",
+        velocity_scale: float = 20.0,
     ) -> None:
         super().__init__()
         if min(visual_dim, aiding_dim, fusion_dim) <= 0:
             raise ValueError("VO dimensions must be positive")
         if min_log_variance >= max_log_variance:
             raise ValueError("Invalid log-variance limits")
+        if velocity_mode not in self.VELOCITY_MODES:
+            raise ValueError(f"velocity_mode must be one of {self.VELOCITY_MODES}")
+        if velocity_scale <= 0:
+            raise ValueError("velocity_scale must be positive")
+        self.velocity_mode = str(velocity_mode)
+        self.velocity_scale = float(velocity_scale)
+        # Instance attribute shadowing the class one, so a caller that reads
+        # model.temporal_input_id gets the contract THIS model was built with.
+        self.temporal_input_id = self.temporal_input_id_for(self.velocity_mode)
         self.visual_dim = int(visual_dim)
         self.fusion_dim = int(fusion_dim)
         self.min_log_variance = float(min_log_variance)
@@ -1003,6 +1042,11 @@ class VisionMambaVO(nn.Module):
         # visual_present: an implicit signal only helps once training has
         # already found it, and both are one linear read away either way.
         self.fusion_input_dim = aiding_dim + self.visual_dim + 2
+        if self.velocity_mode == "geometric_residual":
+            # The held geometric velocity (scaled) and whether one exists yet:
+            # the correction head can only learn a correction proportional to
+            # the base if the fusion state can see the base.
+            self.fusion_input_dim += 4
         self.fusion_encoder = CausalMambaEncoder(
             self.fusion_input_dim,
             d_model=self.fusion_dim,
@@ -1038,6 +1082,14 @@ class VisionMambaVO(nn.Module):
         nn.init.zeros_(self.log_concentration_head.weight)
         nn.init.zeros_(self.log_concentration_head.bias)
 
+        # The correction on top of the held geometric velocity, in m/s.
+        # Zero-initialised: at step 0 the output IS the closed-form estimate.
+        self.residual_head: Optional[nn.Linear] = None
+        if self.velocity_mode == "geometric_residual":
+            self.residual_head = nn.Linear(self.fusion_dim, 3)
+            nn.init.zeros_(self.residual_head.weight)
+            nn.init.zeros_(self.residual_head.bias)
+
     @property
     def backend_name(self) -> str:
         return "vo_vision_mamba"
@@ -1068,12 +1120,19 @@ class VisionMambaVO(nn.Module):
         visual_age: torch.Tensor,
         visual_quality: Optional[torch.Tensor] = None,
         state: Optional[VOStreamState] = None,
+        visual_velocity: Optional[torch.Tensor] = None,
+        visual_velocity_valid: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, VOStreamState]:
         """One block of ticks, returning the state the next block continues from.
 
         ``state=None`` means a reset, and produces exactly what :meth:`fuse`
         produces for the same input - the two share this body so a streamed
         run and a windowed run cannot drift apart.
+
+        ``visual_velocity`` ``(B, T, 3)`` / ``visual_velocity_valid``
+        ``(B, T, 1)`` are the HELD geometric velocity and whether one has been
+        delivered yet (:func:`vio.data.fixedwing_vo.hold_visual_velocity`);
+        required in ``geometric_residual`` mode, ignored otherwise.
         """
 
         if aiding.ndim != 3 or aiding.shape[2] != AIDING_INPUT_DIM:
@@ -1095,11 +1154,35 @@ class VisionMambaVO(nn.Module):
         encoded, aiding_state = self.aiding_encoder.forward_sequence(
             aiding, aiding_state
         )
-        fused = torch.cat((encoded, token, visual_present, visual_age), dim=-1)
+        parts = [encoded, token, visual_present, visual_age]
+        if self.velocity_mode == "geometric_residual":
+            velocity, velocity_valid = self._checked_held_velocity(
+                visual_velocity, visual_velocity_valid, aiding.shape[:2]
+            )
+            parts += [velocity / self.velocity_scale, velocity_valid]
+        fused = torch.cat(parts, dim=-1)
         hidden, fusion_state = self.fusion_encoder.forward_sequence(
             fused, fusion_state
         )
         return hidden, VOStreamState(aiding=aiding_state, fusion=fusion_state)
+
+    def _checked_held_velocity(
+        self,
+        visual_velocity: Optional[torch.Tensor],
+        visual_velocity_valid: Optional[torch.Tensor],
+        leading: Tuple[int, int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if visual_velocity is None or visual_velocity_valid is None:
+            raise ValueError(
+                "geometric_residual mode needs visual_velocity and "
+                "visual_velocity_valid (the held per-pair geometric velocity); "
+                "see vio.data.fixedwing_vo.hold_visual_velocity"
+            )
+        if visual_velocity.shape != (*leading, 3):
+            raise ValueError("visual_velocity must have shape (B, T, 3)")
+        if visual_velocity_valid.shape != (*leading, 1):
+            raise ValueError("visual_velocity_valid must have shape (B, T, 1)")
+        return visual_velocity, visual_velocity_valid.to(visual_velocity.dtype)
 
     def fuse(
         self,
@@ -1108,21 +1191,44 @@ class VisionMambaVO(nn.Module):
         visual_present: torch.Tensor,
         visual_age: torch.Tensor,
         visual_quality: Optional[torch.Tensor] = None,
+        visual_velocity: Optional[torch.Tensor] = None,
+        visual_velocity_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden, _ = self.fuse_stream(
-            aiding, visual_token, visual_present, visual_age, visual_quality, state=None
+            aiding, visual_token, visual_present, visual_age, visual_quality, state=None,
+            visual_velocity=visual_velocity, visual_velocity_valid=visual_velocity_valid,
         )
         return hidden
 
-    def heads(self, hidden: torch.Tensor, log_altitude: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def heads(
+        self,
+        hidden: torch.Tensor,
+        log_altitude: torch.Tensor,
+        visual_velocity: Optional[torch.Tensor] = None,
+        visual_velocity_valid: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         direction = F.normalize(self.direction_head(hidden), dim=-1, eps=1e-6)
         log_rate = self.log_rate_head(hidden).squeeze(-1)
         # v = h * u, exactly, because a sum in log space is a product outside
         # it. The clamp only guards the exponential against a diverging head.
         log_speed = torch.clamp(log_rate + log_altitude, max=self.max_log_speed)
         speed = torch.exp(log_speed)
+        velocity = direction * speed.unsqueeze(-1)
+        if self.velocity_mode == "geometric_residual":
+            held, held_valid = self._checked_held_velocity(
+                visual_velocity, visual_velocity_valid, hidden.shape[:2]
+            )
+            assert self.residual_head is not None
+            corrected = held + self.residual_head(hidden)
+            # Until the first pair has been delivered there is no base to
+            # correct, and the factored heads - driven by attitude and
+            # altitude alone - answer instead. That is the same cold-start
+            # behaviour the heads mode has everywhere.
+            velocity = torch.where(held_valid > 0, corrected, velocity)
+            speed = velocity.norm(dim=-1)
+            direction = F.normalize(velocity, dim=-1, eps=1e-6)
         return {
-            "predicted_velocity": direction * speed.unsqueeze(-1),
+            "predicted_velocity": velocity,
             "predicted_direction": direction,
             "predicted_speed": speed,
             "predicted_log_bearing_rate": log_rate,
@@ -1144,6 +1250,8 @@ class VisionMambaVO(nn.Module):
         *,
         visual_quality: Optional[torch.Tensor] = None,
         log_altitude: Optional[torch.Tensor] = None,
+        visual_velocity: Optional[torch.Tensor] = None,
+        visual_velocity_valid: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         outputs, _ = self.forward_stream(
             aiding,
@@ -1153,6 +1261,8 @@ class VisionMambaVO(nn.Module):
             visual_quality=visual_quality,
             log_altitude=log_altitude,
             state=None,
+            visual_velocity=visual_velocity,
+            visual_velocity_valid=visual_velocity_valid,
         )
         return outputs
 
@@ -1166,11 +1276,14 @@ class VisionMambaVO(nn.Module):
         visual_quality: Optional[torch.Tensor] = None,
         log_altitude: Optional[torch.Tensor] = None,
         state: Optional[VOStreamState] = None,
+        visual_velocity: Optional[torch.Tensor] = None,
+        visual_velocity_valid: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], VOStreamState]:
         """:meth:`forward` over one block of a longer run, plus the carried state."""
 
         hidden, state = self.fuse_stream(
-            aiding, visual_token, visual_present, visual_age, visual_quality, state=state
+            aiding, visual_token, visual_present, visual_age, visual_quality, state=state,
+            visual_velocity=visual_velocity, visual_velocity_valid=visual_velocity_valid,
         )
         if log_altitude is None:
             # aiding[..., LOG_ALTITUDE_INDEX] is the CENTRED copy the encoder
@@ -1186,7 +1299,7 @@ class VisionMambaVO(nn.Module):
             )
         if log_altitude.shape != hidden.shape[:2]:
             raise ValueError("log_altitude must have shape (B, T)")
-        return self.heads(hidden, log_altitude), state
+        return self.heads(hidden, log_altitude, visual_velocity, visual_velocity_valid), state
 
 
 __all__ = [

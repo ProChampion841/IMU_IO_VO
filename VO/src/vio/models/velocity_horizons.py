@@ -53,6 +53,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from vio.data.attitude import AttitudeAltitude, pair_geometry
 from vio.data.fixedwing_vo import BODY_RATE_AIDING_SLICE, visual_age_seconds
 from vio.data.image_pairs import VisualPairSource
 from vio.utils.velocity_metrics import AXIS_NAMES
@@ -236,6 +237,11 @@ class SpanTokens:
     # which is what an ungated frontend and every pre-gate construction site
     # (tests included) mean.
     pair_reliable: Optional[torch.Tensor] = None
+    # (N, 3) float32, CPU: the per-pair metric velocity a flat-ground frontend
+    # (PlanarFlowFrontend) measures, or None for a frontend that measures none.
+    # Scattered and HELD by :func:`scatter_span_velocity` for a
+    # geometric_residual model, under the same delivery rule as the token.
+    velocity: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         if self.tick.shape[0] != self.token.shape[0]:
@@ -252,6 +258,8 @@ class SpanTokens:
             self.pair_reliable = torch.ones((self.token.shape[0], 1))
         elif self.token.shape[0] != self.pair_reliable.shape[0]:
             raise ValueError("token and pair_reliable counts disagree")
+        if self.velocity is not None and self.velocity.shape != (self.token.shape[0], 3):
+            raise ValueError("velocity must be (N, 3), one row per token")
 
     @classmethod
     def empty(cls, visual_dim: int, *, disabled: bool = False) -> "SpanTokens":
@@ -276,11 +284,14 @@ class _SpanPairDataset(Dataset):
         events: np.ndarray,
         body_rate_rad_s: np.ndarray,
         times_s: np.ndarray,
+        attitude: Optional[AttitudeAltitude] = None,
     ) -> None:
         self.image_source = image_source
         self.events = np.asarray(events, dtype=np.int64)
         self.body_rate_rad_s = body_rate_rad_s
         self.times_s = times_s
+        # Given only for a frontend that needs each pair's geometry.
+        self.attitude = attitude
 
     def __len__(self) -> int:
         return int(self.events.size)
@@ -301,6 +312,22 @@ class _SpanPairDataset(Dataset):
             "tick": torch.tensor(
                 int(self.image_source.plan.ready_tick[event]), dtype=torch.long
             ),
+            **self._geometry(event),
+        }
+
+    def _geometry(self, event: int) -> Dict[str, torch.Tensor]:
+        if self.attitude is None:
+            return {}
+        plan = self.image_source.plan
+        geometry = pair_geometry(
+            self.attitude,
+            float(plan.exposure_t0_s[event]),
+            float(plan.exposure_t1_s[event]),
+        )
+        return {
+            "relative_rotation": torch.from_numpy(geometry["relative_rotation"]),
+            "down_body": torch.from_numpy(geometry["down_body"]),
+            "altitude_m": torch.from_numpy(geometry["altitude_m"]),
         }
 
 
@@ -329,12 +356,18 @@ def encode_span_tokens(
     num_workers: int = 0,
     disable_visual: bool = False,
     progress: bool = False,
+    attitude: Optional[AttitudeAltitude] = None,
 ) -> SpanTokens:
     """Run the frontend once over every image pair whose event lands in ``span``.
 
     This is the expensive half of a horizon evaluation and it is deliberately
     separated from the scan: the result is replayed at every horizon, so six
     horizons cost one pass over the images rather than six.
+
+    A frontend with ``requires_pair_geometry`` (the flat-ground one) also needs
+    ``attitude``, from which each pair's rotation, ground normal and altitudes
+    are read exactly as the training dataset reads them, and its per-pair
+    velocity is kept in :attr:`SpanTokens.velocity`.
     """
 
     if disable_visual:
@@ -353,8 +386,17 @@ def encode_span_tokens(
     if events.size == 0:
         return SpanTokens.empty(visual_dim)
 
+    geometric = bool(getattr(frontend, "requires_pair_geometry", False))
+    if geometric and attitude is None:
+        raise ValueError(
+            "this frontend needs each pair's geometry: pass attitude= "
+            "(the flight's AttitudeAltitude)"
+        )
     loader = DataLoader(
-        _SpanPairDataset(image_source, events, body_rate_rad_s, times_s),
+        _SpanPairDataset(
+            image_source, events, body_rate_rad_s, times_s,
+            attitude=attitude if geometric else None,
+        ),
         batch_size=max(int(batch_pairs), 1),
         shuffle=False,
         num_workers=int(num_workers),
@@ -368,15 +410,25 @@ def encode_span_tokens(
     reliabilities: List[torch.Tensor] = []
     ticks: List[np.ndarray] = []
     diagnostics: List[torch.Tensor] = []
+    velocities: List[torch.Tensor] = []
     try:
         for batch in _maybe_progress(loader, "visual tokens", progress):
+            extra = {}
+            if geometric:
+                extra = {
+                    name: batch[name].to(device, non_blocking=True)
+                    for name in ("relative_rotation", "down_body", "altitude_m")
+                }
             encoded = frontend(
                 batch["image0"].to(device, non_blocking=True).float().div(255.0),
                 batch["image1"].to(device, non_blocking=True).float().div(255.0),
                 pair_dt_s=batch["pair_dt_s"].to(device, non_blocking=True),
                 body_rate_rad_s=batch["body_rate"].to(device, non_blocking=True),
                 camera_matrix=camera_matrix,
+                **extra,
             )
+            if geometric:
+                velocities.append(encoded["geometric_velocity"].detach().float().cpu())
             tokens.append(encoded["visual_token"].detach().float().cpu())
             qualities.append(encoded["visual_quality"].detach().float().cpu())
             reliabilities.append(encoded["pair_reliable"].detach().float().cpu())
@@ -396,6 +448,7 @@ def encode_span_tokens(
         diagnostics=torch.cat(diagnostics),
         pair_reliable=torch.cat(reliabilities),
         visual_dim=int(visual_dim),
+        velocity=torch.cat(velocities) if velocities else None,
     )
 
 
@@ -449,6 +502,55 @@ def scatter_span_tokens(
         quality[row, offset] = tokens.quality[inside].to(device=device, dtype=dtype)
         present[row, offset] = 1.0
     return field, quality, present
+
+
+def scatter_span_velocity(
+    tokens: SpanTokens,
+    bounds: Sequence[Tuple[int, int]],
+    ticks: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Held per-pair velocity over C legs: ``(C, ticks, 3)`` and ``(C, ticks, 1)``.
+
+    The same placement and refusal rule as :func:`scatter_span_tokens` - a
+    delivered pair lands on its ready tick, a refused one does not land at
+    all - and then each value is HELD until the next delivered pair, exactly
+    as :func:`vio.data.fixedwing_vo.hold_visual_velocity` holds it in
+    training. Each leg starts with nothing held: a leg is a cold start. The
+    validity field is 0 before a leg's first delivery and 1 after.
+    """
+
+    count = len(bounds)
+    held = torch.zeros(count, ticks, 3, device=device, dtype=dtype)
+    held_valid = torch.zeros(count, ticks, 1, device=device, dtype=dtype)
+    if len(tokens) == 0 or tokens.velocity is None:
+        return held, held_valid
+    reliable = tokens.pair_reliable
+    keep_all = np.flatnonzero(
+        (reliable.reshape(-1) > 0).cpu().numpy()
+        if reliable is not None
+        else np.ones(len(tokens), dtype=bool)
+    )
+    for row, (start, end) in enumerate(bounds):
+        inside = np.flatnonzero((tokens.tick >= start) & (tokens.tick < end))
+        inside = np.intersect1d(inside, keep_all, assume_unique=False)
+        if inside.size == 0:
+            continue
+        offsets = (tokens.tick[inside] - start).astype(np.int64)
+        order = np.argsort(offsets, kind="stable")
+        offsets, inside = offsets[order], inside[order]
+        values = tokens.velocity[inside].to(dtype)
+        # For every tick, the last delivered event at or before it.
+        position = np.searchsorted(offsets, np.arange(ticks), side="right") - 1
+        seen = position >= 0
+        chosen = torch.from_numpy(np.clip(position, 0, None))
+        filled = values[chosen]
+        mask = torch.from_numpy(seen).to(dtype).unsqueeze(-1)
+        held[row] = (filled * mask).to(device)
+        held_valid[row] = mask.to(device)
+    return held, held_valid
 
 
 # ---------------------------------------------------------------------------
@@ -1020,6 +1122,15 @@ def run_span_horizons(
     age_field, _ = visual_age_seconds(present_field, leg_clock, deployment_latency_s)
     if ablate_visual_age:
         age_field = torch.zeros_like(age_field)
+    # A geometric_residual model reads the held per-pair velocity too - built
+    # once over the whole span and sliced per block, like age and for the
+    # same reason: the hold must survive a block boundary.
+    geometric = getattr(model, "velocity_mode", "heads") == "geometric_residual"
+    velocity_field = velocity_valid_field = None
+    if geometric:
+        velocity_field, velocity_valid_field = scatter_span_velocity(
+            tokens, [(start, end)], span_ticks, device=device
+        )
 
     mask = torch.ones(1, span_ticks, device=device)
     # The first ticks after the reset have no visual event yet - the camera
@@ -1067,6 +1178,13 @@ def run_span_horizons(
                 visual_quality=quality_field[:, begin:stop],
                 log_altitude=leg_altitude[:, begin:stop],
                 state=state,
+                visual_velocity=(
+                    None if velocity_field is None else velocity_field[:, begin:stop]
+                ),
+                visual_velocity_valid=(
+                    None if velocity_valid_field is None
+                    else velocity_valid_field[:, begin:stop]
+                ),
             )
             predicted = outputs["predicted_velocity"]
             block_target = leg_target[:, begin:stop]
@@ -1360,6 +1478,7 @@ __all__ = [
     "prefix_leg",
     "run_span_horizons",
     "scatter_span_tokens",
+    "scatter_span_velocity",
     "stream_horizon_metrics",
     "ticks_per_horizon",
     "whole_span_series",

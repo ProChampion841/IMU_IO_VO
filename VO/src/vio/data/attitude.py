@@ -408,6 +408,73 @@ AIDING_CHANNELS = (
 )
 
 
+def quaternion_at(
+    times_s: np.ndarray, quaternion: np.ndarray, query_s: "float | np.ndarray"
+) -> np.ndarray:
+    """Body-to-NED attitude at arbitrary instants, ``(..., 4)`` (w, x, y, z).
+
+    Normalised linear interpolation between the two rows that bracket each
+    query, held at the ends of the log. At 100 Hz consecutive attitudes are a
+    few milliradians apart, where nlerp and slerp agree to a microradian, and
+    the rows are already sign-continuous (see :func:`load_attitude_altitude`),
+    so no hemisphere flip is needed.
+
+    An exposure instant is almost never a telemetry row, and snapping it to the
+    nearest one moves the attitude by up to half a sample - at a 16 deg/s turn
+    that is 0.08 deg per snap, applied at both ends of every pair.
+    """
+
+    times = np.asarray(times_s, dtype=np.float64)
+    quats = np.asarray(quaternion, dtype=np.float64)
+    query = np.asarray(query_s, dtype=np.float64)
+    clamped = np.clip(query, times[0], times[-1])
+    upper = np.clip(np.searchsorted(times, clamped, side="right"), 1, times.size - 1)
+    lower = upper - 1
+    span = times[upper] - times[lower]
+    fraction = np.where(span > 0, (clamped - times[lower]) / np.where(span > 0, span, 1.0), 0.0)
+    blended = (1.0 - fraction)[..., None] * quats[lower] + fraction[..., None] * quats[upper]
+    return blended / np.linalg.norm(blended, axis=-1, keepdims=True)
+
+
+def pair_geometry(
+    attitude: AttitudeAltitude, start_s: float, stop_s: float
+) -> Dict[str, np.ndarray]:
+    """What a flat-ground frontend needs to know about one image pair.
+
+    * ``relative_rotation`` ``(3, 3)``: the second exposure's body orientation
+      in the first exposure's body frame, ``R_0^T R_1``. EXACT, from the two
+      interpolated attitudes - never ``rate * dt``, which is only the first
+      term of the rotation's expansion and at a one-second baseline in a turn
+      is wrong by more than the translation signal.
+    * ``down_body`` ``(3,)``: the NED down axis in the first exposure's body
+      frame, i.e. the ground normal before the camera mounting is applied.
+      Only roll and pitch reach it - yaw drops out, as it must.
+    * ``altitude_m`` ``(2,)``: altitude at the two exposures. The first is
+      the metric scale of the whole pair; the difference is the camera's
+      motion along the ground normal, which the image barely sees and the
+      altimeter measures directly.
+
+    Both instants are clamped to the log's range, the same hold-at-the-ends
+    rule :meth:`vio.data.image_pairs.VisualPairSource.rate_over_exposure`
+    applies.
+    """
+
+    from vio.models.pose_geometry import quaternion_to_matrix_np
+
+    times = attitude.times_s
+    q = quaternion_at(times, attitude.quaternion, np.asarray([start_s, stop_s]))
+    rotation = quaternion_to_matrix_np(q)
+    first, second = rotation[0], rotation[1]
+    altitude = np.interp(
+        np.clip([start_s, stop_s], times[0], times[-1]), times, attitude.altitude_m
+    )
+    return {
+        "relative_rotation": (first.T @ second).astype(np.float32),
+        "down_body": (first.T @ np.asarray([0.0, 0.0, 1.0])).astype(np.float32),
+        "altitude_m": np.asarray(altitude, dtype=np.float32),
+    }
+
+
 __all__ = [
     "AIDING_CHANNELS",
     "ALTITUDE_CANDIDATES",
@@ -419,6 +486,8 @@ __all__ = [
     "detect_euler_unit",
     "hold_fraction",
     "load_attitude_altitude",
+    "pair_geometry",
+    "quaternion_at",
     "resolve_altitude_column",
     "resolve_attitude_columns",
 ]
