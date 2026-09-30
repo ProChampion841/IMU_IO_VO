@@ -48,6 +48,13 @@ StreamEKF ekf(prm, aid);
 // 1. start: from the nav solution / GPS (position, velocity, attitude)
 ekf.initialize(t, p_nwu, v_nwu, attitudeFromNavEuler(roll, pitch, yaw));
 
+// 1b. OR with NO ground truth: position 0, velocity from the first VO pair
+//     rotated by the nav attitude, its own initial 1-sigma (m, m/s, deg)
+Mat3 Rn = attitudeFromNavEuler(roll, pitch, yaw);
+Vec3 vb = frdToFlu(vo_velocity_frd), v0;          // v0 = Rn * vb
+for (int i = 0; i < 3; ++i) v0[i] = Rn[3*i]*vb[0] + Rn[3*i+1]*vb[1] + Rn[3*i+2]*vb[2];
+ekf.initialize(t, {0, 0, 0}, v0, Rn, 1e-3, std::sqrt(max_vo_var), 1.0);
+
 // 2. every IMU sample (100 Hz), raw logger units converted to SI FLU
 ekf.onImu(t, accFromLogger({AcclX, AcclY, AcclZ}),      // g, FRD  -> m/s^2 FLU
              gyroFromLogger({GyroX, GyroY, GyroZ}));    // deg/s, FRD -> rad/s FLU

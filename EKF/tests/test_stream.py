@@ -152,3 +152,38 @@ def test_cpp_matches_python(flight, tmp_path):
     print("C++ vs Python over %d states: |dp| %.2e m  |dv| %.2e m/s  |dq| %.2e  |db| %.2e"
           % (len(py), dp, dv, dq, db))
     assert dp < 1e-5 and dv < 1e-7 and dq < 1e-8 and db < 1e-8
+
+
+# ------------------------------------------------------------------------- D
+def test_no_gt_continuous_run(flight, capsys):
+    """--no_gt: no truth enters the filter; one run over the whole flight, no reset."""
+    import run_stream as run_stream_cli
+    fl = PL.load_flight(flight["csv"])
+    vo = simulate_vo(fl["t"], fl["R_gt"], fl["v_gt"], rate_hz=2.0, white_std=0.3,
+                     bias_std=0.0, seed=1)
+    ev = build_events(fl, vo, t_init=fl["t"][0] + 1.0, t_end=fl["t"][-1], init="vo")
+    typ, t0, x = ev[0]
+    assert typ == "INIT" and np.allclose(x[0:3], 0.0)            # position 0, not GPS
+    j = int(np.searchsorted(vo.t, fl["t"][0] + 1.0))
+    k = int(np.searchsorted(fl["t"], vo.t[j]))
+    assert np.allclose(x[3:6], fl["R_gt"][k] @ vo.v[j])          # velocity from VO
+    assert len(x) == 13 and x[11] > 0.1                          # large velocity std
+    assert not any(e[0] == "GPS" for e in ev)
+    rows, s = run_stream(ev, stream_from_config(
+        run_ekf.load_config(os.path.join(run_ekf.HERE, "configs", "ekf_default.json"))))
+    assert rows[-1, 0] > fl["t"][-1] - 0.1                       # ran to the end, no reset
+    assert s.counters["gps"] == 0
+    cpp = shutil.which("cmake") and shutil.which("g++")
+    args = ["--csv", flight["csv"], "--vo_sim", "--no_gt", "--horizons", "30s", "1m", "3m"]
+    if cpp:
+        build = str(flight["dir"] / "build_nogt")
+        subprocess.run(["cmake", "-S", CPP, "-B", build, "-DCMAKE_BUILD_TYPE=Release"],
+                       check=True, capture_output=True)
+        subprocess.run(["cmake", "--build", build, "-j"], check=True, capture_output=True)
+        args += ["--events_out", str(flight["dir"] / "ev_nogt.csv"),
+                 "--cpp", os.path.join(build, "ekf_replay")]
+    assert run_stream_cli.main(args) == 0
+    out = capsys.readouterr().out
+    assert "NO GT" in out and "time since start" in out
+    if cpp:
+        assert "PASS" in out

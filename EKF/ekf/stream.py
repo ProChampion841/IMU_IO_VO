@@ -52,8 +52,15 @@ class StreamEKF:
                          "att": 0, "gps": 0, "out_of_order": 0}
 
     # ------------------------------------------------------------------ setup
-    def initialize(self, t, p, v, R, ba=None, bg=None, P0=None):
+    def initialize(self, t, p, v, R, ba=None, bg=None, P0=None, init_std=None):
+        """init_std = (pos_std m, vel_std m/s, att_std deg) overrides the config's
+        initial uncertainty for those three blocks (e.g. a no-GT start)."""
         self.f = ESKF(p, v, R, ba, bg, params=self.prm, P0=P0)
+        if init_std is not None and P0 is None:
+            ps, vs, a = (float(x) for x in init_std)
+            d = np.diag(self.f.P).copy()
+            d[0:3], d[3:6], d[6:9] = ps ** 2, vs ** 2, np.radians(a) ** 2
+            self.f.P = np.diag(d)
         self.t = float(t)
         self.last_imu = None
         self.pending.clear()

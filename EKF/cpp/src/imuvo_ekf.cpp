@@ -358,6 +358,17 @@ void StreamEKF::initialize(double t, const Vec3& p, const Vec3& v, const Mat3& R
     ready_ = true;
 }
 
+void StreamEKF::initialize(double t, const Vec3& p, const Vec3& v, const Mat3& R, double pos_std,
+                           double vel_std, double att_std_deg) {
+    initialize(t, p, v, R);
+    const double att = deg2rad(att_std_deg);
+    for (int i = 0; i < 3; ++i) {
+        f_.P[i * N + i] = pos_std * pos_std;
+        f_.P[(3 + i) * N + 3 + i] = vel_std * vel_std;
+        f_.P[(6 + i) * N + 6 + i] = att * att;
+    }
+}
+
 void StreamEKF::onImu(double t, const Vec3& acc, const Vec3& gyro) {
     if (!ready_) return;
     if (have_last_ && t <= last_t_) { ++cnt_.out_of_order; return; }

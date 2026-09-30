@@ -105,6 +105,11 @@ public:
     explicit StreamEKF(const Params& prm = Params(), const AidParams& aid = AidParams());
     void initialize(double t, const Vec3& p, const Vec3& v, const Mat3& R,
                     const Vec3& ba = {0, 0, 0}, const Vec3& bg = {0, 0, 0});
+    // Same, with the initial 1-sigma of position [m], velocity [m/s] and attitude
+    // [deg] given here instead of taken from Params -- e.g. a start with NO ground
+    // truth: p = 0, v = R_nav * first VO velocity (std from its variance), R = nav.
+    void initialize(double t, const Vec3& p, const Vec3& v, const Mat3& R, double pos_std,
+                    double vel_std, double att_std_deg);
     bool ready() const { return ready_; }
 
     void onImu(double t, const Vec3& acc, const Vec3& gyro);

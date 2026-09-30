@@ -4,7 +4,7 @@
 //   ekf_replay events.csv states.csv [ekf_default.json]
 //
 // events.csv, one message per line, in ARRIVAL order (units SI, frames NWU/FLU):
-//   INIT,t,px,py,pz,vx,vy,vz,qw,qx,qy,qz
+//   INIT,t,px,py,pz,vx,vy,vz,qw,qx,qy,qz[,pos_std,vel_std,att_std_deg]
 //   IMU,t,ax,ay,az,gx,gy,gz
 //   VO,t,vx,vy,vz,varx,vary,varz          body FLU (use imuvo::frdToFlu on VO output)
 //   ATT,t,qw,qx,qy,qz                     nav attitude, body -> world
@@ -54,7 +54,10 @@ int main(int argc, char** argv) {
         x.clear();
         while (std::getline(ss, tok, ',')) x.push_back(std::strtod(tok.c_str(), nullptr));
         const auto t0 = std::chrono::steady_clock::now();
-        if (type == "INIT" && x.size() >= 11) {
+        if (type == "INIT" && x.size() >= 14) {
+            ekf.initialize(x[0], {x[1], x[2], x[3]}, {x[4], x[5], x[6]},
+                           quatToMat({x[7], x[8], x[9], x[10]}), x[11], x[12], x[13]);
+        } else if (type == "INIT" && x.size() >= 11) {
             ekf.initialize(x[0], {x[1], x[2], x[3]}, {x[4], x[5], x[6]},
                            quatToMat({x[7], x[8], x[9], x[10]}));
         } else if (type == "IMU" && x.size() >= 7) {

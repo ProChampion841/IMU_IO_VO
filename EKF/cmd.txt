@@ -76,3 +76,15 @@ python run_ekf.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
 python run_stream.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
   --splits inference --vo_dir vo_cache --gps_s 60 ^
   --horizons 30s 1m 2m 3m 4m 5m 10m 15m 20m 30m 40m --out_csv stream_all_horizons.csv
+
+:: ---------------------------------------------------------------- NO GROUND TRUTH, NO RESET
+:: One continuous run per flight: start from the first VO + nav attitude (position 0),
+:: no GPS, no reset.  GPS truth is only used to score it.  Horizons = time since start.
+python run_stream.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --vo_dir vo_cache --no_gt ^
+  --horizons 30s 1m 2m 3m 4m 5m 10m 15m 20m 30m 40m --out_csv no_gt.csv
+
+:: same, VO straight from the ONNX model, and check the C++ build on the first flight
+python run_stream.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --vo_onnx ..\VO\export\onnx --vo_datasets vo_flights --vo_cache_dir vo_cache ^
+  --no_gt --events_out events_nogt.csv --cpp cpp\build\ekf_replay

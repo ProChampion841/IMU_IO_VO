@@ -4,7 +4,8 @@ A message log is what the aircraft sees: timestamped sensor messages in ARRIVAL
 order.  The same file drives the Python StreamEKF and the C++ ekf_replay, which is
 how the two are compared.  Format (one message per line, SI, NWU / FLU):
 
-    INIT,t,px,py,pz,vx,vy,vz,qw,qx,qy,qz
+    INIT,t,px,py,pz,vx,vy,vz,qw,qx,qy,qz[,pos_std,vel_std,att_std_deg]
+                                        optional initial 1-sigma (else the config's)
     IMU,t,ax,ay,az,gx,gy,gz
     VO,t,vx,vy,vz,varx,vary,varz        body FLU velocity + variance
     ATT,t,qw,qx,qy,qz                   nav attitude, body -> world
@@ -19,7 +20,8 @@ _PRIO = {"INIT": 0, "IMU": 1, "GPS": 2, "VO": 3, "ATT": 4}
 
 
 def build_events(fl, vo, t_init, t_end, gps_until=None, gps_rate_hz=5.0, gps_std=0.1,
-                 att_source="gt", vo_latency_s=0.0, imu_drop=0.0, seed=0):
+                 att_source="gt", vo_latency_s=0.0, imu_drop=0.0, seed=0,
+                 init="gt", init_vo=None, init_att_std_deg=1.0):
     """Message log for one flight.
 
     fl         dict from pipeline.load_flight (raw IMU, truth)
@@ -29,13 +31,29 @@ def build_events(fl, vo, t_init, t_end, gps_until=None, gps_rate_hz=5.0, gps_std
     vo_latency_s   a VO message ARRIVES this long after its timestamp (it is still
                    stamped with its own time; the filter handles it as late)
     imu_drop   fraction of IMU samples lost
+    init       "gt": start from the GPS/nav truth state (p, v, R).
+               "vo": NO ground truth -- position 0, velocity = nav attitude x the first
+                     VO velocity at/after t_init (std from that VO variance), attitude =
+                     the nav attitude; the start moves to that VO sample.  init_vo is
+                     the VOStream used for it (defaults to vo).
     """
     rng = np.random.default_rng(seed)
     t = fl["t"]
     i0, i1 = np.searchsorted(t, [t_init, t_end])
     R_att = fl["R_gt"] if att_source == "gt" else fl["R_mti"]
-    ev = [(t[i0], "INIT", t[i0], np.r_[fl["p_gt"][i0], fl["v_gt"][i0],
-                                        so3.mat_to_quat(fl["R_gt"][i0])])]
+    if init == "vo":
+        src = init_vo if init_vo is not None else vo
+        j = int(np.searchsorted(src.t, t[i0])) if src is not None and len(src) else None
+        if j is None or j >= len(src):
+            raise ValueError("no VO sample after t_init to initialise from")
+        i0 = int(np.searchsorted(t, src.t[j]))
+        R0 = R_att[i0]
+        v0 = R0 @ src.v[j]
+        ev = [(t[i0], "INIT", t[i0], np.r_[np.zeros(3), v0, so3.mat_to_quat(R0),
+                                            1e-3, np.sqrt(src.var[j].max()), init_att_std_deg])]
+    else:
+        ev = [(t[i0], "INIT", t[i0], np.r_[fl["p_gt"][i0], fl["v_gt"][i0],
+                                            so3.mat_to_quat(fl["R_gt"][i0])])]
     for k in range(i0, i1 + 1):
         if k > i0 and imu_drop and rng.random() < imu_drop:
             continue
@@ -79,7 +97,8 @@ def run_stream(events, make_filter):
     rows = []
     for typ, t, x in events:
         if typ == "INIT":
-            s.initialize(t, x[0:3], x[3:6], so3.quat_to_mat(x[6:10]))
+            s.initialize(t, x[0:3], x[3:6], so3.quat_to_mat(x[6:10]),
+                         init_std=x[10:13] if len(x) >= 13 else None)
         elif typ == "IMU":
             s.on_imu(t, x[0:3], x[3:6])
             if s.ready:

@@ -144,6 +144,27 @@ ratio **ekf / imu** (below 1 means VO helped). It also reports:
   VO variance is too small, below means it is too big)
 - the final bias estimates
 
+## No ground truth, no reset (`run_stream.py --no_gt`)
+
+This is pure inference, the way the aircraft would run with no GPS at all. The
+whole flight is **one continuous run**: nothing is reset, and no GPS truth enters
+the filter.
+- **Position** starts at 0. It is scored on the distance travelled since the start.
+- **Velocity** starts as the nav attitude × the first VO velocity. Its initial
+  uncertainty comes from that VO sample's variance.
+- **Attitude** comes from the nav solution (the attitude aid, as everywhere else).
+- **Biases** start at 0 and are learned from VO and attitude.
+
+GPS truth is used **only to score** the run. Horizons are counted from the start.
+On the Jetson, the matching call is
+`ekf.initialize(t, {0,0,0}, R_nav * v_vo, R_nav, pos_std, vel_std, att_std_deg)`.
+
+```bash
+python run_stream.py --imu_config ../IMU/configs/exp/UAV/tilt_rotate.conf \
+    --splits inference --vo_dir vo_cache --no_gt \
+    --horizons 30s 1m 2m 3m 4m 5m 10m 15m 20m 30m 40m --out_csv no_gt.csv
+```
+
 ## Horizons 30 s … 40 min
 
 Both scripts take `--horizons 30s 1m 2m 3m 4m 5m 10m 15m 20m 30m 40m`, which is

@@ -14,6 +14,12 @@ whose log is long enough, for the EKF and for the same filter without VO:
     dir_max_error  worst direction error anywhere in the interval          deg
     pos_error      mean |p - p_gps| AT the horizon                         m
 
+--no_gt: NO ground truth at all, no reset, no GPS phase -- the whole flight is one
+continuous run started from the first VO measurement (position 0, velocity = nav
+attitude x VO velocity, attitude = nav).  GPS truth is used only to SCORE it:
+position error is on the distance travelled since the start, and horizons are
+counted from the start.
+
 --events_out writes the message log of the FIRST flight; --cpp runs the C++
 ekf_replay on it and checks it matches Python.
 
@@ -90,8 +96,9 @@ def vo_for(a, cfg, fl, root, name):
     return vo_onnx.replay(a.vo_onnx, folder, save_csv=cache, **kw)
 
 
-def score(fl, rows, t_out, h_s):
-    """The five quantities for one flight at h_s seconds into the outage, or None."""
+def score(fl, rows, t_out, h_s, p_offset=None):
+    """The five quantities for one flight at h_s seconds into the outage, or None.
+    p_offset is added to the estimated position (no-GT runs start at 0)."""
     t_h = t_out + h_s
     if rows[-1, 0] < t_h - 0.05:
         return None
@@ -103,7 +110,8 @@ def score(fl, rows, t_out, h_s):
     cos = (seg[:, 4:7] * fl["v_gt"][k]).sum(1) / np.maximum(
         np.linalg.norm(seg[:, 4:7], axis=1) * np.linalg.norm(fl["v_gt"][k], axis=1), 1e-9)
     de = np.degrees(np.arccos(np.clip(cos, -1, 1)))
-    pe = np.linalg.norm(seg[-1, 1:4] - fl["p_gt"][k[-1]])
+    p_est = seg[-1, 1:4] + (0.0 if p_offset is None else p_offset)
+    pe = np.linalg.norm(p_est - fl["p_gt"][k[-1]])
     return {"vel": ve[-1], "vel_peak": ve.max(), "dir": de[-1], "dir_peak": de.max(), "pos": pe}
 
 
@@ -126,7 +134,11 @@ def main(argv=None):
     ap.add_argument("--vo_datasets", help="root with one VO flight folder per IMU flight")
     ap.add_argument("--vo_cache_dir", default=None, help="save / reuse VO ONNX output here")
     ap.add_argument("--start_s", type=float, default=1.0, help="filter start, s after log start")
-    ap.add_argument("--gps_s", type=float, default=60.0, help="GPS-aided seconds before outage")
+    ap.add_argument("--gps_s", type=float, default=None,
+                    help="GPS-aided seconds before the outage (default 60; 0 with --no_gt)")
+    ap.add_argument("--no_gt", action="store_true",
+                    help="no ground truth: start from the first VO + nav attitude, position 0, "
+                         "one continuous run over the whole flight, no reset")
     ap.add_argument("--horizons", nargs="+", default=HZ.DEFAULT,
                     help="into the outage: 30s 1m 2m ... 40m (a bare number = seconds)")
     ap.add_argument("--gps_std", type=float, default=0.1, help="GPS velocity noise, m/s")
@@ -142,6 +154,8 @@ def main(argv=None):
     if a.vo_onnx and not (a.vo_dataset or a.vo_datasets):
         ap.error("--vo_onnx needs --vo_dataset or --vo_datasets")
 
+    if a.gps_s is None:
+        a.gps_s = 0.0 if a.no_gt else 60.0
     cfg = run_ekf.load_config(a.ekf_config)
     make = stream_from_config(cfg)
     hs = sorted(HZ.parse(h, plain="seconds") for h in a.horizons)       # frames
@@ -149,8 +163,9 @@ def main(argv=None):
     att = cfg["attitude_aid"].get("source") or "gt"
     rows_out, first_ev, nis_all = [], None, []
     flights = flight_list(a)
-    print("[stream] %d flight(s) | GPS %.0f s then outage | horizons %s"
-          % (len(flights), a.gps_s, " ".join(HZ.label(h) for h in hs)))
+    print("[stream] %d flight(s) | %s | GPS %.0f s then outage | horizons %s"
+          % (len(flights), "NO GT: start from VO + nav attitude, no reset" if a.no_gt
+             else "start from the GPS/nav state", a.gps_s, " ".join(HZ.label(h) for h in hs)))
     for root, name in flights:
         try:
             fl = PL.load_flight(os.path.join(root, name))
@@ -168,9 +183,19 @@ def main(argv=None):
                   % (name, fl["t"][-1] - fl["t"][0]))
             continue
         kw = dict(t_init=t_start, t_end=min(fl["t"][-1], t_out + h_max_s + 1.0),
-                  gps_until=t_out, gps_std=a.gps_std, att_source=att,
-                  vo_latency_s=a.vo_latency_s, imu_drop=a.imu_drop, seed=0)
-        ev = build_events(fl, vo, **kw)
+                  gps_until=t_out if a.gps_s > 0 else None, gps_std=a.gps_std, att_source=att,
+                  vo_latency_s=a.vo_latency_s, imu_drop=a.imu_drop, seed=0,
+                  init="vo" if a.no_gt else "gt", init_vo=vo)
+        try:
+            ev = build_events(fl, vo, **kw)
+        except ValueError as e:
+            print("  [skip] %s: %s" % (name, e))
+            continue
+        # the run really starts at the INIT message (no-GT: the first VO sample)
+        t_start = ev[0][1]
+        t_out = t_start + a.gps_s
+        k0 = int(np.clip(np.searchsorted(fl["t"], t_start), 0, len(fl["t"]) - 1))
+        p_off = fl["p_gt"][k0] if a.no_gt else None
         res = {"ekf": run_stream(ev, make), "imu": run_stream(build_events(fl, None, **kw), make)}
         if first_ev is None:
             first_ev = (name, ev, res["ekf"][0])
@@ -179,7 +204,7 @@ def main(argv=None):
         ba = res["ekf"][0][min(i, len(res["ekf"][0]) - 1), 11:14]
         n_ok = 0
         for h in hs:
-            per = {arm: score(fl, res[arm][0], t_out, h / HZ.RATE_HZ) for arm in ARMS}
+            per = {arm: score(fl, res[arm][0], t_out, h / HZ.RATE_HZ, p_off) for arm in ARMS}
             if per["ekf"] is None:
                 continue
             n_ok += 1
@@ -193,15 +218,18 @@ def main(argv=None):
     if not rows_out:
         print("no flight long enough")
         return 1
-    print("\n=== STREAM: into the outage, over flights; each cell = ekf / imu-only (ratio) ===")
+    print("\n=== STREAM%s: %s, over flights; each cell = ekf / imu-only (ratio) ==="
+          % (" (NO GT, no reset)" if a.no_gt else "",
+             "time since start" if a.no_gt and a.gps_s == 0 else "time into the outage"))
     head = "%-6s %4s | " % ("horizon", "fl") + " | ".join("%-26s" % n for n, _, _ in PL.SUMMARY)
     print(head)
     print("-" * len(head))
     for h in hs:
         hr = [r for r in rows_out if r["horizon"] == h]
         if not hr:
-            print("%-7s %4d | no flight long enough (needs %s + %.0f s of GPS)"
-                  % (HZ.label(h), 0, HZ.label(h), a.gps_s + a.start_s))
+            print("%-7s %4d | no flight long enough (needs %s%s)"
+                  % (HZ.label(h), 0, HZ.label(h),
+                     "" if a.gps_s == 0 else " + %.0f s of GPS" % a.gps_s))
             continue
         m = {arm: PL.reduce(hr, arm) for arm in ARMS}
         cells = ["%8.3f / %8.3f (%4.2f)" % (m["ekf"][n], m["imu"][n],
