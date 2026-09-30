@@ -3363,7 +3363,7 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             train_sampler.set_epoch(epoch)
         running = {
             "loss": 0.0, "nll": 0.0, "direction": 0.0, "n": 0,
-            "pairs_offered": 0.0, "pairs_delivered": 0.0,
+            "pairs_offered": 0.0, "pairs_delivered": 0.0, "skipped": 0,
         }
         train_stats = RunningVelocityStats()
         train_batches = tqdm(
@@ -3383,8 +3383,23 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
                 loss_mode=args.velocity_loss, huber_delta=args.huber_delta,
             )
             loss.backward()
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(parameters, args.grad_clip)
+            # One non-finite batch (a corrupt frame, a telemetry glitch) must
+            # not poison every weight: NaN gradients survive clipping and one
+            # optimizer step writes NaN into all of them, after which every
+            # later loss is NaN too. The norm is taken AFTER DDP's all-reduce,
+            # so every rank sees the same value and skips the same step.
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                parameters, args.grad_clip if args.grad_clip > 0 else float("inf")
+            )
+            if not (torch.isfinite(grad_norm) and torch.isfinite(loss.detach())):
+                optimizer.zero_grad(set_to_none=True)
+                running["skipped"] += 1
+                if running["skipped"] <= 3:
+                    world.log(
+                        f"  WARNING non-finite loss/gradient at epoch {epoch} "
+                        f"batch {running['n'] + running['skipped']}: step skipped"
+                    )
+                continue
             optimizer.step()
             running["loss"] += float(loss.detach())
             running["nll"] += parts["nll"]
@@ -3412,6 +3427,12 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             )
         # Read BEFORE stepping: the column names the rate this epoch actually
         # trained at, not the one the next epoch will use.
+        if running["skipped"]:
+            world.log(
+                f"  epoch {epoch}: skipped {running['skipped']} step(s) with a "
+                "non-finite loss or gradient - if this is more than a rare "
+                "batch, check the data (altitude, timestamps, blank frames)"
+            )
         epoch_learning_rate = optimizer.param_groups[0]["lr"]
         schedule.step()
         # Each rank saw a different shard, so the reported training loss is the

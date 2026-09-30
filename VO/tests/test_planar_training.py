@@ -388,3 +388,24 @@ def test_a_resume_may_add_a_learning_rate_warmup(rendered, tmp_path):
         planar_argv(rendered, run_dir, epochs="2", lr_warmup_epochs="1") + ["--resume", "auto"]
     ) == 0
     assert load_checkpoint(run_dir / "last.pt", map_location="cpu")["epoch"] == 2
+
+
+def test_a_non_finite_batch_is_skipped_not_applied(rendered, tmp_path, monkeypatch):
+    """A NaN loss must not reach the weights: the step is skipped and the
+    checkpoint stays finite."""
+
+    original = train_fixedwing_vo.compute_velocity_loss
+    calls = {"n": 0}
+
+    def sometimes_nan(*args, **kwargs):
+        loss, parts = original(*args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            loss = loss * float("nan")
+        return loss, parts
+
+    monkeypatch.setattr(train_fixedwing_vo, "compute_velocity_loss", sometimes_nan)
+    run_dir = tmp_path / "run"
+    assert train_fixedwing_vo.main(planar_argv(rendered, run_dir)) == 0
+    state = load_checkpoint(run_dir / "last.pt", map_location="cpu")["model"]
+    assert all(torch.isfinite(v).all() for v in state.values() if torch.is_floating_point(v))
