@@ -1225,7 +1225,8 @@ class VisionMambaVO(nn.Module):
             # altitude alone - answer instead. That is the same cold-start
             # behaviour the heads mode has everywhere.
             velocity = torch.where(held_valid > 0, corrected, velocity)
-            speed = velocity.norm(dim=-1)
+            # Not .norm(): its derivative at an exactly-zero vector is 0/0.
+            speed = (velocity.pow(2).sum(dim=-1) + 1e-12).sqrt()
             direction = F.normalize(velocity, dim=-1, eps=1e-6)
         return {
             "predicted_velocity": velocity,

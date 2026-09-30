@@ -361,6 +361,16 @@ def build_parser() -> argparse.ArgumentParser:
              "gap buys.",
     )
     window.add_argument(
+        "--output-on-pairs", action="store_true",
+        help="One velocity output per image pair, at the pair interval: pairs "
+             "no longer overlap - (0, g), (g, 2g), ... for --frame-gap g - so a "
+             "new measurement arrives every g frames (every 0.5 s for g = 10 at "
+             "20 Hz), and the model's velocity is scored (and, in the "
+             "evaluator, reported) only on the tick each pair is delivered, "
+             "held in between. Default off: a pair ends on every frame and the "
+             "output is scored on every telemetry tick.",
+    )
+    window.add_argument(
         "--planar-baseline-s", type=float, default=1.0,
         help="Time between the two images of a pair that the planar default "
              "--frame-gap aims for (default 1.0 s: about 13 cells of ground "
@@ -995,11 +1005,22 @@ def resolve_frontend_defaults(
     if args.max_frame_gap_s is None and planar and usable_clock:
         args.max_frame_gap_s = round(1.5 * args.frame_gap * frame_interval_s, 3)
         chosen.append(f"--max-frame-gap-s {args.max_frame_gap_s:g}")
+    args.pair_stride = int(args.frame_gap) if getattr(args, "output_on_pairs", False) else 1
+    if args.pair_stride > 1:
+        chosen.append(
+            f"--output-on-pairs: one pair and one output every {args.pair_stride} frames"
+            + (f" ({args.pair_stride * frame_interval_s:.2f} s)" if usable_clock else "")
+        )
     if args.warmup is None:
         if planar and usable_clock and tick_interval_s > 0:
-            # The epsilon keeps 135.00000000000003 ticks from rounding up to 136.
+            # Non-overlapping pairs can leave a window waiting up to one more
+            # pair interval for its first one. The epsilon keeps
+            # 135.00000000000003 ticks from rounding up to 136.
             blind = math.ceil(
-                (args.deployment_latency_s + args.frame_gap * frame_interval_s) / tick_interval_s
+                (
+                    args.deployment_latency_s
+                    + (args.frame_gap + args.pair_stride - 1) * frame_interval_s
+                ) / tick_interval_s
                 - 1e-6
             )
             args.warmup = int(blind) + 5
@@ -1144,6 +1165,9 @@ def resume_fingerprint(
             "altitude_column": source.altitude_column,
             "image_size": [int(value) for value in args.image_size],
             "frame_gap": int(args.frame_gap),
+            # Which pairs exist and which ticks are scored.
+            "pair_stride": int(getattr(args, "pair_stride", 1)),
+            "output_on_pairs": bool(getattr(args, "output_on_pairs", False)),
             "deployment_latency_s": float(args.deployment_latency_s),
             # Alignment settings belong in the checkpoint: scoring a run under a
             # different clock offset or gap rule silently measures a different
@@ -1281,6 +1305,8 @@ FINGERPRINT_DEFAULTS: Dict[str, object] = {
     # every earlier checkpoint, which therefore ran the original frontend on
     # grayscale frames with the factored heads.
     "color": False,
+    "pair_stride": 1,
+    "output_on_pairs": False,
     "frontend": "mamba_correlation",
     "velocity_mode": "heads",
     "planar": None,
@@ -1724,6 +1750,7 @@ def run_horizon_pass(
         progress=not args.no_progress,
         ablate_body_rate=args.ablate_body_rate,
         ablate_visual_age=args.ablate_visual_age,
+        output_on_pairs=args.output_on_pairs,
     )
     print(f"horizons on {args.horizon_split} ({len(tokens)} visual events)")
     print(format_horizon_table(results))
@@ -1987,9 +2014,14 @@ class VOStep(torch.nn.Module):
         ablate_body_rate: bool = False,
         ablate_visual_age: bool = False,
         photometric_augment: float = 0.0,
+        output_on_pairs: bool = False,
     ) -> None:
         super().__init__()
         self.model = model
+        # With --output-on-pairs the velocity is an output only on the tick a
+        # pair is delivered; the prediction dict then carries that mask as
+        # "output_mask" and forward_batch folds it into the loss mask.
+        self.output_on_pairs = bool(output_on_pairs)
         self.window_length = int(window_length)
         self.visual_dim = int(visual_dim)
         self.disable_visual = bool(disable_visual)
@@ -2195,12 +2227,15 @@ class VOStep(torch.nn.Module):
             aiding, image0, image1, pair_dt_s, body_rate, offsets, valid, times_s,
             geometry=self._geometry(rotation, down, altitude),
         )
-        return self.model(
+        prediction = self.model(
             aiding, visual["token"], visual["present"], visual["age"],
             visual_quality=visual["quality"], log_altitude=log_altitude,
             visual_velocity=visual["visual_velocity"],
             visual_velocity_valid=visual["visual_velocity_valid"],
         )
+        if self.output_on_pairs:
+            prediction["output_mask"] = visual["present"].squeeze(-1).detach()
+        return prediction
 
     def forward_stream(
         self,
@@ -2254,6 +2289,8 @@ class VOStep(torch.nn.Module):
             visual_velocity=visual["visual_velocity"],
             visual_velocity_valid=visual["visual_velocity_valid"],
         )
+        if self.output_on_pairs:
+            prediction["output_mask"] = visual["present"].squeeze(-1).detach()
         return prediction, state, visual["age_carry"]
 
 
@@ -2292,7 +2329,12 @@ def forward_batch(
         to("telemetry_time_s"),
         *_geometry_arguments(batch, to),
     )
-    return prediction, to("target_velocity_body"), to("loss_mask")
+    mask = to("loss_mask")
+    if "output_mask" in prediction:
+        # --output-on-pairs: only the ticks where a pair was delivered are
+        # outputs, so only they are scored - in training and validation alike.
+        mask = mask * prediction["output_mask"].to(mask.dtype)
+    return prediction, to("target_velocity_body"), mask
 
 
 def forward_batch_stream(
@@ -2332,7 +2374,10 @@ def forward_batch_stream(
         altitude=altitude,
         velocity_carry=velocity_carry,
     )
-    return prediction, to("target_velocity_body"), to("loss_mask"), state, age_carry
+    mask = to("loss_mask")
+    if "output_mask" in prediction:
+        mask = mask * prediction["output_mask"].to(mask.dtype)
+    return prediction, to("target_velocity_body"), mask, state, age_carry
 
 
 # ---------------------------------------------------------------------------
@@ -2499,6 +2544,7 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             image_folder=args.image_folder, image_size=tuple(args.image_size),
             frame_gap=args.frame_gap, deployment_latency_s=args.deployment_latency_s,
             max_frame_gap_s=args.max_frame_gap_s,
+            pair_stride=args.pair_stride,
             image_time_offset_s=image_time_offset,
             lever_arm_m=lever_arm,
             camera_matrix=camera_matrix,
@@ -2612,6 +2658,11 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
         ],
     }
     input_contract["frontend"] = str(args.frontend)
+    input_contract["output_rate"] = (
+        f"one velocity per image pair (every {int(args.pair_stride)} frames)"
+        if args.output_on_pairs
+        else "every telemetry tick"
+    )
     input_contract["velocity_mode"] = resolve_velocity_mode(args)
     if args.frontend == "planar":
         input_contract["telemetry_input"]["planar_geometry"] = (
@@ -2793,6 +2844,7 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
         ablate_body_rate=args.ablate_body_rate,
         ablate_visual_age=args.ablate_visual_age,
         photometric_augment=args.photometric_augment,
+        output_on_pairs=args.output_on_pairs,
     ).to(device)
     if world.enabled:
         # static_graph lets DDP cope with gradient checkpointing, which

@@ -446,7 +446,7 @@ class PlanarFlowFrontend(VisionMambaFlowFrontend):
                 residual_rms_cells.clamp(0.0, 5.0),
                 fit["inlier_fraction"],
                 fit["total_weight"] / total_cells.clamp_min(1.0),
-                coarse_margin.to(dtype),
+                coarse_margin.to(dtype).clamp(-1.0, 1.0),
                 rotation_angle,
                 torch.log(height0 / 100.0),
                 geometric_valid.squeeze(-1),

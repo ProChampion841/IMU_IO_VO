@@ -116,6 +116,7 @@ class VisualPairSource:
         frame_gap: int = 1,
         max_frame_gap_s: Optional[float] = None,
         max_telemetry_gap_s: Optional[float] = None,
+        pair_stride: int = 1,
         image_size: Tuple[int, int] = (288, 384),
         grayscale: bool = True,
         camera_matrix: Optional[np.ndarray] = None,
@@ -125,6 +126,14 @@ class VisualPairSource:
     ) -> None:
         if frame_gap < 1:
             raise ValueError("frame_gap must be at least one")
+        # Frames between the FIRST images of consecutive pairs. 1 (default):
+        # a pair ends on every frame, overlapping its neighbours. frame_gap:
+        # pairs tile the capture end to end, (0, g), (g, 2g), ... - one
+        # measurement per pair interval, which is the output rate a deployment
+        # that runs the estimator once per pair will have.
+        if pair_stride < 1:
+            raise ValueError("pair_stride must be at least one")
+        self.pair_stride = int(pair_stride)
         if deployment_latency_s < 0:
             raise ValueError("deployment_latency_s cannot be negative")
         if max_frame_gap_s is not None and not (max_frame_gap_s > 0):
@@ -198,7 +207,7 @@ class VisualPairSource:
         count = len(self.paths) - frame_gap
         if count <= 0:
             raise ValueError("Not enough images for the requested frame gap")
-        first = np.arange(count, dtype=np.int64)
+        first = np.arange(0, count, self.pair_stride, dtype=np.int64)
         second = first + frame_gap
         exposure_t0 = capture[first]
         exposure_t1 = capture[second]

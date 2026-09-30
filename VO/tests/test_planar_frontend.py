@@ -486,3 +486,29 @@ def test_geometric_residual_starts_as_the_held_velocity_and_heads_before_it():
             torch.zeros(batch, ticks, 1), torch.zeros(batch, ticks, 1),
             log_altitude=torch.zeros(batch, ticks),
         )
+
+
+def test_a_blank_padding_pair_leaves_every_gradient_finite():
+    """A window's unused event slots are blank frames with dummy geometry
+    (unit altitude, identity rotation). The fit has nothing to fit there -
+    zero weight, zero residual - and a sqrt or matrix inverse at exactly that
+    point turned the (zero) gradient into NaN and poisoned every weight on the
+    first optimiser step. A blank or overexposed real frame is the same case."""
+
+    image0, image1, geometry, truth, _ = two_views("right_forward")
+    blank = torch.zeros_like(image0)
+    frontend = make_frontend("right_forward").train()
+    out = frontend(
+        torch.cat((image0, blank)), torch.cat((image1, blank)),
+        pair_dt_s=torch.tensor([1.0, 1.0]), camera_matrix=camera_matrix(),
+        relative_rotation=torch.cat((geometry["relative_rotation"], torch.eye(3)[None])),
+        down_body=torch.cat((geometry["down_body"], torch.tensor([[0.0, 0.0, 1.0]]))),
+        altitude_m=torch.cat((geometry["altitude_m"], torch.ones(1, 2))),
+    )
+    assert float(out["geometric_valid"][1]) == 0.0
+    # Only the real pair's velocity is used, as the hold does.
+    loss = (out["geometric_velocity"][0] - torch.tensor(truth, dtype=torch.float32)).pow(2).sum()
+    loss = loss + out["visual_token"].pow(2).sum() + out["visual_quality"].sum()
+    loss.backward()
+    bad = [n for n, p in frontend.named_parameters() if p.grad is not None and not torch.isfinite(p.grad).all()]
+    assert bad == []

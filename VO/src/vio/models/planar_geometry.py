@@ -351,7 +351,12 @@ def fit_planar_translation(
         normal = weighted.transpose(1, 2) @ rows
         rhs = (weighted * targets.unsqueeze(-1)).sum(dim=1)
         scale = normal.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1e-12)
-        normal = normal + ridge * scale.view(-1, 1, 1) * identity
+        # A relative ridge keeps a real fit well-posed; the absolute floor keeps
+        # a fit with NO weight (a blank frame, a padding slot) from becoming a
+        # solve against a ~1e-18 matrix, whose backward overflows to inf and
+        # turns the zero gradient reaching it into NaN. With real weight the
+        # diagonal is ~1e2-1e4, so 1e-6 is far below anything it could move.
+        normal = normal + (ridge * scale + 1e-6).view(-1, 1, 1) * identity
         if constrained:
             # The scale is detached: it sets how much the altimeter row
             # matters, not something the optimiser should be able to shrink.
@@ -378,21 +383,29 @@ def fit_planar_translation(
             robust = torch.cat((factor, factor), dim=1)
         u = solve(base * robust)
 
-    final_weight = base * robust
-    residual = (rows @ u.unsqueeze(-1)).squeeze(-1) - targets
-    weight_sum = final_weight.sum(dim=1).clamp_min(1e-12)
-    variance = (final_weight * residual.pow(2)).sum(dim=1) / weight_sum
-    information, _ = system(final_weight)
-    # The effective sample count is the weight sum over the mean weight, so a
-    # fit on many low-confidence cells is not credited as if each were exact.
-    mean_weight = weight_sum / (final_weight > 0).sum(dim=1).clamp_min(1)
-    covariance = torch.linalg.inv(information) * (variance * mean_weight).view(-1, 1, 1)
+    # The fit's statistics describe it; nothing downstream should be trained
+    # THROUGH them, and two of them are singular exactly where a fit has
+    # nothing in it: sqrt at zero variance and the inverse of an empty
+    # information matrix both have infinite derivatives, and an infinite
+    # derivative times the zero gradient a padding slot receives is NaN.
+    with torch.no_grad():
+        final_weight = base * robust
+        residual = (rows @ u.detach().unsqueeze(-1)).squeeze(-1) - targets
+        weight_sum = final_weight.sum(dim=1).clamp_min(1e-12)
+        variance = (final_weight * residual.pow(2)).sum(dim=1) / weight_sum
+        information, _ = system(final_weight)
+        # The effective sample count is the weight sum over the mean weight, so
+        # a fit on many low-confidence cells is not credited as if each were exact.
+        mean_weight = weight_sum / (final_weight > 0).sum(dim=1).clamp_min(1)
+        covariance = torch.linalg.inv(information) * (variance * mean_weight).view(-1, 1, 1)
+        residual_rms = variance.clamp_min(0.0).sqrt()
+        inlier_fraction = final_weight.sum(dim=1) / base.sum(dim=1).clamp_min(1e-12)
     return {
         "u": u,
         "covariance": covariance,
-        "residual_rms": variance.clamp_min(0.0).sqrt(),
-        "inlier_fraction": (final_weight.sum(dim=1) / base.sum(dim=1).clamp_min(1e-12)),
-        "total_weight": total_weight,
+        "residual_rms": residual_rms,
+        "inlier_fraction": inlier_fraction,
+        "total_weight": total_weight.detach(),
     }
 
 
@@ -503,6 +516,12 @@ def global_offset_peak(
         near = ((rows - row.view(-1, 1, 1)).abs() <= 1) & ((cols - col.view(-1, 1, 1)).abs() <= 1)
         away = grid.masked_fill(near, floor).reshape(batch, -1).amax(dim=1)
         margin = torch.where(away > floor, centre - away, centre)
+        # No offset had enough support (a blank frame, a pair with nothing to
+        # match): report no motion relative to the window centre and no
+        # confidence - never the masking floor, which is -1e37.
+        found = centre > floor
+        offset = torch.where(found.unsqueeze(-1), offset, torch.zeros_like(offset))
+        margin = torch.where(found, margin, torch.zeros_like(margin))
     return offset, margin
 
 

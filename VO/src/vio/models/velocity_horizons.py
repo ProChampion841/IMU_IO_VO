@@ -1004,8 +1004,15 @@ def run_span_horizons(
     progress: bool = False,
     ablate_body_rate: bool = False,
     ablate_visual_age: bool = False,
+    output_on_pairs: bool = False,
 ) -> Tuple[Dict[str, Dict[str, object]], Dict[str, object]]:
     """Stream ``span`` once, start to end, and score every horizon prefix.
+
+    ``output_on_pairs`` scores a model trained with ``--output-on-pairs`` the
+    way it is deployed: its velocity is an output only on the tick an image
+    pair is delivered, so the velocity metrics count only those ticks, and
+    the dead-reckoned position integrates that output HELD until the next
+    one - what a consumer of one velocity per pair actually integrates.
 
     Returns ``(horizons, whole_span)``. ``horizons`` has one entry per label
     (``"h5m"``), each covering the FIRST H minutes of the span and nothing
@@ -1164,6 +1171,8 @@ def run_span_horizons(
     model.eval()
     try:
         state: Optional[VOStreamState] = None
+        # The last emitted output, carried across blocks (--output-on-pairs).
+        held_output: Optional[torch.Tensor] = None
         step = max(int(block_ticks), 1)
         blocks = list(range(0, span_ticks, step))
         for begin in _maybe_progress(
@@ -1189,29 +1198,36 @@ def run_span_horizons(
             predicted = outputs["predicted_velocity"]
             block_target = leg_target[:, begin:stop]
             block_mask = mask[:, begin:stop]
+            score_mask = block_mask
+            drift_predicted = predicted
+            if output_on_pairs:
+                fired = present_field[:, begin:stop, 0] > 0
+                score_mask = block_mask * fired.to(block_mask.dtype)
+                drift_predicted, held_output = _hold_emitted(predicted, fired, held_output)
             block_rotation = (
                 None if leg_rotation is None else leg_rotation[:, begin:stop]
             )
             block_clock = leg_clock[:, begin:stop]
             tick_index = torch.arange(begin, stop, device=device).unsqueeze(0)
 
-            def feed(stats, drift, reference, active) -> None:
-                stats.update(predicted, block_target, active, begin)
+            def feed(stats, drift, reference, prefix) -> None:
+                scored = score_mask * prefix
+                stats.update(predicted, block_target, scored, begin)
                 if drift is not None:
                     drift.update(
-                        predicted,
+                        drift_predicted,
                         block_target,
                         block_rotation,
                         block_clock,
-                        active,
+                        block_mask * prefix,
                         begin,
                     )
                 if reference is not None:
                     reference.update(
-                        constant.expand_as(block_target), block_target, active
+                        constant.expand_as(block_target), block_target, scored
                     )
 
-            feed(span_stats, span_drift, span_reference, block_mask)
+            feed(span_stats, span_drift, span_reference, torch.ones_like(block_mask))
             for ticks, stats, drift, reference in buckets:
                 # A prefix that ended before this block has nothing to add.
                 if begin >= ticks:
@@ -1220,7 +1236,7 @@ def run_span_horizons(
                     stats,
                     drift,
                     reference,
-                    block_mask * (tick_index < ticks).to(block_mask.dtype),
+                    (tick_index < ticks).to(block_mask.dtype),
                 )
     finally:
         model.train(was_training)
@@ -1319,6 +1335,31 @@ def run_span_horizons(
     )
     whole_span["whole_span_minutes"] = span_minutes
     return results, whole_span
+
+
+def _hold_emitted(
+    predicted: torch.Tensor, fired: torch.Tensor, carried: Optional[torch.Tensor]
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Hold each emitted output ``(C, L, 3)`` until the next one fires.
+
+    Ticks before the first emission (in this block and, via ``carried``, in
+    every earlier one) keep the model's own per-tick value. Returns the held
+    series and the output to carry into the next block.
+    """
+
+    count, length, _ = predicted.shape
+    index = torch.arange(length, device=predicted.device).expand(count, length)
+    latest, _ = torch.cummax(torch.where(fired, index, torch.full_like(index, -1)), dim=1)
+    held = predicted.gather(1, latest.clamp_min(0).unsqueeze(-1).expand(count, length, 3))
+    before = (latest < 0).unsqueeze(-1)
+    if carried is not None:
+        fallback = carried.unsqueeze(1).expand(count, length, 3)
+    else:
+        fallback = predicted
+    held = torch.where(before, fallback, held)
+    if carried is None and not bool((latest[:, -1] >= 0).any()):
+        return held, None
+    return held, held[:, -1]
 
 
 def stream_horizon_metrics(

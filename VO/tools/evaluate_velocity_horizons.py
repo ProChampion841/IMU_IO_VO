@@ -313,6 +313,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         image_folder=saved.get("image_folder", "images"),
         image_size=image_size,
         frame_gap=int(saved.get("frame_gap", 1)),
+        pair_stride=int(saved.get("pair_stride", 1)),
         deployment_latency_s=float(saved.get("deployment_latency_s", 0.35)),
         # Reproduce the run's own alignment. Defaults match a checkpoint written
         # before these were recorded, so an older file scores exactly as before.
@@ -630,6 +631,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             progress=progress,
             ablate_body_rate=ablate_body_rate,
             ablate_visual_age=ablate_visual_age,
+            output_on_pairs=bool(saved.get("output_on_pairs", False)),
         )
         if args.no_position:
             for entry in results.values():

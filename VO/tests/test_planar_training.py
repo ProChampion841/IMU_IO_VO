@@ -304,3 +304,55 @@ def test_stratified_errors_split_by_condition_and_refuse_thin_bins():
     assert by_turn[0.0]["ticks"] == 190 and by_turn[0.0]["vel_rmse"] == pytest.approx(0.0)
     assert by_turn[10.0]["ticks"] == 200 and by_turn[10.0]["vel_rmse_y"] == pytest.approx(2.0)
     assert np.isnan(by_turn[2.0]["vel_rmse"]) and by_turn[2.0]["ticks"] == 0
+
+
+def test_output_on_pairs_tiles_the_pairs_and_scores_one_output_per_pair(rendered, tmp_path):
+    """--output-on-pairs with --frame-gap 10 at 20 Hz: pairs (0,10), (10,20),
+    ... - one measurement and one scored output every 0.5 s - carried through
+    training, the checkpoint and the evaluator."""
+
+    from vio.data.image_pairs import VisualPairSource
+
+    times = np.arange(0.0, 20.0, 0.01) + 1000.0
+    source = VisualPairSource(rendered, times, frame_gap=10, pair_stride=10)
+    assert source.plan.first_index[:3].tolist() == [0, 10, 20]
+    assert source.plan.second_index[:3].tolist() == [10, 20, 30]
+    assert np.allclose(np.diff(source.plan.exposure_t1_s[:5]), 0.5)
+
+    run_dir = tmp_path / "run"
+    assert train_fixedwing_vo.main(
+        planar_argv(rendered, run_dir, output_on_pairs=True, warmup=None)
+    ) == 0
+    checkpoint = load_checkpoint(run_dir / "last.pt", map_location="cpu")
+    saved = checkpoint["args"]
+    assert saved["output_on_pairs"] is True and saved["pair_stride"] == 10
+    assert checkpoint["fingerprint"]["contract"]["pair_stride"] == 10
+    with (run_dir / "metrics.csv").open(newline="", encoding="utf-8") as handle:
+        row = list(csv.DictReader(handle))[0]
+    assert np.isfinite(float(row["val_vel_rmse"]))
+
+    output = tmp_path / "eval.json"
+    assert evaluate_velocity_horizons.main([
+        str(run_dir / "best.pt"), "--dataset", str(rendered),
+        "--splits", "validation", "--horizons", "0.04",
+        "--no-plots", "--no-progress", "--output", str(output),
+    ]) == 0
+    horizon = json.loads(output.read_text(encoding="utf-8"))["splits"]["validation"]["horizons"]["h0.04m"]
+    assert horizon["fits"], horizon.get("skipped")
+    # 2.4 s, of which ~1.05 s after the warm-up, at one output per 0.5 s:
+    # two or three scored ticks, not ~100.
+    assert 0 < horizon["scored_ticks"] <= 4
+    assert np.isfinite(horizon["vel_rmse"]) and np.isfinite(horizon["pos_error_final"])
+
+
+def test_held_outputs_fill_until_the_next_emission_and_carry_across_blocks():
+    from vio.models.velocity_horizons import _hold_emitted
+
+    predicted = torch.arange(6, dtype=torch.float32).view(1, 6, 1).expand(1, 6, 3).clone()
+    fired = torch.tensor([[False, True, False, False, True, False]])
+    held, carry = _hold_emitted(predicted, fired, None)
+    assert held[0, :, 0].tolist() == [0, 1, 1, 1, 4, 4]
+    assert carry[0, 0] == 4
+    later, carry2 = _hold_emitted(predicted + 10, torch.tensor([[False, False, True, False, False, False]]), carry)
+    assert later[0, :, 0].tolist() == [4, 4, 12, 12, 12, 12]
+    assert carry2[0, 0] == 12
