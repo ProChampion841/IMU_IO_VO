@@ -1,0 +1,8 @@
+# train
+python tools/train_fixedwing_vo.py --dataset data_split/train --validation-dataset data_split/validation --test-dataset data_split/test --calibration configs/vo/camera_fixedwing.json --rotation-mode field --run-dir runs/vo_field_s0 --device 0,1,2,3,4,5,6,7,8,9 --num-workers 2 --lr-scaling linear --epochs 3000 --seed 0 --select-on vel_rmse --save-every 1 --keep-last 500
+
+# resume if it stops (same command, add --resume)
+python tools/train_fixedwing_vo.py --dataset data_split/train --validation-dataset data_split/validation --test-dataset data_split/test --calibration configs/vo/camera_fixedwing.json --rotation-mode field --run-dir runs/vo_field_s0 --device 0,1,2,3,4,5,6,7,8,9 --num-workers 2 --lr-scaling sqrt --epochs 300 --seed 0 --select-on vel_rmse --save-every 25 --keep-last 5 --resume runs/vo_field_s0/last.pt
+
+# evaluate
+python tools/evaluate_velocity_horizons.py runs/vo_field_s0/best.pt --dataset data_split/validation --calibration configs/vo/camera_fixedwing.json --device cuda:0 --output artifacts/eval_field.json --plot-dir artifacts/plots_field

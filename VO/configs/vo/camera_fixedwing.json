@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "status": "camera_and_imu_values_supplied_rectification_in_loader",
+  "_README": [
+    "Fixed-wing camera calibration supplied for the 1920x1080 training images.",
+    "The 3x3 matrix supplied by the user is stored as fx/fy/cx/cy below.",
+    "The distortion vector uses the OpenCV radtan order [k1, k2, p1, p2, k3].",
+    "The joint image loader applies distortion correction and resize together.",
+    "Replace the IMU bias vectors with signed per-axis stationary-calibration",
+    "measurements before interpreting real-flight accuracy."
+  ],
+  "camera": {
+    "width": 1920,
+    "height": 1080,
+    "fx": 1973.0219659408797,
+    "fy": 1965.4069650790927,
+    "cx": 977.5227160981171,
+    "cy": 573.6751409869057,
+    "images_rectified": false,
+    "distortion": [
+      -0.3927828400041276,
+      0.2826762253522421,
+      0.00017051745472455808,
+      0.00034770638383460145,
+      -0.21271486634537895
+    ]
+  },
+  "imu": {
+    "expected_rate_hz": 100.0,
+    "gyro_unit": "degrees_per_second",
+    "accel_unit": "g",
+    "gravity_m_s2": 9.80665,
+    "gyro_bias": [
+      0.001666666666666667,
+      0.001666666666666667,
+      0.001666666666666667
+    ],
+    "accel_bias": [
+      3e-05,
+      3e-05,
+      3e-05
+    ]
+  },
+  "reference": {
+    "world_frame": "NED",
+    "euler_unit": "radians",
+    "euler_order": "roll_pitch_yaw_intrinsic_zyx",
+    "orientation_meaning": "body_to_ned"
+  },
+  "warning": "Camera K and distortion are supplied. images_rectified=false makes the joint loader rectify and resize in one calibrated remap. Set it true only if the stored images have already been rectified. Equal signed per-axis IMU biases were provided by the user: 6 degrees/hour and 30 micro-g.",
+  "mounting": {
+    "_README": [
+      "gps_to_camera_m is the offset from the GPS antenna to the camera,",
+      "in BODY axes (x forward, y right, z down), in metres.",
+      "GPS measures velocity at the antenna; the camera is what sees the",
+      "motion the network must explain. A rigid body in a turn moves its",
+      "points at different velocities: v_camera = v_gps + omega x r.",
+      "Leave it all zero, or delete this block, for no correction.",
+      "Measure it on the airframe; do not guess a wing mount as zero."
+    ],
+    "gps_to_camera_m": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  }
+}

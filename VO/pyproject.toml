@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mamba-vo"
+version = "0.1.0"
+description = "Causal visual odometry for fixed-wing aircraft: image pairs, Euler attitude and relative altitude to body velocity, via a Mamba state-space estimator."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+
+# torch/torchvision/torchaudio are deliberately unpinned here: the correct
+# build depends on the CUDA toolkit on the target node, so scripts/setup_ubuntu.sh
+# installs them from the appropriate index before this package is installed.
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "numpy",
+    "einops",          # required by the optional Mamba-2 implementation
+    "scipy",           # dual-resampler correspondence probe
+    "opencv-python",   # KLT and camera rectification
+    "Pillow",          # image audit and dataset loading
+    "ninja",           # selective-scan extension build
+    "packaging",
+    "triton; platform_system == 'Linux'",
+    "timm==0.4.12",
+    "chardet",
+    "yacs",
+    "termcolor",
+    "submitit",
+    "tensorboardX",
+    "fvcore",
+    "seaborn",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "ruff>=0.4",
+]
+
+[tool.setuptools]
+# src/ layout: the package is importable only once installed, which keeps a
+# stray `vio/` on the working directory from shadowing the real one.
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Type checkers infer ONE import root from [tool.setuptools] above, and that is
+# src/. But tools/ is a second top-level package, at the repository root, and it
+# is imported as tools.* by 22 files across tools/ and tests/. Without both roots
+# declared a checker reports "Cannot find module tools.<name>" for every one of
+# them, while the code runs fine -- each script puts both on sys.path itself.
+# These keys tell the three common checkers what that bootstrap already does.
+
+[tool.pyright]
+extraPaths = ["src", "."]
+
+[tool.ty.environment]
+extra-paths = ["src", "."]
+
+[tool.mypy]
+mypy_path = ["src", "."]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+# Quieten the third-party deprecation noise that otherwise buries real output.
+filterwarnings = [
+    "ignore::DeprecationWarning:fvcore.*",
+    "ignore::UserWarning:torch.*",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+extend-exclude = ["runs", "artifacts", "data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+# E402 (import not at top of file) is expected: tools/ and tests/ bootstrap
+# sys.path before importing the package so they run without an install.
+ignore = ["E501", "E402"]

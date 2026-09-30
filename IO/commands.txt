@@ -1,0 +1,65 @@
+### velnet -- the only model in this repo
+# Each arm changes ONE thing vs velnet_v1. Reasoning lives in each .conf header.
+# ~2.6 h/arm. No early stopping: pick the epoch by hand from experiments/UAV/<arm>/ckpt/.
+# Run order: A -> G -> H -> E -> D -> F. C needs a re-run (predates the 2026-09-08 baseline).
+
+# train (A: baseline / reference)
+python train.py --config configs/exp/UAV/velnet_v1.conf --device cuda:0
+
+# train (G: gru_hidden 256 -> 128)
+python train.py --config configs/exp/UAV/velnet_v2g_smaller.conf --device cuda:0
+
+# train (H: fuse_dropout 0 -> 0.2)
+python train.py --config configs/exp/UAV/velnet_v2h_dropout.conf --device cuda:0
+
+# train (C: attitude input) -- already run, ~null vs A, needs re-run
+python train.py --config configs/exp/UAV/velnet_v2c_attitude.conf --device cuda:0
+
+# train (E: airspeed input)
+python train.py --config configs/exp/UAV/velnet_v2e_airspeed.conf --device cuda:0
+
+# train (D: mamba_stride 96 -> 32)
+python train.py --config configs/exp/UAV/velnet_v2d_stride32.conf --device cuda:0
+
+# train (F: velocity-direction uncertainty head)
+python train.py --config configs/exp/UAV/velnet_v2f_dirweight.conf --device cuda:0
+
+# resume any run
+python train.py --config configs/exp/UAV/velnet_v1.conf --device cuda:0 --load_ckpt
+
+# eval feasibility: which flights are long enough per horizon (no ckpt needed)
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --check
+
+# eval (30s 1min 5min 10min 15min 30min 40min: vel_rmse vel_max dir_rmse dir_max pos_error)
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf ^
+  --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt ^
+  --out experiments/UAV/velnet_v1/horizons.csv
+
+# eval with the first-frame offset (v_gt0 - v_pred0) removed from every velocity + position
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf ^
+  --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt ^
+  --v0_offset ^
+  --out experiments/UAV/velnet_v1/horizons_v0.csv
+
+# eval one flight
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf ^
+  --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt ^
+  --flights 178_47 ^
+  --out experiments/UAV/velnet_v1/horizons_178_47.csv
+
+# trajectory plots
+python -m tools.plot_trajectory --config configs/exp/UAV/velnet_v1.conf ^
+  --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt
+
+# tensorboard (all arms side by side)
+tensorboard --logdir experiments/UAV --host 0.0.0.0
+
+# ---------------------------------------------------------------------------
+# Reading the results
+#   rank arms on val_vel_error_60s (eval-mode for every arm)
+#   train/val ratio: trend within one run only -- dropout deflates H's by ~3%
+#   val_pred_cov_vel vs (val_vel_error^2 / 3): is the uncertainty calibrated
+#   noise floor is 2.55 m; an arm worth under ~1 m will not be resolvable
+#   validation is 3 dates, not 11 flights -- part of the train/val gap is shift
+#   eval: vel/dir pooled over every frame; pos_error = drift at window end
+# ---------------------------------------------------------------------------

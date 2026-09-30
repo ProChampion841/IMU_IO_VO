@@ -1,0 +1,5 @@
+# Shell scripts and Python must stay LF so a Windows checkout does not produce
+# files that Ubuntu's interpreter rejects with "bad interpreter: \r".
+*.sh   text eol=lf
+*.py   text eol=lf
+*.ps1  text eol=crlf

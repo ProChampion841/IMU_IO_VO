@@ -1,0 +1,55 @@
+# ===== TRAIN =====
+
+# train baseline (A)
+python train.py --config configs/exp/UAV/velnet_v1.conf --device cuda:0
+
+# train smaller model (G)
+python train.py --config configs/exp/UAV/velnet_v2g_smaller.conf --device cuda:0
+
+# train with dropout (H)
+python train.py --config configs/exp/UAV/velnet_v2h_dropout.conf --device cuda:0
+
+# train with attitude input (C)
+python train.py --config configs/exp/UAV/velnet_v2c_attitude.conf --device cuda:0
+
+# train with airspeed input (E)
+python train.py --config configs/exp/UAV/velnet_v2e_airspeed.conf --device cuda:0
+
+# train with mamba_stride 32 (D)
+python train.py --config configs/exp/UAV/velnet_v2d_stride32.conf --device cuda:0
+
+# train with direction uncertainty head (F)
+python train.py --config configs/exp/UAV/velnet_v2f_dirweight.conf --device cuda:0
+
+# resume training
+python train.py --config configs/exp/UAV/velnet_v1.conf --device cuda:0 --load_ckpt
+
+
+# ===== EVALUATE =====
+
+# check which horizons have data (no checkpoint needed)
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --check
+
+# evaluate (30s 1min 5min 10min 15min 30min 40min)
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt --out experiments/UAV/velnet_v1/horizons.csv
+
+# evaluate with first-frame offset removed
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt --v0_offset --out experiments/UAV/velnet_v1/horizons_v0.csv
+
+# evaluate with offset averaged over first 10 s
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt --v0_offset --v0_frames 1000 --out experiments/UAV/velnet_v1/horizons_v0_10s.csv
+
+# evaluate one flight
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt --flights 178_47 --out experiments/UAV/velnet_v1/horizons_178_47.csv
+
+# evaluate a chosen epoch
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --ckpt experiments/UAV/velnet_v1/ckpt/0035.ckpt --out experiments/UAV/velnet_v1/horizons_ep35.csv
+
+
+# ===== VIEW =====
+
+# plot trajectories
+python -m tools.plot_trajectory --config configs/exp/UAV/velnet_v1.conf --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt
+
+# tensorboard
+tensorboard --logdir experiments/UAV --host 0.0.0.0

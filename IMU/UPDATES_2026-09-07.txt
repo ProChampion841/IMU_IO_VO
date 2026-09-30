@@ -1,0 +1,125 @@
+===============================================================================
+WHAT I CHANGED FOR THE HYBRID MODEL TODAY          2026-09-07
+===============================================================================
+
+MADE IT FASTER
+  - One step went from 3652 ms to 660 ms. About 5.5 times faster.
+  - Two settings were wrongly glued together. Split them apart (cov_sampling).
+    The physics part now runs 4.4x faster and the results do not change.
+  - Validation windows no longer overlap, so each epoch is cheaper.
+
+FIXED A CRASH BEFORE YOU HIT IT
+  - The eval step would have crashed your run at epoch 9. It happens when the
+    eval set has fewer windows than the batch size. Your run had enough, so it
+    would not have crashed, but the error message told you nothing useful.
+    Now it says what is actually wrong.
+
+CHANGED HOW THE BEST MODEL IS PICKED
+  - Before: picked by the 120 s score. That score uses only 42 windows from 10
+    flights, and one single flight is 26% of it. Too shaky.
+  - Now: picked by the 60 s score. 101 windows, all 11 flights.
+  - Also added a 30 s score, so training now reports 30 s, 60 s and 120 s --
+    the same three times you measure with.
+
+TUNED THE TRAINING SETTINGS
+  - Max epochs 40 -> 200.
+  - Learning rate floor lowered (1e-5 -> 1e-7) so it does not get stuck early.
+  - Fixed an averaging setting that was 9 times too slow. Because of that bug,
+    about HALF of the old v13 saved model was still random startup noise.
+  - save_freq is now 5. A saved copy every 5 epochs, 40 files, about 560 MB.
+    This matters: the best epoch this time was epoch 2, and at the old setting
+    of 25 it was already thrown away.
+
+ATTITUDE NOW COMES FROM THE MTi NAV SOLUTION   <-- THE BIG ONE
+  WHAT
+  - The model no longer builds attitude by integrating the gyro. It takes it from
+    GPSNavEulX/Y/Z (the MTi ARCH3 nav solution) directly.  gtrot: False -> True.
+
+  WHY IT IS ALLOWED
+  - The concern was that "GPSNav" meant GPS-derived, and so unavailable during a
+    GPS outage.  We CHECKED it: NavEul yaw versus GPS course-over-ground differs by
+    std 14.5-18.3 deg across flights, which is exactly the crab angle from wind.
+    A GPS-derived yaw would follow course within about 1 deg.  It holds true heading
+    instead, so it does not depend on GPS.
+
+  WHAT IT BUYS  (endpoint velocity error, eval split, same windows)
+        horizon   gyro-integrated   NavEul
+         30 s        5.32 m/s        2.93     1.8x better
+         60 s       12.04            4.25     2.8x better
+        120 s       27.19            5.54     4.9x better
+    Position at 120 s, before any training: 1132 m -> 357 m.
+
+  WHY IT CHANGES THE WHOLE PROBLEM
+  - Attitude was 94% of the error at 120 s, so every earlier model was fighting over
+    the remaining 6%.  With attitude supplied, the accel correction works on the
+    dominant term for the first time.  The old null result does not predict this one.
+  - It also makes three things unnecessary: gyro correction, rotation in the loss,
+    and the airspeed consistency term (which existed only to stop the accel
+    correction hiding gyro drift -- there is no gyro drift left to hide).
+
+AIRSPEED: ADDED, THEN REMOVED
+  - It was added as a 7th input, verified genuinely connected, and an airspeed
+    consistency LOSS term was built and measured.
+  - MEASURED and worth keeping on record: the pitot knows forward speed 2.5-2.9x
+    better than the integration does (2.94/1.17, 4.28/1.49, 5.57/1.97 m/s at
+    30/60/120 s).  So it is real information, not noise.
+  - Removed anyway at the user's request: use_airspeed False (in_dim 7 -> 6) and
+    air_weight 0.0.  Verified disconnected -- adding 50 m/s to the airspeed changes
+    the model output by exactly 0.
+  - The loss term still exists in model/losses.py, switched off.  Re-enabling either
+    is one line; the dataloader still supplies the channel.
+  - Known weakness if it is ever re-enabled: the per-window wind fit came out at
+    9.6-19.7 m/s against a real crab of about 5.4, so the wind parameters were
+    flattering the fit, and there is a 0.572 m/s floor from unmodelled sideslip.
+
+KEPT BOTH BRAINS, RETUNED THE LONG ONE
+  - GRU (short memory) covers the last 2.97 seconds.
+  - Mamba (long memory) reaches about 20 seconds. Its step size changed from
+    96 to 32. At 96 it only took 7 steps and its first 8.6 seconds were built
+    from almost no data. At 32 it takes 21 steps and starts at 2.88 seconds,
+    which lines up right where the GRU stops. No blind gap between them.
+
+LOGGING
+  - Removed wandb. TensorBoard is now the only live view. It shows 36 numbers,
+    including all three time horizons.
+  - Deleted the --log flag. It used to turn logging OFF, which was backwards.
+  - Data loading now shows a progress bar, and still prints every per-flight
+    line plus a short summary at the end.
+
+CLEANUP
+  - Repo 3.9 GB -> 1.1 GB. Tools 43 -> 13. Configs down to 2 models.
+
+
+-------------------------------------------------------------------------------
+THE RESULT OF TODAY'S TRAINING RUN
+-------------------------------------------------------------------------------
+Short answer: it did not work. The model is no better than doing nothing.
+
+  "1.000" means the same as the simple bias-freeze method.
+  Below 1.000 is better. Above 1.000 is worse.
+
+    epoch      30 s    60 s   120 s
+      2       0.985   0.987   0.998     best it ever got
+      4       1.000   0.992   1.004     the copy that was saved
+     25       1.144   1.105   1.132     much worse
+
+  - Best case was a 1.3% gain, and only at 30 s and 60 s. It never really beat
+    the freeze at 120 s.
+  - After epoch 2 it started memorising the training flights instead of
+    learning. Training error kept dropping while the real score got worse.
+  - The learning rate cut at epoch 17 made it worse, not better.
+  - The pass mark we set in advance (beat the freeze at both 60 s and 120 s)
+    was NOT met.
+
+WHY
+  - The model has 928,000 settings but only about 442 truly different training
+    windows. It ran out of new things to learn after 2 epochs (56 steps).
+  - At 120 s, 94% of the error comes from attitude, and this model is not
+    allowed to touch attitude. It can only work on the last 6%.
+
+WHAT THIS MEANS
+  - The simple 15-second bias freeze is still doing all the real work.
+  - A bigger or longer-trained network will not fix this. A smaller one might
+    hold the small gain, but the ceiling stays low while attitude is untouched.
+
+===============================================================================

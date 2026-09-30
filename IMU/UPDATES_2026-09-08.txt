@@ -1,0 +1,154 @@
+===============================================================================
+WHAT WE LEARNED AND WHAT I CHANGED          2026-09-08
+===============================================================================
+
+SHORT VERSION
+  - The network does not work, and we now know it for sure (774 epochs).
+  - A single fixed 3-number correction does the same job as the network.
+  - BUT that "constant" is not really a constant -- it changes with the time
+    horizon, which means it is soaking up ATTITUDE error, not sensor bias.
+  - Net result you can ship: use it for LONG outages (2 min), do NOT use it
+    for short ones (30-60 s). At short horizons the 15 s freeze alone is
+    already as good as anything we have.
+
+-------------------------------------------------------------------------------
+1. THE 774-EPOCH RUN: THE MODEL IS FINISHED, AND IT LOST
+-------------------------------------------------------------------------------
+  "1.000" means the same as doing nothing. Below 1.000 is better.
+
+      epoch      30 s    60 s   120 s
+        0       0.990   0.989   0.990
+        1       0.989   0.981   0.988    <- the BEST it ever got
+        4       1.047   1.008   1.050    <- already worse than nothing
+      773       1.066   1.050   1.093    <- and it stays there
+
+  - NOT "needs more training". The learning rate hit its floor at epoch 107,
+    then 667 more epochs changed nothing. It is fully converged -- at WORSE
+    than doing nothing.
+  - THE SMALL GAIN WAS NEVER LEARNED. Best epoch is 1, when the model is
+    still almost switched off. Every epoch of real learning made it worse.
+  - IT MEMORISES. Training error improves to epoch 145; validation error was
+    best at epoch 2. The gap stays wide for 600 epochs.
+  - Fourth model with the same shape: big/old-attitude best at epoch 2,
+    big/MTi-attitude best at epoch 4, small (7x fewer weights) best at
+    epoch 2, this one best at epoch 1.
+
+-------------------------------------------------------------------------------
+2. THE CONTROL TEST: 3 NUMBERS BEAT THE NETWORK
+-------------------------------------------------------------------------------
+  New tool: tools/const_bias_control.py
+  It fits ONE fixed 3-number correction on the training flights, with NO
+  network at all, and scores it on the held-out flights the same way.
+
+  On held-out flights (lower is better):
+
+      cell        3 numbers    the network (138,802 weights)   winner
+      30 s pos      1.0015              1.0034                 3 numbers
+      60 s pos      0.9991              0.9974                 network
+      120 s pos     0.9683              0.9699                 3 numbers
+
+  The 3 numbers win 4 of 6 cells. The biggest gap anywhere is 0.0026, while
+  the flight-to-flight spread is 0.03-0.05 -- so they are the same thing.
+  The network even LOSES on its own selection data (0.9894 vs 0.9786).
+
+  Why: the network's average output points the same direction as the fitted
+  constant (cosine 0.97) at half the size. It spent 138,802 weights learning
+  a worse version of 3 numbers.
+
+-------------------------------------------------------------------------------
+3. THE CATCH: THE "CONSTANT" IS NOT CONSTANT
+-------------------------------------------------------------------------------
+  I fitted it separately at each horizon. A real sensor bias would come out
+  the same every time. It does not:
+
+      fitted at      the 3 numbers (m/s^2)              size
+        30 s      [+0.0034, +0.0088, +0.0078]          0.0123
+        60 s      [+0.0081, +0.0130, +0.0060]          0.0165
+       120 s      [+0.0192, +0.0118, +0.0044]          0.0229
+
+  The size nearly DOUBLES from the 30 s fit to the 120 s fit, and the first
+  number grows 5.6x while the third one shrinks.
+
+  What that means: it is not measuring a sensor bias. It is soaking up
+  ATTITUDE error. A small tilt error leaks gravity into the horizontal
+  direction, and that error grows faster than a straight line -- so the fit
+  needs a bigger number the longer the window. Do not call it "the bias".
+
+  This also re-explains section 2: the network was not failing to learn a
+  bias. THERE WAS NO CONSTANT BIAS TO LEARN. Both arms were fitting attitude
+  leakage, and the network just did it worse.
+
+-------------------------------------------------------------------------------
+4. WHAT TO ACTUALLY USE
+-------------------------------------------------------------------------------
+                        pooled result on held-out flights
+      fitted at     30 s      60 s     120 s      120 s worst-case range
+        30 s       0.9994    0.9987    0.9796     0.9588 - 0.9872
+        60 s       1.0015    0.9991    0.9683     0.9444 - 0.9794
+       120 s       1.0046    0.9963    0.9585     0.9287 - 0.9643
+
+  30 s and 60 s:  DO NOT USE IT. Every version can come out above 1.000
+                  once you drop a single flight. Not better than the 15 s
+                  freeze on its own.
+  120 s:          USE IT. Every version stays below 1.000 no matter which
+                  flight you drop. Best is the 120 s fit: 0.9585 pooled,
+                  and 0.8737 on the typical flight -- a 12.6% improvement.
+
+  Fit it at the horizon you actually care about. The fact that each horizon
+  wants its own number is itself the proof it is not a constant.
+
+-------------------------------------------------------------------------------
+5. FIXES I MADE (so future numbers can be trusted)
+-------------------------------------------------------------------------------
+  1. ADDED A RANDOM SEED  <-- the important one
+     train.py never set one. Every run started from different random weights
+     and shuffled differently, so every config comparison we ever made was
+     also comparing two random draws -- and the differences we cared about
+     (1-2%) were smaller than that random spread.
+     Now: --seed (default 0), recorded into parameters.yaml.
+
+  2. FIXED A WRONG AVERAGE IN THE VALIDATION SCORE
+     It averaged each BATCH equally. With 101 windows at batch 64 you get
+     batches of 64 and 37, so the last 37 windows counted for half the score
+     instead of a third. Your 60 s number moves 123.76 m -> 121.47 m.
+     Nothing got worse; the old number was measured wrong. NOTE: new runs
+     are not directly comparable to old ones.
+
+  3. FIXED A HOLE THAT SKIPPED THE DATA QUALITY CHECK
+     "evaluate" mode built windows WITHOUT the check that rejects windows
+     containing recording gaps -- so the held-out test used windows training
+     would never have accepted, including one spanning a 0.14 s gap. Both
+     use the same rule now. (Re-ran the held-out result: conclusion unchanged.)
+
+  4. eval.py NO LONGER INVENTS RESULTS
+     A wrong checkpoint path printed "no model loaded" and then printed a
+     full, normal-looking table -- from RANDOM weights. Now it stops.
+
+  5. NEW: --per_flight ON THE EVALUATION TOOL
+     One pooled number hides too much. All in one view now:
+         pooled          1.003   (looks like nothing happened)
+         typical flight  0.967   (3% better)
+         one flight      1.027   and it carries 53% of the total error
+     One bad flight was deciding the verdict.
+
+  6. Small: corrected a wrong label ("raw, uncorrected IMU" -- it already has
+     the 15 s freeze applied), and added a missing setting so hybrid_best can
+     be tested on the held-out flights at all.
+
+-------------------------------------------------------------------------------
+6. STILL OPEN
+-------------------------------------------------------------------------------
+  - THE SIMULATED DATA. I could not find it. data/ has 88 files, all real,
+    all dated 09-04. data/train.csv and data/test.csv are byte-identical
+    copies of real flights 2025_11_22_105_21 and 2025_11_17_141_13.
+    Please send the path.
+
+  - YOUR imu_metric.csv BASELINE. It reads 36.54 / 123.92 / 386.24 where the
+    same settings give me 38.23 / 125.35 / 386.24. The 120 s value matches
+    EXACTLY and the other two do not. Still unexplained. Send the command
+    and data path and I will reconcile it. (The conclusions are unaffected:
+    inside each row the model and the baseline share the same windows.)
+
+  - Leave-one-DATE-out on the 120 s fit, to confirm it transfers to a new
+    date and not just a new flight. Not yet run.
+===============================================================================

@@ -1,0 +1,317 @@
+PLAN
+====
+Next experiment, one change at a time.
+
+THESIS: there are confirmed geometry defects that must be corrected before the
+body-rate ablation can be interpreted. Whether geometry FULLY explains the
+lateral failure remains an experimental question, not a settled one.
+
+runs/vo_metrics.csv is the REAL flight, trained on the A100 and copied here by
+hand. The checkpoint is still on the server.
+
+CAUTION ON EVERY RATE NUMBER BELOW: yaw and roll rates quoted here were measured
+on data/ (the SYNTHETIC capture), because the real flight is not on this machine.
+They must be re-measured on the real flight before any of the magnitudes are
+trusted. Section 15 lists what that changes.
+
+
+1. WHAT THE LOG SAYS ABOUT THE AIRCRAFT
+----------------------------------------
+1.1  Per-axis mean-predictor floors on the real validation split, from the CSV:
+     forward 3.530, lateral 2.915, vertical 1.335 m/s. These check out exactly
+     against the recorded overall 4.768.
+1.2  Transverse spread 3.206 m/s over a direction spread of 8.100 deg gives a
+     mean airspeed of about 22.7 m/s. Derived, not assumed.
+1.3  The lateral axis therefore varies by about 7.4 deg of crab about the mean.
+1.4  At 22.7 m/s that is wind, not sideslip, and the capture has a wind column.
+1.5  Wind crab cannot be predicted from attitude. It depends on the wind vector,
+     which no input carries. Only the camera sees it, because only the camera
+     measures motion relative to the GROUND.
+1.6  So the lateral axis stands or falls on the frontend, not on the aiding stream.
+
+
+2. CONFIRMED AND LARGEST: THE ROTATION CORRECTION IS ONE CONSTANT PER IMAGE
+----------------------------------------------------------------------------
+2.1  RotationalSearchCenter is nn.Linear(3, 2, bias=False), so it emits ONE
+     (dx, dy) per image (vision_mamba_vo.py:81, :107).
+2.2  LocalCorrelation broadcasts it over every cell with
+     center.view(B,2,1,1).expand(B,2,H,W) (correlation.py:91). At 576x1024 and
+     patch 8 that is one pair of numbers replicated into 9,216 cells.
+2.3  Real rotational flow is not constant. In normalised coordinates:
+       u = x*y*wx - (1+x^2)*wy + y*wz
+       v = (1+y^2)*wx -  x*y*wy - x*wz
+2.4  A constant removes exactly the order-0 terms, -wy in u and +wx in v. That
+     is all it can ever remove.
+2.5  The curl term (+y*wz, -x*wz) is ODD about the principal point, so its mean
+     over a symmetric image is EXACTLY zero. The best constant approximation is
+     the zero vector, so NONE of the curl is removed. This is structural.
+2.6  Magnitude at the image corner (r_n = 0.575 from the real intrinsics,
+     f_working 1052, dt 0.05 s), using SYNTHETIC-flight yaw rates:
+       yaw  6.11 deg/s RMS  -> 3.23 px = 0.403 cells = 2.1x the crab signal
+       yaw 11.52 deg/s peak -> 6.08 px = 0.760 cells = 4.0x the crab signal
+2.7  The horizontal component alone is 0.205 cells RMS, which by itself equals
+     the entire 0.191-cell crab signal.
+2.8  In velocity units at 100 m: corner curl 6.15 m/s RMS, 11.6 m/s peak.
+2.9  It is turn-correlated by construction, which is exactly the signature the
+     lateral investigation is chasing.
+2.10 It is NOT clipped by the search window: 1.49 forward + 0.76 curl stays
+     inside radius 4. So it is measured and reported as translation.
+2.11 Pooling does NOT cancel it. token_projection holds an independent weight
+     per (channel, cell) over cell_dim = (9 + grid_dim) * 36, so the 36 cells
+     are never averaged into one number. Zero-mean-ness describes an average
+     the model never takes. Each block's own mean is 5/6 of its corner value.
+2.12 Worse, the occupied mask hard-zeroes any block below min_pool_weight, so a
+     texture dropout can delete one arm of the curl outright and leave the other.
+2.13 A half-image dropout at peak yaw yields 0.193 cells = 2.945 m/s, which is
+     101% of the crab signal, produced purely as a function of yaw rate.
+2.14 The audit of the real capture records detail_persistence 0.486, "fine detail
+     is weak; matching will be unreliable". Dropout is the expected regime, not
+     an edge case.
+2.15 THE FIX IS CHEAP. LocalCorrelation ALREADY accepts a per-cell centre field:
+     correlation.py:92 permits (B,2,H,W) and :131 reads the centre per pixel.
+     Nothing in the repo ever supplies one. Evaluating the full u/v field on the
+     feature grid removes the curl and the quadratic terms geometrically, with
+     no change to the correlator, the pooling, or the fusion contract.
+2.16 The normalised (x, y) per cell are already derivable from _bearing_scale.
+
+
+3. CAMERA MOUNTING IS ASSUMED, NEVER MEASURED, AND THE TOOL IS MISSING
+------------------------------------------------------------------------
+3.1  The architecture asserts a nadir camera: log_speed = log_rate + log_altitude
+     is correct only when the optical axis points at the ground.
+3.2  But no camera-to-body rotation exists anywhere. The calibration's mounting
+     block holds only gps_to_camera_m, and README says the omission is deliberate.
+3.3  tools/calibrate_camera_imu_rotation.py, which seed_from_jacobian names and
+     train_fixedwing_vo.py:1497 requires, DOES NOT EXIST in tools/.
+3.4  So --rotation-map can never be used and the rotation map always starts from
+     zeros. A documented capability that cannot be exercised.
+3.5  The mounting does NOT change the conclusion in section 2. On the synthetic
+     data roll is 7.06 deg/s RMS against yaw 6.12, so under a forward-facing
+     camera the curl axis becomes roll and the curl GROWS to 0.466 cells RMS.
+3.6  Both mountings leave an un-removable curl larger than the crab signal.
+
+
+4. THE LATERAL SIGNAL IS SMALLER THAN ONE CORRELATION CELL
+-----------------------------------------------------------
+4.1  Real calibration: fx 1973.0, fy 1965.4 on 1920x1080. At 576x1024 working
+     size that is 1052 px, so one 8 px cell subtends 7.6 mrad.
+4.2  Flow per image pair, in cells, at 20 Hz (dt = 0.05 s):
+
+       altitude   forward 22.7 m/s   crab 2.92 m/s   1 deg of direction
+          50 m          2.99             0.383            0.052
+         100 m          1.49             0.192            0.026
+         200 m          0.75             0.096            0.013
+
+4.3  To get direction right to 1 deg at 100 m the correlator must resolve 0.026
+     of a cell, which is 0.39 of a NATIVE pixel.
+4.4  The model's current 8 deg direction error is about 0.21 cells at 100 m.
+4.5  Forward velocity learns because its signal is 1.5 cells and lives in the
+     integer argmax. Crab does not because 0.19 cells lives entirely in the
+     sub-cell refinement, where section 2's curl is 2 to 4 times larger.
+4.6  UNKNOWN AND NEEDED: the flight's actual AGL range. Every row scales as 1/h.
+
+
+5. LENS DISTORTION: REAL, BUT SMALLER THAN FIRST STATED
+--------------------------------------------------------
+5.1  The lens has k1 = -0.393. Local flow magnification over the real sensor
+     area is mean 0.896, sigma 0.068, range 0.711 to 1.000.
+5.2  The MEAN is a constant and the log_rate head absorbs it. Only the SPREAD
+     is unlearnable: about +/- 7.6% at one sigma, with the central 90% of pixels
+     spanning 24% and the corner reaching -29%.
+5.3  Correct wording: uncorrected distortion introduces up to about 26-29%
+     position-dependent flow error near the image boundary, and about 7.6% at
+     one sigma over the frame. Not a 26% whole-image error.
+5.4  Against a 0.19-cell crab signal, 7.6% of the 1.49-cell forward flow is
+     0.11 cells, about 60% of the signal. Material but second to section 2.
+5.5  THE WIRING BUG IS REAL. VisualPairSource accepts a distortion vector and
+     builds cv2.initUndistortRectifyMap, folding undistortion and resize into
+     one remap. But build_vo_dataset has no distortion parameter and the trainer
+     never reads calibration.distortion, so the path is unreachable from training.
+5.6  Note for future reviewers: it is easy to read image_pairs.py and conclude
+     distortion IS corrected. The capability exists; the wiring does not. This is
+     the same capability-versus-use trap as section 2.15, in the other direction.
+
+
+6. THE 77% ANISOTROPY CLAIM IS CONDITIONAL AND UNPROVEN
+--------------------------------------------------------
+6.1  Without --calibration the bearing scale falls back to 1/image_size, giving a
+     vertical-to-horizontal ratio of 1.778 against a true 1.004.
+6.2  WITH --calibration the frontend uses resized fx and fy and the error is 0.4%.
+6.3  It was inferred that the fallback was in use because commands.txt passes no
+     --calibration. commands.txt is documentation, not the command that ran.
+6.4  HOW TO SETTLE IT: the trainer logs "camera: WxH fx=.. fy=.." if and only if
+     a calibration loaded. Grep the server's training log for that line.
+6.5  Note the two are independent: passing --calibration fixes the bearing scale
+     but does NOT fix distortion, because of 5.5.
+6.6  This affects the m/s conversions above but not any cell count, which are
+     all calibration-independent.
+
+
+7. FRAME GAP: CANNOT BE DECIDED FROM ALTITUDE ALONE
+-----------------------------------------------------
+7.1  --frame-gap 2 doubles the interval to 0.1 s, so all flow doubles and the
+     sub-cell requirement halves. One flag, no code, no extra compute.
+7.2  Forward flow in cells at gap 2, by altitude and speed:
+
+       altitude   22.7 m/s   25 m/s   30 m/s      (radius is 4)
+          75 m      3.98      4.38     5.26
+         100 m      2.99      3.29     3.95
+         150 m      1.99      2.19     2.63
+
+7.3  So 75 m is already over the window at 25 m/s. An earlier "safe above 75 m"
+     claim was wrong.
+7.4  Height above TERRAIN is what matters, not RelativeAlt, which is height above
+     the takeoff point. Note that aiding_features has an altitude_offset_m
+     parameter for exactly this and no caller ever passes it.
+7.5  Search-window use also depends on peak ground speed, focal length, pair
+     interval, camera orientation, and the rotational-compensation error of
+     section 2. No table settles it.
+7.6  DECIDE IT EMPIRICALLY: log how often the correlation peak lands on the
+     search boundary. That captures every factor above at once and is the right
+     test. Do not set frame gap from altitude alone.
+7.7  Other resolution levers, which multiply with frame gap: --patch-size 4
+     doubles cells per unit flow at 4x correlation compute; --image-size
+     1080 1920 gives 1.875x at 3.5x compute.
+
+
+8. VISUAL INFORMATION IS ~370 ms OLD, NOT 40 ms
+------------------------------------------------
+8.1  --deployment-latency-s delays the VISUAL stream only, at image_pairs.py:206.
+8.2  It does not shift the target. Aiding, altitude and target are sliced at the
+     same tick indices, and the trainer asserts those clocks match.
+8.3  At the predicted tick, attitude and altitude are 0 ms old and the freshest
+     image is 350-390 ms old, mean 370 ms. Measured, not assumed.
+8.4  The earlier "40 ms" was only the 20 Hz image spacing with the pipeline delay
+     silently set to zero. It was wrong.
+8.5  Keep visual measurement age in the diagnostics.
+
+
+9. WARMUP: TWO DIFFERENT CASES, ONLY ONE IS BROKEN
+----------------------------------------------------
+9.1  --warmup is 20 ticks (200 ms).
+9.2  COLD START, meaning the first window of a split range and every horizon-eval
+     span: no visual event has been delivered yet, so the model is blind for
+     35-40 ticks and a 20-tick warmup does not cover it.
+9.3  ORDINARY TRAINING WINDOWS are NOT blind. They can receive events captured
+     before the window began, provided those events stay inside the same split.
+9.4  So an earlier claim that every span is blind for 35-40 ticks was too broad.
+9.5  Treat the two separately. Only the cold-start case needs a longer warmup or
+     an exclusion of blind ticks from scoring.
+
+
+10. THE OVERFITTING DIAGNOSIS DOES NOT HOLD UP
+-----------------------------------------------
+10.1 The argument was "train improves while val degrades, so it overfits".
+10.2 The train/val ratio NARROWS: 0.636 at epochs 2-4 to 0.777 at epochs 9-12.
+10.3 So the CSV does not discriminate overfitting from any other cause. Withdrawn.
+10.4 The LR column cannot help either: 0.000300 for all 12 epochs is consistent
+     with any T_max at or above 424, so it cannot even prove the anneal ran.
+10.5 Step count per epoch on the real dataset must be read from the server log.
+
+
+11. THE LATERAL AXIS IS STILL THE STRONGEST SIGNAL IN THE LOG
+--------------------------------------------------------------
+11.1 At epoch 12 the train/val gap decomposes as x 4.2%, y 92.6%, z 3.3%.
+11.2 y carries 67-93% of the squared gap in every epoch from 2 onward.
+11.3 Dropout enters nine shared residual branches, so its noise should land about
+     equally on y and z. The observed asymmetry is 6:1 after normalising.
+11.4 On training data y improved only 10% while x improved 74% and z 37%.
+11.5 Overfitting cannot explain a training-set failure. Sections 2 and 4 give a
+     mechanism that can.
+
+
+12. WHY val LOOKS EASIER THAN train: TWO LIVE CANDIDATES
+----------------------------------------------------------
+12.1 train_vel_rmse is measured with dropout ON and averaged over an epoch of
+     changing weights. val_vel_rmse is dropout OFF on end-of-epoch weights.
+12.2 There is also no train-side mean-predictor floor anywhere in the code.
+12.3 Mid-epoch averaging is about 2% of the gap. Masking and windowing are zero.
+12.4 The val_baseline_* columns cannot settle it: they measure distance to the
+     TRAINING mean, an upper bound on validation spread, never a lower one.
+12.5 ONE LINE SETTLES IT: run evaluate() over loaders["train"] with the same
+     baseline. Isolates dropout, weight state and the missing floor at once.
+
+
+13. KAPPA AND THE DIRECTION LOSS
+---------------------------------
+13.1 kappa is computed on every batch and thrown away. It has no consumer.
+13.2 Logging the MEAN kappa per epoch is about four one-line edits.
+13.3 Per-tick kappa, yaw rate, visual age and direction error with stratified
+     aggregation is NOT four lines. It needs metadata propagation through the
+     window and a real aggregation path. Budget it as a proper change.
+13.4 Mean kappa can also be recovered approximately from the existing CSV by
+     inverting the loss against the reported direction error: about 34 rising
+     to 42 across the 12 epochs, and from epoch 4 the loss beats the constant
+     kappa bound, which proves kappa is genuinely per-sample.
+13.5 What that does NOT show is WHICH samples get low kappa.
+13.6 The lever-arm confound is withdrawn. Measured yaw rate never exceeds
+     20 deg/s, so at a 1.5 m offset the label error is 0.40 deg RMS, which moves
+     optimal kappa by 0.25%. GPSNavEul is also a unit-converted copy of NavEul
+     to 5e-7 rad, so the GPS-yaw mechanism does not exist here either.
+13.7 Do not touch the direction loss until kappa diagnostics justify it.
+
+
+14. PROTOCOL FOR ANY A/B
+-------------------------
+14.1 CosineAnnealingLR takes T_max from --epochs, so the budget IS an optimiser
+     setting. Two arms with different --epochs are different optimisers.
+14.2 best.pt takes a running minimum, so a longer arm wins on order statistics.
+14.3 A and B must use IDENTICAL --epochs, schedule and seeds-per-arm.
+14.4 Early stopping does NOT break this. It is a selection rule and does not
+     alter the trajectory before it fires. An earlier objection was wrong.
+14.5 Ranks do not diverge under a plateau schedule: evaluate() all-reduces before
+     computing metrics. That objection was also wrong.
+14.6 Budget in optimiser steps, not epochs, and state the step count.
+14.7 Epoch-to-epoch variation is NOT a noise estimate. Three seeds per arm is to
+     ESTIMATE the seed spread, which is currently unknown. Report it.
+
+
+15. ORDER OF WORK
+-----------------
+15.1 Retrieve from the server: the epoch-4 checkpoint, the exact command, the
+     dataset, and the code revision.
+15.2 Grep the server training log for the "camera: WxH fx=.. fy=.." line, which
+     settles section 6, and for the step-count header, which settles 10.5.
+15.3 Measure the REAL flight's yaw rate, roll rate, AGL and peak ground speed.
+     Every magnitude in sections 2, 4 and 7 currently rests on synthetic rates.
+15.4 Evaluate the old checkpoint on its ORIGINAL image path. It was trained on
+     unrectified images; scoring it on newly rectified ones measures distribution
+     shift, not skill. This must happen BEFORE any geometry change lands.
+15.5 Verify the stored images are genuinely unrectified rather than trusting the
+     images_rectified flag.
+15.6 Histogram yaw rate per split. Needs no checkpoint. Re-split if validation
+     turn coverage is thin, before anything else.
+15.7 Add the evaluate() pass over the training loader. Settles section 12.
+15.8 Add mean-kappa logging now; schedule the stratified per-tick diagnostics.
+15.9 Log how often the correlation peak reaches the search boundary. This is the
+     measurement that decides frame gap, radius and resolution together.
+15.10 Wire calibration.distortion through build_vo_dataset to VisualPairSource,
+     with fingerprint, evaluator and tests updated. Confirm OpenCV on the server.
+15.11 Implement the per-cell rotational field. The correlator already accepts it.
+15.12 Retrain the geometry-corrected baseline A, three seeds.
+15.13 Diagnose residual flow against image position and yaw rate on A. If the
+     curl is gone, section 2 is closed; if not, the field is wrong.
+15.14 Freeze the step budget and LR schedule.
+15.15 Add p, q, r to the aiding vector. Train B, three seeds, identical otherwise.
+15.16 Judge B on TURN TRANSITIONS, not steady-state lateral error. Per 1.5, body
+     rates cannot supply wind crab; they can only help track how crab changes.
+15.17 Change the direction loss only if kappa diagnostics justify it.
+
+
+16. STILL UNKNOWN
+-----------------
+16.1 The real flight's yaw rate, roll rate, AGL range and peak ground speed.
+     Everything in sections 2, 4 and 7 is conditional on these.
+16.2 Whether --calibration was passed on the server run.
+16.3 The real airframe's camera mounting. Undocumented by design, and the tool
+     that would measure it does not exist.
+16.4 Whether the learned yaw column of the rotation map is near zero. If it is
+     NOT, there is a second additive failure: a turn-correlated constant
+     translation approximating a field with no translational part.
+16.5 How much of the train-versus-validation gap is dropout and how much is turns.
+16.6 Whether low kappa lands on turns.
+16.7 Whether the run overfits at all. The 12-epoch log cannot say.
+16.8 On synthetic data sin(roll) correlates 0.9964 with yaw rate, so the aiding
+     vector already carries a strong yaw surrogate in coordinated flight. Whether
+     that holds on the real flight is unmeasured, and it weakens but does not
+     remove the case for explicit body rates.

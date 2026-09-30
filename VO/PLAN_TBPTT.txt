@@ -1,0 +1,203 @@
+TBPTT DESIGN NOTE - INCREMENT 3 OF THE POST-BUGFIX ROADMAP
+============================================================
+Scope: what this increment builds, why each design choice was made, and what
+is explicitly left for a later session. See UPDATES.txt section 16 for the
+change log and C:\Users\ctar\.claude\plans\robust-weaving-lagoon.md for how
+this fits the larger roadmap.
+
+1. WHY THIS NEEDED A DESIGN NOTE FIRST
+---------------------------------------
+Codex's original roadmap called TBPTT "low risk." It is not, for three
+reasons specific to this codebase:
+
+1.1  FixedWingVODataset windows overlap 50% by default (window_length=400,
+     stride=200). "Carry state across chronological chunks" naively applied
+     to the existing windows would either double-process the overlapping
+     ticks or need a tick-level re-seen mask that does not exist.
+1.2  The training DistributedSampler always shuffles
+     (tools/train_fixedwing_vo.py, sampler = DistributedSampler(..., shuffle=
+     training)). A shuffled batch has no chronological relationship to the
+     batch before it, so carrying recurrent state across batches in the
+     existing loop would silently stitch together unrelated windows.
+1.3  CausalMambaEncoder.detach_state existed but had ZERO call sites anywhere
+     in the repository - it would be TBPTT's first real use, unexercised by
+     every one of the 216 tests that existed before this increment.
+
+None of these are reasons to skip TBPTT; they are reasons its FIRST landing
+should be a tested, local-only scaffold rather than a CLI flag wired straight
+into the distributed training loop.
+
+2. WHAT "A CHUNK" MEANS HERE
+------------------------------
+A chunk is exactly one FixedWingVODataset window - no new windowing concept.
+The scaffold instead changes what happens BETWEEN two chunks assigned to the
+same batch "lane": nothing (state reset, the existing default path) versus
+carrying the recurrent state forward (this increment).
+
+3. THE SAMPLER: ChronologicalWindowSampler (vio.data.fixedwing_vo)
+---------------------------------------------------------------------
+3.1  Requires stride == window_length. Checked directly against
+     dataset.starts (not a stored dataset.stride, which the dataset does not
+     keep - the check re-derives it from the realized tiling, which also
+     catches a dropped partial window for free). This is the fix for 1.1
+     above: TBPTT's windows never overlap, so "the next chunk" is always
+     exactly the ticks right after the current one, never a re-visit.
+3.2  batch_size independent "lanes". The sampler concatenates every window
+     index in chronological, per-range order (dataset.starts is already in
+     that order - see FixedWingVODataset.__init__) and splits the result
+     into batch_size contiguous, equal-length runs. This is the same
+     "split the corpus into N streams" batching classic truncated-BPTT
+     language-model training uses, applied to windows instead of tokens.
+3.3  Per-lane, per-step "continues" flag. A lane's step t continues step t-1
+     only if both windows belong to the SAME index_range (FixedWingVODataset.
+     _range_start) AND are tick-adjacent (guaranteed by 3.1). Step 0 never
+     continues, for every lane - nothing has run yet to carry.
+3.4  Range boundaries are real resets, not merely "later in time". A
+     condition-segment split (tools/segment_flight_conditions.py) assigns
+     several DISJOINT spans to one phase; two of them being in tick order
+     does not mean they were flown back to back. Crossing from one into the
+     next is treated exactly like step 0: a full reset, never a carry. This
+     is the fix for the part of 1.1 that survives even after stride ==
+     window_length: overlap is a same-range problem, but silently gluing two
+     unrelated segments together is a cross-range one, and needs its own
+     check (test_a_lane_crossing_a_range_boundary_is_flagged_for_reset pins
+     this specifically, with a batch_size chosen so a lane's own walk
+     straddles the join).
+3.5  drop_last-by-construction: len(starts) % batch_size windows at the tail
+     are simply never assigned to a lane, so every lane is exactly
+     num_steps long - the same reasoning
+     tools/train_fixedwing_vo.py already applies to its DistributedSampler.
+
+4. THE STATE CONTRACT: VOStreamState, mask_stream_state, detach_stream_state
+-------------------------------------------------------------------------------
+4.1  mask_stream_state(state, keep) (vio.models.vision_mamba_vo) zeroes the
+     batch lanes where keep is False. This is not "reset lane k, as a
+     separate operation from carry lane k" - CausalSelectiveStateBlock.
+     initial_state is all zeros by construction, so multiplying every state
+     tensor's batch dimension by a 0/1 mask IS both operations at once.
+     Simpler and half the surface area of building a fresh initial_state and
+     torch.where-ing it in.
+4.2  detach_stream_state(state) applies the existing (previously dead)
+     CausalMambaEncoder.detach_state to both the aiding and fusion
+     sub-states. Call it AFTER backward() has run on the chunk that produced
+     the state, before that state is fed to the next chunk's forward - never
+     before backward, or the next chunk's own contribution to this chunk's
+     parameters is lost along with the (correctly) truncated history.
+4.3  The call order a training loop follows, per step:
+        keep = sampler.continues_at(step)
+        state = None if step == 0 else mask_stream_state(state, keep)
+        prediction, state = step.forward_stream(..., state=state)
+        loss(prediction, ...).backward()
+        optimizer.step(); optimizer.zero_grad()
+        state = detach_stream_state(state)
+     state=None only ever appears at step 0; every later step passes a real
+     (possibly lane-masked) VOStreamState, matching the fact that
+     VisionMambaVO.forward_stream's state=None IS "build a zeroed initial
+     state" - so masking-to-zero and passing None are the same operation,
+     and step 0's keep is all-False anyway (nothing to mask against yet).
+
+5. VOStep.forward_stream / forward_batch_stream (tools/train_fixedwing_vo.py)
+----------------------------------------------------------------------------------
+5.1  VOStep.forward and VOStep.forward_stream now share one _encode_visual
+     helper (frontend + scatter_visual_tokens + visual_age_ticks); they
+     differ only in calling VisionMambaVO.forward vs .forward_stream. Pure
+     refactor - forward's behavior and call signature are unchanged, checked
+     by the full suite passing before and after (216 tests, no new failures).
+5.2  forward_batch_stream mirrors forward_batch, threading state in and out.
+5.3  EXPLICITLY NOT DDP-SAFE, on purpose, for now: both call step.
+     forward_stream(...) directly. DistributedDataParallel's gradient-sync
+     reducer hooks fire on the WRAPPED module's forward() - calling a
+     differently-named method on the wrapped module bypasses them entirely,
+     silently turning multi-rank TBPTT into multi-rank training with no
+     gradient synchronization at all. See section 7.
+
+6. WHY static_graph=True SHOULD STILL HOLD (for the eventual DDP path)
+---------------------------------------------------------------------------
+tools/train_fixedwing_vo.py already sets static_graph=True (unless
+--disable-visual-input) for exactly this reason: gradient checkpointing
+re-enters the autograd graph, which DDP's default bucketing cannot follow.
+TBPTT's forward_stream call does not change the graph SHAPE per step - one
+window's worth of frontend + fusion computation, identical parameter set,
+identical op sequence to forward's own graph for one window. The state is
+just an extra input tensor and an extra output tensor around that same
+graph, not a new branch or a variable-shaped one. So static_graph=True
+should continue to hold once TBPTT is wired into the distributed loop - but
+this is a prediction to VERIFY empirically when that work happens, not a
+substitute for doing so, since DDP + gradient checkpointing + a threaded
+external state is a combination nothing in this repository exercises yet.
+
+7. EXPLICITLY DEFERRED
+-------------------------
+7.1  A --tbptt (or similar) CLI flag wiring ChronologicalWindowSampler +
+     VOStep.forward_stream into tools/train_fixedwing_vo.py's actual epoch
+     loop. This increment ships the primitives, tested directly, not a new
+     end-user training mode - the CLI wiring needs its own decisions
+     (metrics.csv columns for a stateful epoch, whether/how validation stays
+     windowed-and-shuffled while training goes chronological-and-stateful,
+     interaction with --eval-train-split) that are better made once the
+     primitives below have been reviewed.
+7.2  DDP per-rank-lane state threading (see section 6): each rank would own
+     a disjoint slice of lanes, forward_batch_stream would need to call
+     through the DDP wrapper correctly, and the gradient-sync/static_graph
+     interaction needs empirical verification, not just the argument above.
+7.3  Checkpoint schema changes for resuming mid-sequence. Right now a
+     checkpoint carries no recurrent-state payload; resuming a TBPTT run
+     restarts every lane's state from scratch (a correctness question, not a
+     crash - equivalent to "the model got a bit slower at the very start of
+     the resumed run", not silently wrong) but nobody has decided whether
+     that is good enough for long training runs.
+7.4  Any multi-GPU validation of the above.
+
+8. TESTS THIS INCREMENT ADDS
+--------------------------------
+- tests/test_tbptt.py: ChronologicalWindowSampler's lane ordering, the
+  continues grid (including the range-boundary-crossing case), and both
+  refusals (overlapping windows, too few windows for the requested lane
+  count). Builds datasets with image_source=None - the sampler never touches
+  image data, only dataset.starts/.window_length/.index_ranges.
+- tests/test_vision_mamba_vo.py: mask_stream_state resets exactly the
+  flagged lanes and leaves the others bit-for-bit untouched;
+  detach_stream_state removes grad_fn/requires_grad from every leaf while
+  leaving the VALUES untouched (checked structurally, not by comparing
+  gradients on a specific loss, which would only show the cut mattered for
+  that one case).
+- tests/test_train_fixedwing_vo_integration.py: the real frontend + dataset
+  + VOStep + sampler pipeline, not hand-built tensors. Carrying state into
+  step 1 changes its prediction relative to a state=None run of the same
+  batch (mirrors test_velocity_horizons.test_a_reset_actually_discards_the_
+  past); detaching the carried state changes nothing about step 1's own
+  forward values. Reverting VOStep.forward_stream's state threading was
+  checked to fail this test before landing the fix, same discipline as
+  every other bug fix and increment this session.
+
+9. IMMEDIATE NEXT STEP
+-------------------------
+Nothing further is scheduled for this session. The next TBPTT-related
+session should start from section 7.1: decide the CLI surface (a flag name,
+which metrics.csv columns a stateful epoch needs, how validation behaves)
+before wiring ChronologicalWindowSampler into tools/train_fixedwing_vo.py's
+actual epoch loop - and only after that is reviewed, take up 7.2-7.4.
+
+10. ADDENDUM (INCREMENT 3.1 HARDENING): AGE HAS ITS OWN CARRIED STATE
+--------------------------------------------------------------------------
+Codex's hardening review (UPDATES.txt section 17) found visual_age itself
+needed a physical-seconds redesign (see 17.1-17.2) - and, once it did, a
+second piece of carried state alongside VOStreamState, for exactly the
+reason section 4 above describes for the model's own state: a window only
+sees its own local ticks, so "how stale is the currently-held image"
+resets to "unknown" at every chunk boundary unless something carries it.
+
+age_carry is a (B,) tensor of telemetry-clock TIMES (not ages - the ready
+time of the last delivery, so the same value competes correctly in
+visual_age_seconds's internal cummax on the next call), with -inf
+(vio.data.fixedwing_vo.NO_IMAGE_YET) meaning "no image known yet". It
+threads through VOStep.forward_stream / forward_batch_stream exactly where
+state does, and mask_age_carry resets exactly the lanes
+ChronologicalWindowSampler.continues_at flags, mirroring mask_stream_state -
+but with no detach step: age_carry is built from telemetry timestamps, never
+from a model output, so it never enters the autograd graph and there is
+nothing to cut.
+
+The still-hypothetical CLI wiring in section 7.1 will need to carry this
+alongside state, the same per-lane way; nothing here changes the "no CLI
+flag yet" scope of this file.

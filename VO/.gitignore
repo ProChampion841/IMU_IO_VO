@@ -1,0 +1,28 @@
+# Python build and cache
+**/__pycache__
+**/*.egg-info
+**/.pytest_cache
+.pose_pytest/
+*.so
+
+# Checkpoints. runs/ is ignored wholesale; this catches strays elsewhere.
+*.pt
+
+# Datasets: supplied, or reproducible from tools/make_synthetic_flight.py
+data_split/
+dataset/
+dataset_splits/
+dataset_synthetic/
+dataset_mock/
+/data/
+# Output of tools/split_dataset.py: derived from data/, reproducible, and large.
+/data_split/
+
+# Training output
+runs/
+runs/*/tensorboard/
+/training_logs
+
+# artifacts/ is generated output only: every tool that writes there creates the
+# directory itself, and nothing in the tree reads a file back out of it.
+artifacts/

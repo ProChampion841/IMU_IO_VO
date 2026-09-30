@@ -1,0 +1,30 @@
+### Hybrid_Best Model
+# train
+python train.py --config configs/exp/UAV/hybrid_best.conf --device cuda:3
+python train.py --config configs/exp/UAV/tilt_aware.conf --device cuda:0
+
+# eval
+python -m tools.eval_vel_horizons --config configs/exp/UAV/hybrid_best.conf ^
+  --ckpt experiments/UAV/hybrid_best/ckpt/best_model.ckpt ^
+  --nested --first_only --horizons 3000 6000 12000 ^
+  --splits eval test --win_csv nested_windows.csv
+
+python -m tools.eval_vel_horizons --config configs/exp/UAV/hybrid_best.conf ^
+  --splits eval --csv 2026_04_07_219_54_sensor_data.csv ^
+  --ckpt experiments/UAV/hybrid_best/ckpt/best_model.ckpt ^
+  --nested --first_only --horizons 3000 6000 12000
+
+
+
+python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_aware.conf ^
+  --ckpt experiments/UAV/tilt_aware/ckpt/best_model.ckpt ^
+  --splits inference --nested --horizons 12000 --per_flight
+
+python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_aware.conf ^
+  --splits inference --csv 2026_04_07_219_54_sensor_data.csv ^
+  --ckpt experiments/UAV/tilt_aware/ckpt/best_model.ckpt ^
+  --nested --first_only --horizons 3000 6000 12000
+  
+# tensorboard
+tensorboard --logdir experiments/UAV/hybrid_best/tensorboard --host 0.0.0.0
+

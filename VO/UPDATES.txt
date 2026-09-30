@@ -1,0 +1,632 @@
+UPDATES
+=======
+What changed, one line each. Newest section first.
+
+
+1. FLOW MEASUREMENT (ACCURACY)
+------------------------------
+1.1  Two problems both made the measured ground motion too small, and speed comes from that motion.
+1.2  Problem A: the grid squares were averaged plainly, mixing good measurements with squares that saw nothing.
+1.3  A square that cannot match gives the answer zero, so the average was pulled down toward zero.
+1.4  How far down depended on the ground, so the error changed while flying and could not be learned away.
+1.5  Fix A: weight each square by the confidence the model already computes, instead of a plain average.
+1.6  A later layer could NOT have fixed this: two very different scenes can give identical averages.
+1.7  Problem B: the answer was averaged over all 81 candidate movements, including the very unlikely ones.
+1.8  Those far candidates dragged the answer toward the middle, so motion was under-reported by about 3x.
+1.9  Fix B: pick the best candidate first, then average only its 8 neighbours for the fine detail.
+1.10 Measured together on a known 2-cell shift: error fell 90% with 40% of the ground untrackable.
+1.11 With clean ground the answer is now exact (2.000) where it used to read 1.943.
+1.12 The two fixes depend on each other: B alone makes a blank square report confident nonsense, and A hides it.
+1.13 A new weight channel says "nothing was measured here", which is not the same as "the motion was zero".
+1.14 Cell channels went 7 to 9, so the model is 684,975 params, 1.7% larger, and old checkpoints will not load.
+1.15 The old shrinking behaviour is still under test, so nobody reintroduces it by accident.
+1.16 Review follow-up: a square with NO information was still being counted as measured.
+1.17 A tie between all 81 candidates still scores 1/81, so the confidence never reached zero.
+1.18 When a whole region was blank the weighting cancelled out and it reported a big wrong number (-3.0).
+1.19 Fix: subtract the no-information floor first, so a blank region now gets weight exactly zero.
+1.20 Fix: at the edge of the search the window is now cut short instead of slid inward, which biased it.
+1.21 The blank-region test no longer hides behind an "if", so it cannot pass by never running.
+1.22 The search size is unchanged at 81 candidates: making it smaller is a speed win, not an accuracy one.
+1.23 Review follow-up 2: the maths changed but the version name did not, so old weights still loaded.
+1.24 Same tensor shapes, different meaning, and a strict load cannot see the difference.
+1.25 The frontend is now v3, and the name is written into both the checkpoint and the resume check.
+1.26 A checkpoint with no version, or an older one, is now refused by name instead of loaded quietly.
+1.27 Checked end to end: a v3 checkpoint relabelled v2 is still refused, so the name is doing the work.
+
+
+2. TIME ALIGNMENT
+-----------------
+2.1  Altitude and attitude are now read at the exact photo time, not at the nearest row.
+2.2  Rotation is averaged over the real shutter window instead of taken from one sample.
+2.3  The time between two photos comes from their file names, never from a fixed frame rate.
+2.4  Photos taken during a telemetry gap are dropped, because a guess across a hole is not a measurement.
+2.5  A gap counts as a hole when it is 8x longer than normal, so normal jitter is safe.
+2.6  --max-frame-gap-s drops a photo pair when the camera missed frames between them.
+2.7  --image-time-offset fixes a camera clock that is early, late, or drifting. Off by default.
+2.8  A fixed clock offset cannot be seen in the timestamps alone; use tools/estimate_time_offset.py.
+
+
+3. DATA SPLITS
+--------------
+3.1  tools/split_dataset.py writes train, validation and test into separate folders on disk.
+3.2  Splitting on disk makes data leaking impossible, instead of only checking for it.
+3.3  Photos are split by TIME, never by count, because the frame rate is not constant.
+3.4  Only photos with telemetry on both sides are kept, so every one can be interpolated.
+3.5  The script refuses to write if a photo lands in two splits, or if the splits overlap.
+3.6  It reports the cost of each cut: broken pairs, and frames too near the end to use.
+3.7  --link saves disk space by hard-linking photos; --dry-run shows the plan without writing.
+3.8  The original capture is never changed, and a test proves it is identical afterwards.
+3.9  --split-manifest is removed. It was accepted but ignored, which is worse than missing.
+3.10 --validation-dataset and --test-dataset let the trainer use each folder whole.
+3.11 The built-in split is unchanged: 60/20/20 by time, with one window dropped between parts.
+
+
+4. CLEANUP OF TOOLS AND TESTS
+-----------------------------
+4.1  43 files for the old IMU, optical-flow and pose-VIO work are deleted (~17,600 lines).
+4.2  tools/ went from 31 files to 11. tests/ went from 34 to 14.
+4.3  The list came from following real imports, not from searching for words.
+4.4  This mattered: imu_mamba.py has NO IMU code. It holds the Mamba encoder the model uses.
+4.5  A word search would have deleted it and broken the model, so it is kept.
+4.6  The old tools were not just unused. They need Gyro and Accl columns, so they always failed here.
+4.7  tools/check_dataset_sync.py was kept and rewired to use attitude instead of a gyro.
+4.8  Its old degree-to-radian step was removed, because the new rates are already in radians.
+4.9  Keeping that step would have made the focal-length check wrong by 57 times.
+4.10 Three more tools were deleted because they cannot run on this data at all.
+4.11 The training-log privacy tool is gone, because the current trainer never wrote that log.
+
+
+5. TESTS
+--------
+5.1  The whole test suite now passes: 176 tests, no failures, no import errors.
+5.2  test_velocity_horizons.py can be imported again, bringing back 813 lines of dead checks.
+5.3  Those checks had been silently dead, and they hid a real bug added on this branch.
+5.4  The bug: the resume check reads max_frame_gap_s, but the test data never had that field.
+5.5  Other failures came from the old scoring rules and now match the new one-leg scoring.
+5.6  test_image_pairs.py now tests the REAL model front end, not a retired one.
+5.7  test_synthetic_flight.py dropped its 3 IMU tests and now checks what the trainer reads.
+5.8  It also proves NavEul is 0.2 deg away from the target, so the input is not a copy of the answer.
+
+
+6. TEST DATA (MOCK FLIGHT)
+--------------------------
+6.1  The fake flight now has a RelativeAlt column, the same one real data uses.
+6.2  Before, it only had Barometer, so tests took a different path than production.
+6.3  Barometer is now RelativeAlt plus 500 m, so the two columns are clearly different.
+6.4  This is on purpose: reading the wrong column now gives a 5x wrong altitude and fails loudly.
+6.5  data/flight.csv was updated in place, from 116 to 117 columns. The old file was saved.
+6.6  data_split/ was rebuilt, and all three splits now read RelativeAlt.
+
+
+7. LABELS
+---------
+7.1  --lever-arm corrects the distance between the GPS antenna and the camera.
+7.2  It is off by default and very small on this drone, so nothing changes unless you set it.
+7.3  The altitude reader now accepts RelativeAlt, relativeAlt and RelatedAlt.
+7.4  Before, a spelling difference made it fall back to Barometer without saying so.
+7.5  Speed is still altitude x rate at the same output moment, which is correct.
+7.6  The altitude input is RelativeAlt, which is height above the takeoff point, already zeroed.
+7.7  Barometer is only a last-resort fallback and is not used on any split of this capture.
+
+
+8. PROJECT LAYOUT
+-----------------
+8.1  Code moved to src/vio/ with a pyproject.toml, so no stray copy can shadow it.
+8.2  pyproject.toml lists both import roots, so the editor stops showing false import errors.
+8.3  scripts/ holds command.sh and setup_ubuntu.sh, both fixed for the new paths.
+8.4  artifacts/ is deleted and ignored by git. Nothing read from it.
+8.5  Old IMU and optical-flow artifacts are deleted, including a bad camera rotation file.
+8.6  data/ is ignored by git, which stops 127 MB of flight data being committed by accident.
+
+
+9. EVALUATION
+-------------
+9.1  The horizons asked for were already the defaults: 30 s, 1, 5, 10, 15, 20, 30 and 40 minutes.
+9.2  vel_rmse, vel_max_error, dir_rmse, dir_max_error and the position errors were already all reported.
+9.3  Each maximum also reports WHEN it happened, because an RMS over 40 minutes hides one bad second.
+9.4  A mean-predictor floor is printed beside them, so "better than guessing the average" is visible.
+9.5  Four figures per split are written by default, and their paths are printed at the end.
+9.6  velocity.png draws GT against the model per body axis; trajectory.png draws both paths top down.
+9.7  Bug found and fixed: skipped horizons were printed above the fitted ones, not in requested order.
+9.8  A skip is recorded before the encoding pass and a fit after it, so h40m sorted above h0.5m.
+9.9  That broke the one thing the table is for, which is reading a column downwards as the horizon grows.
+9.10 A 40 minute horizon needs a split strictly longer than 40 minutes, or it reports itself skipped.
+9.11 The mock capture was rebuilt at 100 Hz telemetry and 20 Hz images, matching the real one.
+9.12 A previous interrupted rebuild had left two flights interleaved in one image folder, now impossible.
+9.13 The generator clears old frames before rendering, since a rerun only overwrites names it reuses.
+9.14 --device now accepts a GPU list, so --device 0,1,2,3,4,5,6,7,8,9 trains on ten cards.
+9.15 A list re-launches the script under torchrun, one process per card, because this trainer is DDP.
+9.16 Assigning the list directly would put ten processes on cuda:0, which is a ten-times slower one-GPU run.
+9.17 DataParallel would accept the list as written and is the wrong answer: deprecated and far slower on ten cards.
+9.18 Naming a card the machine does not have fails immediately with the list of cards it does have.
+9.19 Evaluation is single GPU and takes --device cuda:0, which already worked and is now in commands.txt.
+9.20 There is no early stopping and never was: a run goes to --epochs and stops.
+9.21 --epochs default raised from 30 to 3000, because on ten cards an epoch is only about 10 optimiser steps.
+9.22 30 epochs was 300 steps, which is not a trained model, while the disk-cost helper already assumed 3000.
+9.23 --select-on chooses the metric behind best.pt, and now defaults to the 3-axis vel_rmse.
+9.24 Selecting on one axis picks the luckiest epoch on it while the other two may have got worse.
+9.25 That matters more without early stopping, since best.pt is a minimum over thousands of noisy draws.
+9.26 The chosen metric is written into the checkpoint, so a later comparison is not against an unknown number.
+9.27 val_vel_rmse_y is now NaN unless that axis was actually selected, instead of holding some other metric.
+
+10. DEAD CODE REMOVED
+--------------------
+10.1  15 modules under src/vio are deleted; they were reachable only from other dead modules.
+10.2  src/vio is now 18 files, and every one of them is reached from a live entry point.
+10.3  The two package __init__ files no longer re-export anything, so a deleted module cannot linger by name.
+10.4  One blocker first: a test needed the calibration reader, which lived inside the retired pose loader.
+10.5  That reader refused any file without gyro and accel units, which this project will never have.
+10.6  New src/vio/data/calibration.py reads only the camera block and ignores the rest.
+10.7  The trainer and the evaluator had each parsed that JSON separately; both now use the one reader.
+10.8  imu_mamba.py is renamed to causal_mamba.py, because it never held any IMU code.
+10.9  It is the temporal backbone of the model, and the old name nearly got it deleted in an IMU cleanup.
+
+11. ROTATION IS NOW REMOVED PER CELL, AND A CORRELATOR BUG IS FIXED
+--------------------------------------------------------------------
+11.1  Turning an aircraft moves the image differently in different places.
+11.2  The old code predicted ONE shift for the whole picture and subtracted that.
+11.3  For the part of the turn that spins the picture about its centre, that can
+      never work: the spin pushes one side one way and the other side the other,
+      so the best single number is exactly zero and nothing at all is removed.
+11.4  Measured in the new test: a constant removes 0% of that spin, and 96-97%
+      of the other two rotation directions. So one axis was completely uncorrected.
+11.5  The fix evaluates the real rotation pattern at every cell. The correlator
+      already accepted a per-cell input; nothing had ever supplied one.
+11.6  The camera mounting is still not needed. A learned 3x3 map covers every
+      possible mounting, so the geometry is fixed and the orientation is learned.
+11.7  It still starts at zero, so the search begins centred and earns every offset.
+11.8  Measured end to end on a known spin, error in the recovered sideways motion:
+      spin 1.5 cells, 50% better; spin 3 cells, 66% better.
+11.9  HONEST LIMIT: at the spin size this aircraft actually produces, about 0.4
+      to 0.8 cells, the gain is between break-even and 16%. It only pays off
+      properly once the picture resolution is raised.
+11.10 SEPARATE BUG FOUND, AND IT IS THE BIGGER ONE. The correlator lost up to
+      HALF the measured motion whenever the predicted shift was not a whole cell.
+11.11 On a known 2-cell shift: whole-number shifts gave 2.00 every time, but
+      half-cell shifts gave 1.00 to 1.66. It survived every texture tested.
+11.12 The old code fed it a learned shift that is almost never a whole number,
+      and its size grows with turn rate, so the loss grew during turns.
+11.13 That is a turn-correlated shrinking of measured motion, which is exactly
+      the error shape this frontend cannot absorb, aimed at the worst axis.
+11.14 Fix: the search is rounded to whole cells. Nothing is lost, because all
+      the fine detail comes from the sub-cell step, which is exact on whole cells.
+11.15 Rounding passes the gradient straight through, or the map could never learn.
+11.16 The reported motion now subtracts the EXACT rotation, not the rounded one,
+      so the rounding cannot leak back in as fake sideways motion.
+11.17 --rotation-mode field or constant, so the change can be tested, not assumed.
+11.18 The frontend is now v4 and the mode is in the fingerprint, so old weights
+      are refused by name rather than loaded into different maths.
+11.19 Whole suite green: 195 tests.
+
+
+12. STILL TO DO
+---------------
+12.1  Training-log privacy needs rebuilding on the current trainer, if you still want it.
+
+
+13. RUNBOOK AND EVALUATION FIXES, FOUND BY EXTERNAL REVIEW OF THE v4 CHANGE
+------------------------------------------------------------------------------
+13.1  BIGGEST ONE: the frontend was handed the camera matrix at NATIVE
+      (calibration) resolution, in both the trainer and the evaluator.
+13.2  But the frontend only ever sees images already resized to the WORKING
+      resolution, and it infers "native size" from the image tensor it is
+      actually given - so its own native/working rescale was silently a
+      no-op, and the raw native fx/fy/cx/cy were used as if already at
+      working scale.
+13.3  At a typical 1920x1080 native / 576x1024 working size that overstates
+      focal length by about 1.875x and misplaces the principal point by
+      hundreds of working pixels.
+13.4  This corrupted both the bearing scale AND the new per-cell rotational
+      field's coordinate grid - so every v4 number to date needs a retrain to
+      be trusted, not just re-reading.
+13.5  Fix: resize the matrix once, with the same helper VisualPairSource
+      already trusts, before it reaches the frontend.
+13.6  Lens distortion was parsed from the calibration file and then dropped:
+      build_vo_dataset() had no parameter to carry it to VisualPairSource, so
+      a calibration with real distortion had it silently ignored by every
+      caller. Wired through, and added to the resume fingerprint.
+13.7  The evaluator always built a "field" frontend regardless of what a
+      checkpoint actually recorded, so scoring a "constant" checkpoint could
+      load the wrong-shaped weights or silently score under the wrong
+      geometry. Now restores rotation_mode from the checkpoint, defaulting to
+      "constant" only when the key predates the field mode existing at all -
+      the same convention the trainer's own resume check already used.
+13.8  A missing raw log altitude used to fall back to the CENTRED copy in the
+      aiding vector, which would have scaled every predicted speed by a
+      constant nobody would think to look for. Now refuses instead of
+      guessing.
+13.9  Added a cold-start warm-up diagnostic: every horizon leg starts from a
+      zeroed state, so no visual event can exist before one deployment
+      latency plus about one camera frame interval have elapsed, and a
+      shorter --warmup silently scores those ticks as live. Diagnostic only -
+      the right cold-start warmup is still an open question.
+13.10 PRE-SPLIT evaluation bug: _resolve_ranges maps every phase to the WHOLE
+      scored directory, so the evaluator's "train mean" baseline was actually
+      the mean of whichever folder was being scored - comparing a model
+      against its own validation (or test) mean, flattering every
+      skill/baseline number. The true training mean is now recorded in the
+      checkpoint at training time and read from there; an older checkpoint
+      falls back to recomputing it from the recorded training folder, never
+      from the folder being scored.
+13.11 PRE-SPLIT training bug, latent until --horizon-minutes is used with a
+      pre-split run: the optional in-training horizon pass always read
+      datasets["train"] and the training file's own clock, regardless of
+      --horizon-split. Harmless when every phase shares one file (the
+      fractional-split mode this was written for) but in a pre-split run each
+      phase is a different directory, so a "validation" horizon leg would
+      have silently scored a slice of the TRAINING file under the validation
+      label. Now reads datasets[args.horizon_split] and that dataset's own
+      attitude.
+13.12 commands.txt: the resume command had dropped --test-dataset, which
+      changes the fingerprinted split ranges and would have been refused by
+      name; the "spelled out" torchrun command had dropped --save-every and
+      --keep-last; the test-split evaluation command never passed --splits
+      test, so its JSON labelled a test-set result as validation; only one of
+      three seeds was listed per rotation-mode arm. All four fixed.
+13.13 Doc cleanup: the frontend_id version-history comment now has a "v4:"
+      entry (it only had v2/v3); correlation.py no longer calls the search
+      centre a "gyro/IMU prediction" (this project has no gyro); the
+      --rotation-map error messages no longer point at
+      tools/calibrate_camera_imu_rotation.py as if it exists - it does not
+      ship in this repository, and the messages now say so and give the
+      expected JSON shape instead.
+13.14 Whole suite green: 201 tests.
+
+
+14. INCREMENT 1 OF THE POST-BUGFIX ROADMAP: PERFORMANCE AND DIAGNOSTICS
+--------------------------------------------------------------------------
+14.1  The correlator's up-to-81-candidate cost volume was a Python loop
+      issuing one slice, or one grid_sample call, per candidate.
+14.2  Fixed: one F.unfold call replaces the loop when there is no search
+      centre; one batched grid_sample call replaces it when there is.
+14.3  Both were checked against the old per-candidate loop, reimplemented by
+      hand, before landing - not assumed equivalent from reading the code.
+14.4  Measured at VisionMambaFlowFrontend's own CLASS default feature size
+      (batch 8, 36x48 features from a 288x384 image, radius 4, CPU):
+      242.8 -> 108.5 ms/pair-batch, 2.24x. CORRECTION (see section 17.7):
+      this is NOT the trainer's default - tools/train_fixedwing_vo.py's own
+      --image-size default is 576x1024, which at patch_size 8 is 72x128
+      features, 8x the cell count measured here. Do not read 2.24x as a
+      production speedup; see 17.7 for the reproducible benchmark at the
+      trainer's real configuration and what is still unmeasured (any GPU
+      number at all).
+14.5  A field-swap bug deliberately introduced during that check was caught
+      by the new regression test, then reverted - the test is not vacuous.
+14.6  --eval-train-split scores the training data through evaluate() (eval
+      mode, dropout off) instead of only mid-epoch with dropout on, logged as
+      traineval_* next to train_* and val_*. Off by default.
+14.7  This is PLAN.txt SS12's open question, settled by running rather than
+      reasoning about it: does train_vel_rmse sit above val_vel_rmse because
+      of real generalisation, or because train_vel_rmse is measured under
+      dropout on a model that is still changing. traineval_* isolates that.
+14.8  New frontend diagnostic: peak_at_boundary. A soft-argmax can only ever
+      report a displacement inside the window it was given - it has no way to
+      say "the true match is further out" - so a winning candidate pinned to
+      the edge of the search window is the one symptom of a too-small radius
+      that is otherwise invisible in the reported flow itself.
+14.9  The frontend now also exposes, per pair, three numbers the correlator
+      already computed but nothing surfaced past the token: mean usable
+      confidence, mean entropy, occupied-cell fraction.
+14.10 All four diagnostics are meaned over the visual events inside each
+      horizon's own prefix and land in both the evaluator's JSON and, via
+      HORIZON_ROW_METRICS, metrics.csv - one column lookup, not a rerun with
+      extra instrumentation, to see whether e.g. occupancy is falling with
+      the lateral axis's error, or the boundary-hit rate rises during turns.
+14.11 None of the four diagnostics reach the model. They are logging only.
+14.12 Whole suite green: 206 tests.
+
+
+15. INCREMENT 2 OF THE POST-BUGFIX ROADMAP: AIDING-VECTOR ADDITIONS
+--------------------------------------------------------------------------
+15.1  The aiding vector carried sin/cos roll, sin/cos pitch and log altitude
+      but no body rate at all - a coordinated turn holds roll and pitch near
+      constant while yaw rate carries the whole manoeuvre, invisible to those
+      four channels.
+15.2  Fixed: aiding_features (vio/data/attitude.py) appends p, q, r - the
+      SAME body_rate_rad_s the loader already derives at load time
+      (Log(R_{i-1}^T R_i) / dt), not a fresh differentiation. VO_AIDING_CHANNELS
+      and AIDING_INPUT_DIM (6 -> 9) grew to match; log altitude stayed at
+      index 4, so nothing already reading that index moved.
+15.3  Fusion input gained a second scalar alongside visual_present:
+      visual_age, ticks since the last delivered visual token
+      (vio.data.fixedwing_vo.visual_age_ticks). visual_present alone conflates
+      "no image yet" with "the image showed zero motion"; visual_age lets the
+      encoder discount a held-over token by its own staleness from the first
+      gradient step instead of having to infer it from recurrence alone.
+15.4  visual_age_ticks is causal and call-local: zero on the tick a token
+      arrives, growing by one every tick after, and counting from the call's
+      own start (not "unknown") before the first token that call can see -
+      the same boundary scatter_visual_tokens already draws for
+      visual_present itself.
+15.5  The streamed evaluator (run_span_horizons) computes visual_age_ticks
+      ONCE over the whole span and slices it per block, exactly like
+      token_field/quality_field/present_field, so age stays continuous across
+      a block boundary; a genuine state reset instead computes it fresh on
+      the reset slice, which is what makes it forget staleness along with
+      everything else.
+15.6  fuse_stream/fuse/forward/forward_stream all gained a required
+      visual_age positional argument (no silent default): AIDING_INPUT_DIM
+      is a hard-coded constant, not a CLI flag, so a resume against a
+      pre-Increment-2 checkpoint already fails loudly at the trainer's and
+      evaluator's load_state_dict(strict=True) rather than silently
+      continuing under the old channel count.
+15.7  New integration test trains on a flight with a known constant yaw rate
+      (0.02 rad/s) and confirms, via a spy on VisionMambaVO.forward, that:
+      the captured aiding vector's r channel sits at that rate and p/q sit at
+      zero; visual_age is exactly zero wherever visual_present fires; and
+      visual_age exceeds the camera's own nominal frame-to-frame gap. Reverting
+      the visual_age wiring in VOStep.forward was checked to fail this test
+      before landing the fix.
+15.8  Shared-frame re-encoding dedup remains its own, not-yet-started
+      increment (see the approved plan) - deliberately skipped again here.
+15.9  Whole suite green: 210 tests.
+
+
+16. INCREMENT 3 OF THE POST-BUGFIX ROADMAP: TBPTT DESIGN + LOCAL SCAFFOLD
+--------------------------------------------------------------------------
+16.1  Design note first, as planned (PLAN_TBPTT.txt): the roadmap's own "low
+      risk" label for TBPTT did not survive checking three things against
+      the actual code - windows overlap 50% by default, the training
+      DistributedSampler always shuffles, and CausalMambaEncoder.detach_state
+      had zero call sites anywhere in the repository. All three are load-
+      bearing design constraints, not implementation details.
+16.2  New ChronologicalWindowSampler (vio/data/fixedwing_vo.py): splits a
+      dataset's own window order into batch_size independent lanes, each
+      walking forward in time, and records per lane per step whether that
+      step is the TRUE chronological successor of the lane's previous one -
+      false at step 0 always, and also whenever a lane's walk crosses an
+      index_ranges boundary, since a condition-segment split assigns
+      disjoint spans to one phase and two of them being in tick order does
+      not mean they were flown back to back.
+16.3  Requires stride == window_length, checked against the realized
+      dataset.starts tiling rather than a stored stride (the dataset does
+      not keep one). Refuses construction otherwise: an overlapping window
+      would either be double-processed or need a tick-level re-seen mask
+      this scaffold does not implement.
+16.4  New mask_stream_state / detach_stream_state (vision_mamba_vo.py).
+      Masking a lane to zero and carrying a lane forward are the SAME
+      operation (multiply by a 0/1 keep mask) because a block's
+      initial_state is already all zeros - not two code paths that happen
+      to agree. Detaching finally gives CausalMambaEncoder.detach_state its
+      first real caller.
+16.5  VOStep gained forward_stream (tools/train_fixedwing_vo.py), sharing a
+      new _encode_visual helper with the existing forward - a pure refactor,
+      confirmed by the full suite passing unchanged before and after. New
+      forward_batch_stream mirrors forward_batch, threading VOStreamState in
+      and out. Both are explicitly NOT DDP-safe: DistributedDataParallel's
+      gradient-sync hooks fire on the wrapped module's own forward(), and a
+      differently-named method bypasses them silently - documented as
+      deferred, not worked around.
+16.6  Nothing wired into the CLI. This increment ships tested primitives,
+      not a new --tbptt training mode: the epoch-loop wiring needs its own
+      decisions (metrics.csv columns, validation semantics, --eval-train-
+      split interaction) better made in a dedicated follow-up once these are
+      reviewed. See PLAN_TBPTT.txt section 7 for the full deferred list -
+      DDP per-rank-lane threading and mid-sequence checkpoint resume chief
+      among them.
+16.7  New integration test runs the REAL frontend/dataset/VOStep/sampler
+      pipeline for two TBPTT steps: carrying state into step 1 changes its
+      prediction relative to a state=None run of the same batch, and
+      detaching the carried state changes nothing about step 1's own forward
+      values. Reverting forward_batch_stream's state threading was checked
+      to fail this test before landing the fix.
+16.8  Whole suite green: 217 tests.
+
+
+17. INCREMENT 3.1 HARDENING PASS, PER CODEX'S THIRD REVIEW
+--------------------------------------------------------------------------
+Codex re-reviewed increments 2 and 3, independently reran a subset of the
+suite (8 tests, all passing), and found the WORK sound but not yet ready for
+server training or TBPTT activation: several semantic and GPU-specific gaps.
+This section is that hardening pass and nothing else - no CLI wiring for
+TBPTT, no new architecture, exactly as the review asked.
+
+17.1  visual_age was not physical age. visual_age_ticks reported 0 the tick
+      a token arrived, but that tick is ready_tick - one deployment latency
+      (0.35s default) AFTER the second image was actually captured (see
+      VisualPairSource) - so the image was already ~0.35-0.39s old at the
+      moment it became "fresh" in the old accounting. It also counted ticks,
+      not seconds, so an irregular telemetry clock (a dropped sample) was
+      measured wrong.
+17.2  Fixed: visual_age_ticks -> visual_age_seconds(present, times_s,
+      deployment_latency_s, carry=None). age(t) = (times_s[t] -
+      times_s[last_delivery_tick]) + deployment_latency_s for any tick at or
+      after a delivery this call can see; exactly 0 before the first
+      delivery (or when present is all zero, e.g. --disable-visual-input)
+      because there is no captured image yet to be stale. Uses the REAL
+      clock throughout, not an assumed uniform interval.
+17.3  Continuity across a TBPTT chunk boundary needed a NEW piece of carried
+      state - the age-side counterpart of VOStreamState - since a window
+      only sees its own local ticks. carry (a (B,) telemetry-clock time, -inf
+      meaning "never") threads through VOStep.forward_stream/
+      forward_batch_stream alongside state, and mask_age_carry
+      (vio.data.fixedwing_vo) resets exactly the lanes ChronologicalWindow
+      Sampler flags, mirroring mask_stream_state. The streamed evaluator
+      (run_span_horizons) still needs no carry parameter: it already computes
+      age once over the whole unbroken span.
+17.4  telemetry_time_s is now a FixedWingVODataset.__getitem__ output (the
+      real per-window clock) and a VOStep.forward/forward_stream input -
+      new plumbing visual_age_seconds needs that visual_age_ticks did not.
+17.5  mask_stream_state's device bug: keep.to(conv.dtype) changed dtype but
+      left the mask on keep's OWN device. Harmless on CPU (one device for
+      everything); a silent RuntimeError the first CUDA training step, since
+      a sampler builds keep fresh on the CPU with no device to infer. Fixed
+      to keep.to(device=conv.device, dtype=conv.dtype). New CUDA-gated
+      regression test (skipped here, no GPU) pins it for the server.
+17.6  TBPTT warm-up was still cold-start-only. A dataset window always zeroes
+      its own first `warmup` ticks - right for a lane that resets, wrong for
+      one whose state was carried in, which has no real blind period to
+      score as blind. New tbptt_loss_mask(loss_mask, continues, warmup)
+      restores warmup to 1 only on the lanes ChronologicalWindowSampler
+      flags as continuing; not wired into the (still absent) TBPTT CLI path,
+      but tested directly against a mixed continued/reset batch.
+17.7  Performance claim corrected and re-measured. Section 14.4's 36x48
+      feature size is VisionMambaFlowFrontend's own CLASS default, not the
+      trainer's - tools/train_fixedwing_vo.py's --image-size default is
+      576x1024, which at patch_size 8 is 72x128 features, 8x the cell count.
+      New tools/benchmark_correlation.py reproduces LocalCorrelation.forward
+      timing (and CUDA peak memory, when run on a CUDA device - torch has no
+      CPU equivalent) at any size; default args are the trainer's real
+      configuration. Run here (CPU, no GPU available in this session):
+          python tools/benchmark_correlation.py
+      batch 8, 64 channels, 72x128, radius 4 (81 candidates): forward only
+      684.0 ms, forward + backward 935.5 ms. The old per-candidate loop no
+      longer exists to re-measure a before/after ratio at this size against -
+      it was deleted once 14.2-14.3 confirmed the vectorized path matched it
+      exactly - so this is reported as today's number, not a speedup claim.
+      A100 forward/backward throughput and peak VRAM remain UNMEASURED: no
+      GPU is available in this session. Do not call the correlation
+      vectorization a production speedup until those numbers exist.
+17.8  Boundary/entropy diagnostics were confounded. boundary_hit_fraction
+      averaged peak_at_boundary over every cell, including ones whose search
+      window was clipped by the image border (full_window_valid=False, which
+      makes the argmax structurally more likely to land on whatever remains
+      of the window, regardless of where the true match is) and ones with no
+      real signal at all (usable_confidence <= 0, an arbitrary tie-break).
+      Fixed: restricted to cells that are BOTH full_window_valid AND
+      usable_confidence > 0, in both the numerator and the denominator - not
+      merely diluted by including them. New mean_entropy_normalized divides
+      entropy by each cell's OWN log(candidate_count) rather than the
+      radius-only log(K), so a border cell's smaller ceiling (fewer valid
+      candidates) does not make it look artificially more certain, and the
+      value is comparable across different search radii. Both extracted into
+      a standalone frontend_diagnostics() function so they are unit-tested
+      directly against hand-built correlation dicts (border cells and
+      textureless cells proven NOT to inflate the fraction) rather than only
+      through a real image pipeline. DIAGNOSTIC_NAMES, HORIZON_ROW_METRICS,
+      and correlation.py's returned dict (candidate_count, needed for the
+      per-cell entropy ceiling) all updated to match.
+17.9  --eval-train-split under-covered the training split. It reused
+      loaders["train"], which is shuffle=True AND drop_last=True for the
+      OPTIMISER's sake - dropping up to batch_size-1 windows every call, a
+      systematic (not occasional) gap whenever the split length is not a
+      multiple of batch_size. Fixed: a dedicated loaders["train_eval"]
+      (shuffle=False, drop_last=False) built once, alongside the existing
+      loaders. New regression test uses a split (9 windows) and batch size
+      (4) chosen so the old code would have scored 8, not 9, and checks all
+      9 are scored.
+17.10 Ablation flags: --ablate-body-rate and --ablate-visual-age (tools/
+      train_fixedwing_vo.py), independently switchable, zero their own
+      fusion-input channel WITHOUT changing any tensor shape - VOStep zeroes
+      aiding[..., BODY_RATE_AIDING_SLICE] and/or the age tensor at the point
+      of consumption, and run_span_horizons does the same for the streamed
+      evaluator. Recorded in the resume fingerprint's contract (both flags
+      are plain shapes-unchanged booleans, so a shape check at
+      load_state_dict cannot catch a mismatched setting - the fingerprint
+      has to) and reproduced from the checkpoint at evaluation time (not
+      overridable there, same convention rotation_mode already uses).
+17.11 New VisionMambaVO.temporal_input_id ("vo_temporal_fusion_v2"), the
+      fusion side's counterpart to frontend_id: AIDING_INPUT_DIM changing
+      (6 -> 9) already fails load_state_dict on a shape mismatch, but that
+      only catches a SHAPE change, not a same-shape semantic one (an
+      ablation flag flipped between training and evaluation, or any future
+      change that keeps every tensor the same size). Checked by name in
+      tools/evaluate_velocity_horizons.py exactly where frontend_id already
+      is, with the same style of refusal message.
+17.12 New regression tests beyond the ones already named above: variable
+      (irregular) telemetry intervals: visual_age_seconds tracks real
+      elapsed time between a dropped sample's neighbours, not a uniform tick
+      count; carry continuity: two chunked calls equal one concatenated call
+      over the same span, and a genuine reset (carry=None) does not see a
+      previous chunk's delivery; independent input ablations: each flag
+      zeroes only its own channel and leaves the other, and the aiding
+      vector's known yaw rate, untouched.
+17.13 Files newly tracked by this pass: tools/benchmark_correlation.py (new).
+      PLAN.txt, PLAN_TBPTT.txt, tests/test_tbptt.py and
+      tests/test_train_fixedwing_vo_integration.py remain untracked from
+      prior increments - not committed by this pass either; see the session
+      notes for the untracked-file list Codex asked for.
+17.14 Whole suite green: 229 passed, 1 skipped (the new CUDA
+      mask_stream_state regression test - no GPU in this session; it is not
+      vacuous, it is skip-marked and will run on the server). git diff
+      --check: clean (only the pre-existing CRLF/LF line-ending warnings,
+      unrelated to content).
+
+
+18. VALIDATION FRONTEND-CHUNK BYPASS (MEMORY REGRESSION, CODEX'S 4TH REVIEW)
+-----------------------------------------------------------------------------
+18.1  Real bug, found from an actual Ubuntu multi-GPU crash report, not a
+      local repro: tools/train_fixedwing_vo.py's encode_pairs() read
+      `if chunk <= 0 or not torch.is_grad_enabled(): ... one call with every
+      pair`. evaluate() and run_horizon_pass() both run under
+      torch.no_grad(), so EVERY validation pass silently ignored
+      --frontend-chunk and sent the whole batch's pairs through the frontend
+      - and its correlator - in one call. Confirmed against the actual code
+      (tools/train_fixedwing_vo.py, src/vio/models/correlation.py) before
+      changing anything, same discipline as every other fix this session.
+18.2  Why it only became fatal recently: the correlator used to loop over
+      its ~81 search candidates one at a time (a Python loop of per-offset
+      grid_sample calls). Increment 1's vectorisation (src/vio/models/
+      correlation.py's _all_integer_shifts/_all_grid_samples) replaced that
+      loop with one call building a (pairs, channels, candidates, height,
+      width) tensor - faster for a bounded chunk, but the validation bypass
+      above meant "pairs" was the WHOLE batch, not the chunk. At the
+      trainer's real defaults (batch 4, 120 events/window, 64 channels, 81
+      candidates, 72x128 grid) that is 480 pairs and ~85.4 GiB for a single
+      tensor - on top of images, feature maps, sampling grids, logits,
+      softmax probabilities and the fusion state. Ten 80 GiB GPUs do not
+      pool into 800 GiB; each DDP rank needs this to fit alone.
+18.3  Fix, in tools/train_fixedwing_vo.py's encode_pairs(): chunk whenever
+      chunk > 0, REGARDLESS of grad state. Only the checkpoint()
+      recompute-in-backward wrapper is conditioned on
+      torch.is_grad_enabled() now - under no_grad there is nothing to
+      recompute for, so each chunk calls the frontend directly instead of
+      through checkpoint(), which is strictly less work, not a behaviour
+      change (checkpoint() already no-ops functionally when grad is
+      disabled; this makes it explicit rather than relying on that).
+18.4  Second, smaller fix: the uint8 -> float / 255 conversion used to
+      happen once for the WHOLE flattened batch, in VOStep._encode_visual,
+      before encode_pairs ever saw it - about 2.1 GiB for a real 480-pair
+      validation batch, on its own. Moved inside encode_pairs' per-chunk
+      encode() closure, so at most one chunk's worth of pairs are ever live
+      as float at once. encode_pairs' contract changed accordingly: it now
+      takes raw image dtype (uint8) directly, not pre-normalised float - the
+      call site in _encode_visual was updated to stop converting before the
+      call, and a regression test
+      (test_encode_pairs_converts_uint8_input_without_double_normalising)
+      pins that a caller must NOT pre-divide by 255.
+18.5  New tools/train_fixedwing_vo.py startup log line (guarded on not
+      --disable-visual-input): reports the correlator's estimated peak
+      candidate-tensor size in GiB at the CONFIGURED --frontend-chunk (or,
+      if chunk is disabled, at the whole per-step pair count, loudly). This
+      is the number that decides whether a run OOMs the moment validation -
+      or a large --batch-size - is reached, so it is printed at startup
+      rather than discovered from a crash.
+18.6  New tests/test_encode_pairs.py - nothing exercised encode_pairs
+      directly before this file. A fake counting frontend pins the exact
+      regression (20 pairs, chunk 4, no_grad -> 5 calls of 4, not 1 of 20;
+      same split with grad enabled; chunk=0 still means one call; a ragged
+      remainder is not padded or dropped); a real (small) VisionMambaFlow
+      Frontend confirms chunked and unchunked encoding produce identical
+      tokens and quality under no_grad, so chunking is pinned as a memory
+      optimisation only, never a numeric one; a pinned unit check of the new
+      GiB estimate against the 480-pair/85 GiB and 8-pair/1.4 GiB numbers
+      above. Reverting the fix (chunk<=0 or not grad-enabled, restored) was
+      checked to fail the two no_grad chunking tests before landing it,
+      same discipline as every other fix this session.
+18.7  Validation's OWN correctness was re-audited on request and found
+      already clean: evaluate() is correctly decorated @torch.no_grad() (an
+      easy thing to misdiagnose by mis-reading an offset Read call, which
+      is exactly what happened once before this fix was pinned down -
+      caught by re-reading the actual line before reporting it);
+      RunningVelocityStats/masked_velocity_stats detach to plain Python
+      floats and numpy before accumulating, so there is no cross-batch
+      autograd-graph leak in the metrics accumulator; run_horizon_pass
+      already chunks correctly (it was written after encode_pairs and
+      always called the frontend per --batch-pairs, never through
+      encode_pairs's buggy branch). The frontend-chunk bypass above was the
+      one real defect.
+18.8  Host-RAM/`/dev/shm` pressure from `--num-workers` x world_size x
+      prefetched uint8 batches is real but secondary - see the GPU-gate and
+      smoke-test sections of README.md, and Codex's own diagnostic commands
+      (free -h, df -h /dev/shm, journalctl -k for an OOM-killer line) for
+      telling it apart from the GPU OOM this fix addresses.
+18.9  frontend_chunk is not part of the checkpoint fingerprint (it only
+      changes HOW activation memory is spent, never what the model
+      computes), so a checkpoint from before this fix resumes under it
+      unchanged - --resume does not need to change.
+18.10 Full suite green: 236 passed (229 + 7 new), 1 skipped (the CUDA
+      mask_stream_state test - still no GPU in this session). Re-ran the
+      earlier local CPU smoke train/evaluate (small synthetic flight) after
+      the fix to confirm the real VOStep/encode_pairs call path still
+      trains and evaluates end to end, not just the new unit tests.

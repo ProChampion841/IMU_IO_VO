@@ -1,0 +1,77 @@
+:: ============================================================================
+:: AirIMU commands  (Windows cmd;  ^ = line continues)
+:: Run from the repo folder, in the mvvio env:   conda activate mvvio
+::
+:: Splits:  inference = HELD-OUT flights (use this for real results)
+::          test / eval = the flights used to PICK the checkpoint (not held-out)
+:: Horizons are in frames at 100 Hz:  3000 = 30 s,  6000 = 60 s,  12000 = 120 s
+:: ============================================================================
+
+
+:: ---------------------------------------------------------------- TRAIN
+:: Train the tilt_aware model (40 epochs, seed 0)
+python train.py --config configs/exp/UAV/tilt_aware.conf --device cuda:0
+
+:: Continue a stopped run from its newest checkpoint
+python train.py --config configs/exp/UAV/tilt_aware.conf --device cuda:0 --load_ckpt
+
+:: Same run with a different random seed (to check the result is not luck)
+python train.py --config configs/exp/UAV/tilt_aware.conf --device cuda:0 --seed 1
+
+:: Watch training live, then open http://localhost:6006
+tensorboard --logdir experiments/UAV/tilt_aware/tensorboard --host 0.0.0.0
+
+
+:: ---------------------------------------------------------------- PASS / FAIL
+:: THE result.  Held-out flights, 120 s, every flight listed.
+:: Pass = pooled below 0.9585 AND "every value below 1.0" in the LOFO line.
+python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_aware.conf ^
+  --ckpt experiments/UAV/tilt_aware/ckpt/best_model.ckpt ^
+  --splits inference --nested --horizons 12000 --per_flight
+
+:: Same, all three horizons (30 s / 60 s / 120 s) from one pass
+python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_aware.conf ^
+  --ckpt experiments/UAV/tilt_aware/ckpt/best_model.ckpt ^
+  --splits inference --nested --horizons 3000 6000 12000 --per_flight
+
+:: Same, and also save one row per window to a CSV
+python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_aware.conf ^
+  --ckpt experiments/UAV/tilt_aware/ckpt/best_model.ckpt ^
+  --splits inference --nested --horizons 3000 6000 12000 --per_flight ^
+  --win_csv tilt_aware_windows.csv
+
+
+:: ---------------------------------------------------------------- ONE FLIGHT
+:: First 30 s / 1 min / 2 min of ONE held-out flight, no reset to GT.
+:: This is ONE window only: good for looking, not proof of anything.
+:: (143_23 is the hardest held-out flight: ~half of all the error)
+python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_aware.conf ^
+  --ckpt experiments/UAV/tilt_aware/ckpt/best_model.ckpt ^
+  --splits inference --csv 2026_02_06_143_23_sensor_data.csv ^
+  --nested --first_only --horizons 3000 6000 12000
+
+
+:: ---------------------------------------------------------------- CONTROL
+:: Is the network better than 3 plain numbers?  Fits one fixed accel
+:: correction on train (no network, no training) and scores it next to
+:: the trained model on the held-out flights.  "const" vs "net" rows.
+python -m tools.const_bias_control --config configs/exp/UAV/tilt_aware.conf ^
+  --ckpt experiments/UAV/tilt_aware/ckpt/best_model.ckpt ^
+  --fit_split train --score_split inference --horizons 3000 6000 12000
+
+:: Same, fitted at 120 s (best for long outages)
+python -m tools.const_bias_control --config configs/exp/UAV/tilt_aware.conf ^
+  --fit_split train --score_split inference --horizons 12000 --fit_horizon 12000
+
+
+:: ---------------------------------------------------------------- CHECKS
+:: Which flights are long enough for each horizon (no model needed).
+:: Window counts here are an UPPER bound: the real eval drops some windows
+:: in the data-quality check and the 15 s freeze (e.g. 246 -> 218 at 30 s).
+python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_aware.conf ^
+  --splits inference --horizons 3000 6000 12000 --check
+
+:: Old model for comparison (accel_const, still has its checkpoint)
+python -m tools.eval_vel_horizons --config configs/exp/UAV/accel_const.conf ^
+  --ckpt experiments/UAV/accel_const/ckpt/best_model.ckpt ^
+  --splits inference --nested --horizons 12000 --per_flight
