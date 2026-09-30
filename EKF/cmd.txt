@@ -1,0 +1,37 @@
+:: ============================================================================
+:: EKF (IMU + VO) commands  (Windows cmd;  ^ = line continues)
+:: Run from the EKF folder.  EKF\ and IMU\ must sit side by side.
+:: Horizons are frames at 100 Hz: 3000 = 30 s, 6000 = 1 min ... 30000 = 5 min.
+:: The window is the LONGEST horizon; every shorter one is read off its prefix.
+:: ============================================================================
+
+:: ---------------------------------------------------------------- tests
+python -m pytest tests -q
+
+:: ---------------------------------------------------------------- simulated VO
+:: Checks the filter on your REAL IMU flights with SIMULATED VO (GPS truth + noise
+:: sized from the measured VO RMSE).  Not a VO result -- the output says so.
+python run_ekf.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --vo_sim --horizons 3000 6000 12000 --out_csv ekf_sim.csv
+
+:: ---------------------------------------------------------------- real VO
+:: vo_predictions\<flight>_vo.csv per flight: time, body_velocity_m_s_x/y/z (FRD),
+:: velocity_log_variance_x/y/z -- the VO model's output contract.
+python run_ekf.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --vo_dir vo_predictions ^
+  --horizons 3000 6000 12000 18000 24000 30000 ^
+  --out_csv ekf_windows.csv --out_npz ekf_traj.npz --plot_dir ekf_plots
+
+:: same, with the learned IMU correction (export it first, see IMU\cmd.txt)
+python run_ekf.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --vo_dir vo_predictions --imu_onnx ..\IMU\tilt_rotate_40s.onnx ^
+  --horizons 3000 6000 12000 18000 24000 30000 --out_csv ekf_windows_onnx.csv
+
+:: one flight
+python run_ekf.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --csv 2026_02_06_143_23_sensor_data.csv ^
+  --vo_csv vo_predictions\2026_02_06_143_23_sensor_data_vo.csv ^
+  --horizons 3000 6000 12000 --plot_dir ekf_plots
+
+:: settings (noise, attitude aid, VO variance scale): configs\ekf_default.json
+:: copy it, edit, and pass --ekf_config my.json

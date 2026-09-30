@@ -1,0 +1,43 @@
+{
+  "_comment": "Error-state EKF, IMU + VO.  Units: SI, angles in degrees where named _deg.  See EKF/README.md.",
+
+  "eskf": {
+    "gravity": 9.81007,
+    "acc_noise": 0.05,
+    "gyro_noise": 0.005,
+    "acc_bias_rw": 1e-4,
+    "gyro_bias_rw": 1e-5,
+    "init_pos_std": 0.1,
+    "init_vel_std": 0.1,
+    "init_att_std_deg": 0.5,
+    "init_acc_bias_std": 0.03,
+    "init_gyro_bias_std": 2e-4,
+    "gate": true
+  },
+
+  "attitude_aid": {
+    "_comment": "source: gt = GPSNavEul (the attitude the IMU model is trained with, gtrot), mti = EulX/Y/Z, null = no aid.  Set a std to null to drop that part (mti: std_yaw_deg null -- its heading drifts).",
+    "source": "gt",
+    "std_tilt_deg": 0.2,
+    "std_yaw_deg": 0.5,
+    "every": 10
+  },
+
+  "vo": {
+    "_comment": "frame of the VO file: frd (VO contract) or flu.  var_scale inflates the VO variance (VO error is time-correlated).  lever_arm_m: IMU -> camera, body FLU.",
+    "frame": "frd",
+    "time_offset_s": 0.0,
+    "var_scale": 4.0,
+    "min_std": 0.05,
+    "lever_arm_m": [0.0, 0.0, 0.0]
+  },
+
+  "vo_sim": {
+    "_comment": "Only for --vo_sim.  null stds = split the measured VO RMSE [3.5, 2.7, 0.95] m/s between white noise and a slow Gauss-Markov error.",
+    "rate_hz": 10.0,
+    "white_std": null,
+    "bias_std": null,
+    "tau_s": 20.0,
+    "seed": 0
+  }
+}
