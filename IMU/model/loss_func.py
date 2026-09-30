@@ -3,8 +3,12 @@ import torch
 EPSILON = 1e-7
 
 def diag_cov_loss(dist, pred_cov):
+    # Gaussian NLL with pred_cov = log(sigma):  e^2 / (2 sigma^2) + log(sigma).
+    # It used to read `error / 2*(torch.exp(2 * pred_cov))`, which by operator
+    # precedence is e^2/2 * sigma^2 -- the NLL inverted, minimised by sigma -> 0.
+    # Nothing in the repo calls it today; fixed so nothing can start to.
     error = (dist).pow(2)
-    return torch.mean(error / 2*(torch.exp(2 * pred_cov)) + pred_cov)
+    return torch.mean(error / (2 * torch.exp(2 * pred_cov)) + pred_cov)
 
 def diag_ln_cov_loss(dist, pred_cov, use_epsilon=False):
     error = (dist).pow(2)

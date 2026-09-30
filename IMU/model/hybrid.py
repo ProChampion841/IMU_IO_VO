@@ -76,6 +76,8 @@ skip connection:
     corrected = raw * (1 + s) + b           # correction_mode: "affine"  (default)
     corrected = raw + b                     # correction_mode: "additive"
     corrected = direct_scale * head(feat)   # correction_mode: "direct"  (see below)
+    corrected = Exp(dtheta) @ raw + b       # correction_mode: "rotate"  (acc only;
+                                            #   see _rotate_small for why)
 
 ``affine`` is the default because of a measured property of this corpus: fitting
 one constant accel bias per split gives a bias *direction* that is essentially a
@@ -198,16 +200,43 @@ class HybridNet(ModelBase):
         # CNN downsamples by stride 3 x stride 3.  interval is a CONSEQUENCE of
         # the encoder stride, not an independent knob -- keep them in sync.
         self.interval = 9
-        self.inter_head = np.floor(self.interval / 2.0).astype(int)
+        # `causal_cnn: True` makes the whole correction path causal.  Two things have
+        # to move together: the CNN pads on the left only (model/cnn.py), and a frame
+        # is owned by the token that ENDS at or before it (inter_head 0) instead of
+        # the token centred on it.  MEASURED before this switch: the correction at
+        # window frame f depended on frames up to f+12 (120 ms of future IMU).
+        # Default False keeps every existing checkpoint bit-identical.
+        self.causal_cnn = bool(conf.get("causal_cnn", False))
+        self.inter_head = 0 if self.causal_cnn else int(np.floor(self.interval / 2.0))
         self.inter_tail = self.interval - self.inter_head
 
         self.att_input = str(conf.get("att_input", "gravity"))
         self.att_source = str(conf.get("att_source", "gt"))
         self.correction_mode = str(conf.get("correction_mode", "affine"))
-        if self.correction_mode not in ("affine", "additive", "direct"):
-            raise ValueError("correction_mode must be affine|additive|direct, got %r"
+        if self.correction_mode not in ("affine", "additive", "direct", "rotate"):
+            raise ValueError("correction_mode must be affine|additive|direct|rotate, got %r"
                              % self.correction_mode)
         self.scale_std = float(conf.get("scale_std", 0.05))
+        # correction_mode "rotate": corrected_acc = Exp(dtheta) @ raw_acc + b.
+        # dtheta is a small body-frame ATTITUDE correction, bounded to rotate_max_deg
+        # by a tanh.  See _rotate_small() for why this is the right functional form for
+        # the error measured on this corpus.  2 deg is ~5x the 0.387 deg tilt that the
+        # fitted "bias" corresponds to.
+        self.rotate_max = float(conf.get("rotate_max_deg", 2.0)) * np.pi / 180.0
+        # `cov_stop_grad: True` feeds the covariance heads a DETACHED feature, so the
+        # covariance NLL trains only its own two heads and cannot pull the shared trunk.
+        # MEASURED on the tilt_aware run: cov_loss is ~0.219 of a ~0.678 val_loss (32%),
+        # it bottomed at epoch 42 while the correction kept improving to epoch 120-930,
+        # i.e. the two objectives want different trunks.  Default False == before.
+        self.cov_stop_grad = bool(conf.get("cov_stop_grad", False))
+        # `cov_model` / `cov_bias_std_init` / `cov_calib_lr_mult` appear in
+        # tilt_aware.conf but NO code in this repository reads them, so that run used
+        # the plain propagated covariance.  Say so instead of ignoring them silently.
+        _cm = conf.get("cov_model", None)
+        if _cm not in (None, "propagated"):
+            print("[hybrid] WARNING: cov_model=%r is not implemented in this code base "
+                  "and is IGNORED (cov_bias_std_init / cov_calib_lr_mult likewise). "
+                  "The covariance is the plain propagated one." % (_cm,))
         self.direct_scale = float(conf.get("direct_scale", 10.0))
         self.correct_gyro = bool(conf.get("correct_gyro", True))
 
@@ -332,7 +361,8 @@ class HybridNet(ModelBase):
         # Zero everywhere except airspeed, so `(x - in_offset) / in_scale` is
         # bit-identical to the old `x / in_scale` for every pre-existing config.
         self.register_buffer("in_offset", torch.cat(_offset))
-        self.cnn = CNNEncoder(c_list=[self.in_dim, 32, cnn_dim], k_list=[7, 7], s_list=[3, 3])
+        self.cnn = CNNEncoder(c_list=[self.in_dim, 32, cnn_dim], k_list=[7, 7], s_list=[3, 3],
+                              causal=self.causal_cnn)
 
         # `branches` selects which of the two paths is BUILT.  "mamba" and "gru" skip
         # constructing the other branch entirely rather than building it and not calling
@@ -414,10 +444,15 @@ class HybridNet(ModelBase):
         gw = ("whole window" if self.gru_window == 0
               else "%d tok = %d frames = %.2f s" % (self.gru_window, self.gru_window_frames,
                                                     self.gru_window_frames / 100.0))
-        print("[hybrid] branches=%s in_dim=%d (att_input=%s, att_source=%s) mode=%s "
+        print("[hybrid] branches=%s in_dim=%d (att_input=%s, att_source=%s) mode=%s%s "
+              "causal_cnn=%s cov_stop_grad=%s "
               "fuse=%s fuse_dropout=%.2f%s%s correct_gyro=%s params=%d"
               % (self.branches, self.in_dim, self.att_input, self.att_source,
-                 self.correction_mode, self.fuse_mode, self.fuse_dropout,
+                 self.correction_mode,
+                 ("(max %.2f deg)" % np.degrees(self.rotate_max))
+                 if self.correction_mode == "rotate" else "",
+                 self.causal_cnn, self.cov_stop_grad,
+                 self.fuse_mode, self.fuse_dropout,
                  (" gru(hidden=%d, window=%s)" % (gru_hidden, gw)) if self.use_gru else "",
                  (" mamba(dim=%d, layers=%d, stride=%d -> %.2f s/step, kernel=%s)"
                   % (mamba_dim, mamba_layers, self.mamba_stride,
@@ -554,6 +589,8 @@ class HybridNet(ModelBase):
         return self.fuse_drop(self.fuse_norm(self.fuse_act(fused)))
 
     def cov_decoder(self, x):
+        if self.cov_stop_grad:
+            x = x.detach()
         acc = torch.exp(self.acccov_decoder(x) - 5.0)
         gyro = torch.exp(self.gyrocov_decoder(x) - 5.0)
         return torch.cat([acc, gyro], dim=-1)
@@ -589,6 +626,34 @@ class HybridNet(ModelBase):
     # ------------------------------------------------------------------
     # correction
     # ------------------------------------------------------------------
+    @staticmethod
+    def _rotate_small(dtheta, v):
+        """Exp(dtheta) @ v by Rodrigues, exact, smooth at dtheta = 0.
+
+        WHY A ROTATION.  The integrator computes world specific force as R_used @ acc.
+        If the attitude it is handed is off by a small body-frame rotation dtheta,
+        i.e. R_true = R_used Exp(dtheta), then R_used @ (Exp(dtheta) @ acc) is exactly
+        R_true @ acc -- so the error is removed by rotating the specific force, not by
+        adding a vector to it.  MEASURED (UPDATES_2026-09-08, tilt_aware.conf header):
+        the best constant "bias" grows 0.0123 -> 0.0229 m/s^2 from the 30 s to the
+        120 s fit, which is the signature of attitude leakage g*sin(theta), not of an
+        accelerometer bias.  An additive head can only approximate g*(dtheta x g_body)
+        and must learn the dependence on g_body from ~440 distinct windows; this form
+        has it built in, with 3 bounded numbers per token.
+
+        EXACT, not first order: at 2 deg the second-order term is ~6e-3 m/s^2, the
+        same size as the corrections being learned.  sin(t)/t and (1-cos t)/t^2 use
+        their Taylor series below 1e-4 rad so the gradient at dtheta = 0 is finite.
+        """
+        t2 = (dtheta * dtheta).sum(-1, keepdim=True)
+        t = torch.sqrt(t2.clamp_min(1e-12))
+        small = t2 < 1e-8
+        a = torch.where(small, 1.0 - t2 / 6.0, torch.sin(t) / t)
+        b = torch.where(small, 0.5 - t2 / 24.0, (1.0 - torch.cos(t)) / t2.clamp_min(1e-12))
+        c1 = torch.cross(dtheta, v, dim=-1)
+        c2 = torch.cross(dtheta, c1, dim=-1)
+        return v + a * c1 + b * c2
+
     def _correct(self, raw, feature, frame_len, bias_head, scale_head, std,
                  channel="acc"):
         """raw (B, F', 3) -> corrected (B, F', 3) under the configured mode."""
@@ -622,8 +687,22 @@ class HybridNet(ModelBase):
             n = torch.arange(1, f.shape[1] + 1, device=f.device, dtype=f.dtype)
             f = torch.cumsum(f, dim=1) / n.view(1, -1, 1)
         bias = self._update(zero.clone(), bias_head(f) * std, frame_len)
-        if self.correction_mode == "additive":
+        if self.correction_mode == "additive" or (
+                self.correction_mode == "rotate" and channel != "acc"):
+            # rotate is an accelerometer-only form; a gyro correction stays additive.
             return raw + bias
+        if self.correction_mode == "rotate":
+            # scale_head is reused as the rotation head: it is zero-initialised, so
+            # dtheta = 0 exactly at step 0 and the model starts as the identity.
+            # NORM-bounded: |dtheta| < rotate_max whatever the direction (a per-axis
+            # tanh would allow sqrt(3) x rotate_max on the diagonal).  tanh(n)/n -> 1
+            # as n -> 0, so this is smooth and exactly 0 at a zero head output.
+            h = scale_head(f)
+            n = h.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            dtheta = self._update(zero.clone(),
+                                  self.rotate_max * torch.tanh(n) / n * h,
+                                  frame_len)
+            return self._rotate_small(dtheta, raw) + bias
         # affine: bounded diagonal scale, exactly 0 at init (tanh(0) = 0)
         scale = self._update(zero.clone(),
                              self.scale_std * torch.tanh(scale_head(feature)),

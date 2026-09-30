@@ -1,0 +1,97 @@
+===============================================================================
+MODEL + LOSS REVIEW AND UPDATES          2026-09-30
+===============================================================================
+
+SHORT VERSION
+  - tilt_aware (gravity input) is the first arm that improves with training
+    (val 120 s 0.949 -> 0.871, best epochs 120-932).  Held-out is not yet scored.
+  - New arm: configs/exp/UAV/tilt_rotate.conf.  It removes the attitude error by
+    ROTATING the accelerometer vector instead of ADDING a bias.
+  - Found and fixed: the logged train/val numbers were not means; the CNN reads
+    120 ms of future IMU; cov_model: bias was never implemented.
+  - Every new switch defaults OFF.  Old configs and checkpoints behave the same.
+
+-------------------------------------------------------------------------------
+1. WHAT I FOUND
+-------------------------------------------------------------------------------
+  a. cov_model: bias DOES NOT EXIST IN THIS CODE.
+     tilt_aware.conf sets cov_model / cov_bias_std_init / cov_calib_lr_mult,
+     and the header cites ModelBase._calibrate_cov.  No file in the repo reads
+     any of those keys, so tilt_aware ran with the plain propagated covariance.
+     HybridNet now prints a WARNING when they are set.  (If your training
+     machine has a newer model/net.py, please send it.)
+
+  b. THE CNN SEES THE FUTURE.  The Conv1d layers pad on both sides.  Measured:
+     the correction at frame f depends on IMU frames up to f+12 (120 ms ahead).
+     This is not label leakage, but it cannot run causally in real time, and
+     the Mamba branch was built strictly causal on purpose.
+
+  c. THE COVARIANCE LOSS FIGHTS THE CORRECTION.  cov_loss is ~0.219 of a ~0.678
+     val_loss (32%).  It flows into the shared trunk.  It was best at epoch 42
+     and drifted up while the correction kept improving to epochs 120-932.
+
+  d. WRONG FORM FOR THE ERROR.  The error being removed is attitude leakage.
+     The fitted "bias" doubles from the 30 s fit to the 120 s fit.  A small
+     attitude error dtheta is cancelled EXACTLY by rotating the specific force.
+     The additive head can only approximate that and has to learn the g_body
+     dependence from ~440 windows.
+
+  e. diag_cov_loss had an operator-precedence bug: e^2/2 * sigma^2, which is
+     the NLL upside down.  It is unused, but it was wrong.
+
+  f. LOGGED NUMBERS WERE NOT MEANS (train.py).
+     train_*  = sum over batches (n_win was never incremented).
+     val_*    = true mean x batch size (x6 at 30/60 s, x3 at 120 s).
+     Ratios were always correct.  Absolute metres were not.
+     Verified after the fix: the val output equals the true per-window mean.
+
+-------------------------------------------------------------------------------
+2. WHAT I CHANGED
+-------------------------------------------------------------------------------
+  MODEL (model/hybrid.py, model/cnn.py) -- all opt-in
+    correction_mode: rotate
+        corrected_acc = Exp(dtheta) @ raw_acc + b.  dtheta is a 3-vector per
+        token, NORM-bounded to rotate_max_deg (default 2.0) and zero at init.
+        It reuses the existing accscale_decoder head, so there are no new
+        parameters.  Rodrigues formula, exact, finite gradient at 0.  Gyro
+        stays additive.
+    cov_stop_grad: True
+        The covariance heads read a detached feature.  The NLL then trains
+        only its own heads, not the trunk.
+    causal_cnn: True
+        Left-only padding plus causal token ownership.  Measured lookahead
+        12 frames -> 0.  Token count and shapes are unchanged.
+    WARNING when cov_model is set (see 1a).
+
+  LOSS (model/losses.py, model/loss_func.py)
+    loss_time_power: p   (default 0 = bit-identical)
+        Checkpoint k of K is weighted ((k+1)/K)^p, normalised to mean 1.
+        This puts more weight on the end-point horizons you are scored on.
+    diag_cov_loss precedence fixed.
+
+  LOGGING (train.py)
+    train_* and val_* are now true means.  Compare against old runs by the
+    model/raw RATIO only.
+
+  NEW CONFIG: configs/exp/UAV/tilt_rotate.conf
+    = tilt_aware + correction_mode rotate + cov_stop_grad
+      - the dead cov_model keys
+      max_epoches 4000 -> 300, patience 60 -> 20
+    causal_cnn and loss_time_power are present but OFF, so this stays a
+    two-change arm.
+
+  TESTS: tests/test_model_updates.py (13 tests, CPU, no data needed)
+    python -m pytest tests/test_model_updates.py -q
+    (Chunk 255 is used in the tests only.  pypose 0.9.5 plus a recent torch
+    crashes when chunk+1 is not a power of two.  Your 250 works on your torch.)
+
+-------------------------------------------------------------------------------
+3. WHAT TO RUN
+-------------------------------------------------------------------------------
+  1. Score tilt_aware on the held-out flights FIRST (commands in cmd.txt,
+     --splits inference --per_flight).  This is the baseline tilt_rotate has
+     to beat.
+  2. python train.py --config configs/exp/UAV/tilt_rotate.conf --device cuda:0
+  3. If tilt_rotate wins, try in order, one at a time:
+     loss_time_power: 1.0, then causal_cnn: True, then seed 1 and seed 2.
+===============================================================================

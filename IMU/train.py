@@ -595,6 +595,12 @@ def train(network, loader, confs, epoch, optimizer, ema=None, ema_decay=0.0):
         data = bias_augment(data, confs, confs.get("correct_gyro", True))
         inte_state = network(data, init_state)
         loss_state = get_loss(inte_state, label, confs)
+        # Per-BATCH means are accumulated below, so this counts batches.  It used to be
+        # declared and never incremented, so every train_* column was divided by
+        # max(1, 0) = 1 -- a SUM over ~all batches, not a mean (train_pos_error_60s read
+        # ~33,000 m against ~120 m per window).  Only the final batch can be short, so
+        # the batch mean is the window mean to within that one batch.
+        n_win += 1
 
         # statistics
         losses += loss_state['loss'].item()
@@ -714,9 +720,9 @@ def test(network, loader, confs, epoch=None):
                     for _k in cov_nll:
                         cov_nll[_k] += loss_state['cov_nll_' + _k].item() * bs
 
-            t_range.set_postfix(loss_avg="%9.6f" % (losses / (i + 1)),
-                                pos_err_avg_m="%8.4f" % (pos_losses / (i + 1)),
-                                vel_err_avg_mps="%8.4f" % (vel_losses / (i + 1)),
+            t_range.set_postfix(loss_avg="%9.6f" % (losses / n_win),
+                                pos_err_avg_m="%8.4f" % (pos_losses / n_win),
+                                vel_err_avg_mps="%8.4f" % (vel_losses / n_win),
                                 refresh=False)
             t_range.refresh()
 
@@ -725,16 +731,21 @@ def test(network, loader, confs, epoch=None):
         if gyro_covs:
             gyro_covs = torch.cat(gyro_covs)
 
-    out = {"loss": (losses/(i+1)), "pos_loss":(pos_losses/(i+1)), "vel_loss":(vel_losses/(i+1)),
-           **{k: v/(i+1) for k, v in acc.items()},
-           "pred_cov_rot": (pred_cov_rot/(i+1)), "pred_cov_vel": (pred_cov_vel/(i+1)), "pred_cov_pos": (pred_cov_pos/(i+1)),
+    # Every accumulator above is SUM(batch_mean * bs), so the window mean is / n_win.
+    # It used to be / (i+1) -- the batch COUNT -- which multiplied every val column by
+    # the mean batch size: x6 at 30/60 s and x3 at 120 s with batch_size 6 (e.g. the
+    # 60 s raw baseline logged 738.1 m for a true 123.0 m).  Ratios were unaffected.
+    n_win = max(1, n_win)
+    out = {"loss": (losses/n_win), "pos_loss":(pos_losses/n_win), "vel_loss":(vel_losses/n_win),
+           **{k: v/n_win for k, v in acc.items()},
+           "pred_cov_rot": (pred_cov_rot/n_win), "pred_cov_vel": (pred_cov_vel/n_win), "pred_cov_pos": (pred_cov_pos/n_win),
            "acc_covs": acc_covs, "gyro_covs": gyro_covs,
-           "cov_loss": (cov_loss_sum/(i+1)) if confs.get("propcov", False) else None,
-           "cov_nll_rot": (cov_nll['rot']/(i+1)) if confs.get("propcov", False) else None,
-           "cov_nll_vel": (cov_nll['vel']/(i+1)) if confs.get("propcov", False) else None,
-           "cov_nll_pos": (cov_nll['pos']/(i+1)) if confs.get("propcov", False) else None}
+           "cov_loss": (cov_loss_sum/n_win) if confs.get("propcov", False) else None,
+           "cov_nll_rot": (cov_nll['rot']/n_win) if confs.get("propcov", False) else None,
+           "cov_nll_vel": (cov_nll['vel']/n_win) if confs.get("propcov", False) else None,
+           "cov_nll_pos": (cov_nll['pos']/n_win) if confs.get("propcov", False) else None}
     if use_rot_loss:
-        out["rot_loss"] = (rot_losses/(i+1))
+        out["rot_loss"] = (rot_losses/n_win)
     return out
 
 

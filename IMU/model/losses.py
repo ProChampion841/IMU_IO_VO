@@ -250,6 +250,25 @@ def get_loss(inte_state, data, confs):
     _REF_DELTA = {"Huber_loss005": 0.005, "Huber_loss05": 0.05, "L1": 1.0}
     _ref = _REF_DELTA.get(confs.loss)
 
+    # HORIZON WEIGHTING -- `loss_time_power: p` (default 0 = uniform, bit-identical).
+    #
+    # Checkpoint k of K (every `sampling` frames) is weighted ((k+1)/K)^p, normalised
+    # to mean 1 so the loss scale -- and with it lr, the channel weights and the Huber
+    # normalisation above -- keeps its meaning.  p = 1 gives the last checkpoint 2x
+    # the average weight and the first ~0.
+    #
+    # WHY.  Every number this project is judged on is an END-POINT error at 30/60/120 s,
+    # while the objective spreads its weight evenly over 120 checkpoints from 0.5 s to
+    # 60 s.  The error being removed is attitude leakage, which grows with elapsed time,
+    # so the early checkpoints carry almost none of it.  MEASURED on the tilt_aware run:
+    # val 120 s kept improving at the LR floor (-0.0018 per 100 epochs) while 30/60 s
+    # stayed flat, i.e. the long-horizon signal is what is still being learned.
+    _tp = float(confs.get("loss_time_power", 0.0))
+
+    def _time_w(K, ref):
+        w = torch.arange(1, K + 1, dtype=ref.dtype, device=ref.device).div(K).pow(_tp)
+        return (w / w.mean()).view(1, K, 1)
+
     def _huber(delta):
         delta = float(delta)
         if _ref is None:
@@ -258,10 +277,17 @@ def get_loss(inte_state, data, confs):
                 "normalise against, and `loss: %s` is not in %s. Either use one of those "
                 "losses or drop the delta keys." % (confs.loss, sorted(_REF_DELTA)))
         k = _ref / delta
-        return lambda d: Huber(d, delta=delta) * k
+        if not _tp:
+            return lambda d: Huber(d, delta=delta) * k
+        return lambda d: (torch.nn.functional.huber_loss(
+            d, torch.zeros_like(d), delta=delta, reduction="none")
+            * _time_w(d.shape[1], d)).mean() * k
 
     _pd = confs.get("pos_huber_delta", None)
     _vd = confs.get("vel_huber_delta", None)
+    if _tp and not (_pd and _vd):
+        raise KeyError("loss_time_power needs pos_huber_delta and vel_huber_delta set "
+                       "(it is implemented on the normalised Huber path only).")
     _pos_fc = _huber(_pd) if _pd else loss_fc
     _vel_fc = _huber(_vd) if _vd else loss_fc
 
