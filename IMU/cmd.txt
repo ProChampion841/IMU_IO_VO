@@ -75,3 +75,25 @@ python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_aware.conf ^
 python -m tools.eval_vel_horizons --config configs/exp/UAV/accel_const.conf ^
   --ckpt experiments/UAV/accel_const/ckpt/best_model.ckpt ^
   --splits inference --nested --horizons 12000 --per_flight
+
+
+:: ---------------------------------------------------------------- 2026-09-30
+:: tilt_rotate: train, then the 30 s / 1 / 2 / 3 / 4 / 5 min summary table
+:: (vel_rmse, vel_max_error, dir_rmse, dir_max_error, pos_error).
+python train.py --config configs/exp/UAV/tilt_rotate.conf --device cuda:0
+
+:: which held-out flights are long enough for each horizon (no model needed)
+python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_rotate.conf ^
+  --splits inference --horizons 3000 6000 12000 18000 24000 30000 --check
+
+:: growth curve: every horizon a prefix of the same 5 min windows
+python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_rotate.conf ^
+  --ckpt experiments/UAV/tilt_rotate/ckpt/best_model.ckpt ^
+  --splits inference --nested --horizons 3000 6000 12000 18000 24000 30000 ^
+  --batch_size 4 --out tilt_rotate_horizons.csv
+
+:: each horizon on all flights long enough for it (more windows at short horizons)
+python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_rotate.conf ^
+  --ckpt experiments/UAV/tilt_rotate/ckpt/best_model.ckpt ^
+  --splits inference --horizons 3000 6000 12000 18000 24000 30000 ^
+  --batch_size 4 --out tilt_rotate_horizons_all.csv

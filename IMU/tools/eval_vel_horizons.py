@@ -333,6 +333,7 @@ def run_split(network, conf, section, horizon, device, batch_size, collate_fn,
     # keyed (arm, channel) so the model and raw arms cannot drift apart
     sq = {(a, c): 0.0 for a in ("model", "raw") for c, _, _ in REPORT}
     mx = dict.fromkeys(sq, 0.0)
+    sm = dict.fromkeys(sq, 0.0)        # plain sum -> MEAN error at the horizon
     n = 0
     with torch.no_grad():
         for data, init_state, label in loader:
@@ -356,6 +357,7 @@ def run_split(network, conf, section, horizon, device, batch_size, collate_fn,
                 for ch, _, _ in REPORT:
                     e = ser[ch][:, i]
                     sq[(arm, ch)] += float(e.pow(2).sum())
+                    sm[(arm, ch)] += float(e.sum())
                     mx[(arm, ch)] = max(mx[(arm, ch)],
                                         float(ser[ch][:, :i + 1].max()))
             n += int(out["vel"].shape[0])
@@ -365,8 +367,10 @@ def run_split(network, conf, section, horizon, device, batch_size, collate_fn,
     for ch, _, _ in REPORT:
         res["%s_rmse" % ch] = (sq[("model", ch)] / n) ** 0.5
         res["%s_max" % ch] = mx[("model", ch)]
+        res["%s_mean" % ch] = sm[("model", ch)] / n
         res["raw_%s_rmse" % ch] = (sq[("raw", ch)] / n) ** 0.5
         res["raw_%s_max" % ch] = mx[("raw", ch)]
+        res["raw_%s_mean" % ch] = sm[("raw", ch)] / n
     return res
 
 
@@ -417,6 +421,7 @@ def run_split_nested(network, conf, section, horizons, device, batch_size, colla
 
     sq = {(a, c, h): 0.0 for a in ("model", "raw") for c, _, _ in REPORT for h in horizons}
     mx = dict.fromkeys(sq, 0.0)
+    sm = dict.fromkeys(sq, 0.0)        # plain sum -> MEAN error at the horizon
     # grew[h_prev, h] counts windows whose MODEL error rose from one horizon to the
     # next -- the monotonicity claim, measured rather than assumed.
     order = sorted(horizons)
@@ -450,6 +455,7 @@ def run_split_nested(network, conf, section, horizons, device, batch_size, colla
                         per[(arm, ch, h)] = e
                         pk[(arm, ch, h)] = q
                         sq[(arm, ch, h)] += float(e.pow(2).sum())
+                        sm[(arm, ch, h)] += float(e.sum())
                         mx[(arm, ch, h)] = max(mx[(arm, ch, h)], float(q.max()))
             for ch, _, _ in REPORT:
                 for a, b in zip(order, order[1:]):
@@ -478,14 +484,45 @@ def run_split_nested(network, conf, section, horizons, device, batch_size, colla
         for ch, _, _ in REPORT:
             res["%s_rmse" % ch] = (sq[("model", ch, h)] / n) ** 0.5
             res["%s_max" % ch] = mx[("model", ch, h)]
+            res["%s_mean" % ch] = sm[("model", ch, h)] / n
             res["raw_%s_rmse" % ch] = (sq[("raw", ch, h)] / n) ** 0.5
             res["raw_%s_max" % ch] = mx[("raw", ch, h)]
+            res["raw_%s_mean" % ch] = sm[("raw", ch, h)] / n
         rows.append(res)
     mono = {}
     for ch, _, _ in REPORT:
         for a, b in zip(order, order[1:]):
             mono[(ch, a, b)] = grew[(ch, a, b)] / float(n)
     return rows, mono
+
+
+# The five numbers asked for per horizon, under the names used in reports:
+#   vel_rmse       RMS over windows of ||v_pred - v_gt|| AT the horizon      m/s
+#   vel_max_error  worst ||v_pred - v_gt|| at ANY frame in [0, T]            m/s
+#   dir_rmse       RMS over windows of the velocity-DIRECTION angle AT T     deg
+#   dir_max_error  worst direction angle at any frame in [0, T]              deg
+#   pos_error      MEAN over windows of ||p_pred - p_gt|| AT the horizon     m
+# pos_error is the mean, not the RMS, so it is the same statistic train.py logs
+# as val_pos_error_*; pos RMSE and max stay in the POS table above.
+SUMMARY = (("vel_rmse", "vel_rmse"), ("vel_max_error", "vel_max"),
+           ("dir_rmse", "vel_dir_rmse"), ("dir_max_error", "vel_dir_max"),
+           ("pos_error", "pos_mean"))
+
+
+def print_summary(rows):
+    print("\n=== SUMMARY -- model (raw in brackets; ratio = model/raw, <1 is better) ===")
+    print("%-9s %-7s %6s | %s" % ("split", "horizon", "wins",
+                                 " | ".join("%-22s" % n for n, _ in SUMMARY)))
+    print("-" * (26 + 25 * len(SUMMARY)))
+    for r in rows:
+        cells = []
+        for _, k in SUMMARY:
+            m, raw = r[k], r["raw_" + k]
+            cells.append("%8.3f (%8.3f) %4.2f" % (m, raw, m / max(raw, 1e-12)))
+        print("%-9s %-7s %6d | %s" % (r["split"], r["tag"], r["windows"],
+                                     " | ".join("%-22s" % c for c in cells)))
+    print("units: vel m/s, dir deg, pos m.  *_rmse / pos_error are AT the horizon;")
+    print("*_max_error is the worst frame anywhere inside [0, T].")
 
 
 def main():
@@ -620,6 +657,7 @@ def main():
                      r["raw_%s_rmse" % ch], r["raw_%s_max" % ch],
                      r[ch + "_rmse"] / max(r["raw_%s_rmse" % ch], 1e-12),
                      r[ch + "_max"] / max(r["raw_%s_max" % ch], 1e-12)))
+    print_summary(rows)
     if a.max_flights or a.max_windows:
         print("\n*** SMOKE RUN -- max_flights=%s max_windows=%s.  A plumbing check, NOT\n"
               "*** a result: computed on a subset that represents no split."
@@ -685,8 +723,8 @@ def main():
             if a.nested:
                 fields.append("nested_from")
             for ch, _, _ in REPORT:
-                fields += ["%s_rmse" % ch, "%s_max" % ch,
-                           "raw_%s_rmse" % ch, "raw_%s_max" % ch]
+                fields += ["%s_rmse" % ch, "%s_max" % ch, "%s_mean" % ch,
+                           "raw_%s_rmse" % ch, "raw_%s_max" % ch, "raw_%s_mean" % ch]
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
             for r in rows:
