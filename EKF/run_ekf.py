@@ -61,7 +61,10 @@ def vo_for_flight(a, cfg, flight, win):
     key = path
     if key not in a._vo_cache:
         a._vo_cache[key] = load_vo_csv(path, frame=vc["frame"], time_offset=vc["time_offset_s"],
-                                       var_scale=vc["var_scale"], min_std=vc["min_std"])
+                                       var_scale=vc["var_scale"], min_std=vc["min_std"],
+                                       min_interval_s=vc.get("min_interval_s", 0.5),
+                                       fresh_only=vc.get("fresh_only", True))
+        print("  [vo] %s" % a._vo_cache[key].source)
     return a._vo_cache[key]
 
 

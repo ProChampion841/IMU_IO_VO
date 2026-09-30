@@ -29,12 +29,15 @@
     "time_offset_s": 0.0,
     "var_scale": 4.0,
     "min_std": 0.05,
-    "lever_arm_m": [0.0, 0.0, 0.0]
+    "lever_arm_m": [0.0, 0.0, 0.0],
+    "_cadence": "VO gives one new image pair per 500 ms (frame_gap 10) but writes a row every telemetry tick. fresh_only keeps one row per pair: visual_age == 0 / visual_present == 1 if the CSV has it, else one row per min_interval_s.",
+    "fresh_only": true,
+    "min_interval_s": 0.5
   },
 
   "vo_sim": {
     "_comment": "Only for --vo_sim.  null stds = split the measured VO RMSE [3.5, 2.7, 0.95] m/s between white noise and a slow Gauss-Markov error.",
-    "rate_hz": 10.0,
+    "rate_hz": 2.0,
     "white_std": null,
     "bias_std": null,
     "tau_s": 20.0,

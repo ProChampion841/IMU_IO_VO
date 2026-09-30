@@ -26,17 +26,22 @@ def flight(tmp_path_factory):
     df["AcclX"] += ramp
     df.to_csv(path, index=False)
     # VO predictions in the VO model's own contract: body FRD + log variance
+    # Like the real VO: a row on every telemetry tick (20 Hz here), but a NEW image
+    # pair only every 0.5 s (frame_gap 10); in between the same error is held and
+    # visual_age counts the ticks since the pair.
     rng = np.random.default_rng(0)
-    t = df["Time"].to_numpy()[::10]
-    R_ned = so3.euler_zyx(df["GPSNavEulZ"].to_numpy()[::10], df["GPSNavEulY"].to_numpy()[::10],
-                          df["GPSNavEulX"].to_numpy()[::10])
-    v_ned = df[["GPSNavVnX", "GPSNavVnY", "GPSNavVnZ"]].to_numpy()[::10]
-    v_frd = np.einsum("nji,nj->ni", R_ned, v_ned) + rng.standard_normal((len(t), 3)) * [0.5, 0.5, 0.2]
+    t = df["Time"].to_numpy()[::5]
+    R_ned = so3.euler_zyx(df["GPSNavEulZ"].to_numpy()[::5], df["GPSNavEulY"].to_numpy()[::5],
+                          df["GPSNavEulX"].to_numpy()[::5])
+    v_ned = df[["GPSNavVnX", "GPSNavVnY", "GPSNavVnZ"]].to_numpy()[::5]
+    age = np.arange(len(t)) % 10
+    err = np.repeat(rng.standard_normal((len(t) // 10 + 1, 3)), 10, axis=0)[:len(t)]
+    v_frd = np.einsum("nji,nj->ni", R_ned, v_ned) + err * [0.5, 0.5, 0.2]
     lv = np.log(np.tile(np.array([0.5, 0.5, 0.2]) ** 2, (len(t), 1)))
     vo = pd.DataFrame({"time": t, "body_velocity_m_s_x": v_frd[:, 0],
                        "body_velocity_m_s_y": v_frd[:, 1], "body_velocity_m_s_z": v_frd[:, 2],
                        "velocity_log_variance_x": lv[:, 0], "velocity_log_variance_y": lv[:, 1],
-                       "velocity_log_variance_z": lv[:, 2]})
+                       "velocity_log_variance_z": lv[:, 2], "visual_age": age})
     vo_path = str(d / "2099_02_02_1_1_sensor_data_vo.csv")
     vo.to_csv(vo_path, index=False)
     cfg = str(d / "ekf.json")
@@ -59,6 +64,8 @@ def test_vo_csv_ekf_beats_imu_only(flight):
     assert r["ekf"]["pos_error"] < r["imu"]["pos_error"]
     assert r["ekf"]["vel_rmse"] < r["imu"]["vel_rmse"]
     assert r["ekf"]["vel_rmse"] < 0.5                 # VO noise 0.5 m/s, filtered
+    # only the fresh rows (one per 0.5 s) were used: 60 s window -> ~120 per window
+    assert all(100 <= row["vo_samples"] <= 125 for row in rows)
     assert os.listdir(str(flight["dir"] / "plots"))
     assert os.path.getsize(str(flight["dir"] / "traj.npz")) > 0
 

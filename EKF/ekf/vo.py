@@ -6,12 +6,25 @@ VO OUTPUT CONTRACT (VO/logs/input_contract.json)
                                        (VO's NLL is 0.5*(r^2 exp(-lv) + lv))
 The label VO is trained on is  v_body = R_GPSNavEul^T v_NED,  i.e. FRD.
 
+VO CADENCE (VO/src/vio/data/image_pairs.py).  One visual measurement is an image PAIR
+(i, i + frame_gap); it is delivered at the first telemetry tick after
+exposure_t1 + deployment_latency_s.  The VO network then writes a velocity on EVERY
+telemetry tick, holding the latest visual token between pairs.  With frame_gap 10
+and one inference per 500 ms, only ONE ROW PER 0.5 s carries new image information;
+the rows in between are the same token re-read with fresh telemetry.  Feeding every
+row to a Kalman filter counts one image many times and makes it over-confident, so
+the loader keeps only the fresh rows:
+    visual_age == 0  (or visual_present == 1) when the CSV has that column,
+    otherwise one row per `min_interval_s` (default 0.5 s).
+
 CSV this module reads -- one row per VO output, any extra columns ignored:
     time                   seconds, SAME clock as the IMU log's `Time`
                            (aliases: Time, time_s, t)
     vx, vy, vz             aliases: body_velocity_m_s_x/y/z
     logvar_x/y/z           optional; aliases: velocity_log_variance_x/y/z
                            or var_x/y/z (variance) or std_x/y/z (m/s)
+    visual_age             optional; ticks since the last image pair (0 = fresh)
+                           alias: visual_present (1 = fresh)
 Frame is FRD unless told otherwise (`frame="flu"`).  Everything is returned in
 body FLU, the frame the EKF runs in: FRD -> FLU flips y and z; variances do not
 change.
@@ -69,12 +82,14 @@ def _pick(header, groups):
 
 
 def load_vo_csv(path, frame="frd", time_offset=0.0, default_std=None, var_scale=1.0,
-                min_std=0.05):
+                min_std=0.05, min_interval_s=0.5, fresh_only=True):
     """Read a VO prediction CSV -> VOStream in body FLU.
 
     time_offset is ADDED to the VO time to put it on the IMU clock.
     var_scale inflates the VO variance (VO errors are time-correlated, which a
     per-sample variance does not describe; >1 is the usual fix).
+    fresh_only keeps one row per image pair (see VO CADENCE above); min_interval_s
+    is the pair period used when the file has no visual_age / visual_present.
     """
     with open(path, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
@@ -105,14 +120,32 @@ def load_vo_csv(path, frame="frd", time_offset=0.0, default_std=None, var_scale=
     elif frame.lower() != "flu":
         raise ValueError("frame must be 'frd' or 'flu'")
     ok = np.isfinite(t) & np.isfinite(v).all(1) & np.isfinite(var).all(1)
-    return VOStream(t[ok], v[ok], var[ok], "csv:%s" % path)
+    how = "all rows"
+    if fresh_only:
+        if "visual_age" in header:
+            ok &= np.array([float(r["visual_age"]) == 0 for r in rows])
+            how = "visual_age == 0"
+        elif "visual_present" in header:
+            ok &= np.array([float(r["visual_present"]) > 0.5 for r in rows])
+            how = "visual_present == 1"
+        elif min_interval_s and min_interval_s > 0:
+            keep = np.zeros(len(t), bool)
+            last = -np.inf
+            for i in np.argsort(t):
+                if ok[i] and t[i] - last >= min_interval_s - 1e-6:
+                    keep[i], last = True, t[i]
+            ok &= keep
+            how = "one row per %g s" % min_interval_s
+    return VOStream(t[ok], v[ok], var[ok], "csv:%s (%s, %d of %d rows)"
+                    % (path, how, int(ok.sum()), len(t)))
 
 
-def simulate_vo(t, R, v_world, rate_hz=10.0, white_std=None, bias_std=None,
+def simulate_vo(t, R, v_world, rate_hz=2.0, white_std=None, bias_std=None,
                 tau_s=20.0, seed=0, var_scale=1.0):
     """SIMULATED VO from ground truth -- for testing the filter, NOT a result.
 
-    Body-FLU truth R^T v, sampled at rate_hz, plus
+    Body-FLU truth R^T v, sampled at rate_hz (default 2 Hz: one image pair per
+    500 ms, frame_gap 10), plus
         white noise   N(0, white_std^2) per sample
         a slow error  first-order Gauss-Markov (time constant tau_s, std bias_std)
     The slow part is there on purpose: real VO error is strongly time-correlated,
