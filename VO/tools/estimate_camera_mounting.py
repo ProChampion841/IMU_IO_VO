@@ -130,24 +130,38 @@ def circular_median_degrees(angles: np.ndarray) -> float:
     return float(mean + np.median(wrap_degrees(np.asarray(angles) - mean)))
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
-    root = args.dataset.expanduser().resolve()
-    csv_path = root / args.csv_name
-    attitude = load_attitude_altitude(
-        csv_path, time_column=args.time_column, time_scale=args.time_scale,
-        altitude_column=args.altitude_column,
-    )
-    times, velocity_body = reference_body_velocity(
-        csv_path, time_column=args.time_column, time_scale=args.time_scale
-    )
-    calibration = load_camera_calibration(args.calibration)
-    image_size = (int(args.image_size[0]), int(args.image_size[1]))
+def estimate_mounting(
+    root: Path,
+    *,
+    attitude,
+    times: np.ndarray,
+    velocity_body: np.ndarray,
+    calibration,
+    image_size: Sequence[int],
+    image_folder: str = "images",
+    image_time_offset=0.0,
+    frame_gap: int = 6,
+    pairs: int = 300,
+    max_rotation_deg: float = 5.0,
+    min_speed: float = 8.0,
+    min_response: float = 0.05,
+    crop: float = 0.6,
+) -> Dict[str, object]:
+    """The measurement behind this tool, callable from the trainer.
+
+    Returns the report dict :func:`main` prints and writes: the best nadir
+    mounting, its residual yaw misalignment, the measured/predicted motion
+    ratio, and the refined ``camera_from_body`` matrix.
+    """
+
+    import cv2
+
+    image_size = (int(image_size[0]), int(image_size[1]))
     source = VisualPairSource(
         root, attitude.times_s,
-        image_folder=args.image_folder,
-        image_time_offset_s=float(args.image_time_offset),
-        frame_gap=int(args.frame_gap),
+        image_folder=image_folder,
+        image_time_offset_s=image_time_offset,
+        frame_gap=int(frame_gap),
         image_size=image_size,
         grayscale=True,
         camera_matrix=calibration.camera_matrix,
@@ -161,14 +175,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     total = int(plan.ready_tick.size)
     if total == 0:
         raise SystemExit("no image pairs overlap the telemetry")
-    events = np.unique(np.linspace(0, total - 1, min(args.pairs, total)).round().astype(np.int64))
+    events = np.unique(np.linspace(0, total - 1, min(pairs, total)).round().astype(np.int64))
 
     names = sorted(NADIR_MOUNTINGS)
     matrices = {name: np.asarray(NADIR_MOUNTINGS[name], dtype=np.float64) for name in names}
     inverse = np.linalg.inv(working)
     height_px, width_px = image_size
-    crop_h = max(int(height_px * args.crop) // 2 * 2, 16)
-    crop_w = max(int(width_px * args.crop) // 2 * 2, 16)
+    crop_h = max(int(height_px * crop) // 2 * 2, 16)
+    crop_w = max(int(width_px * crop) // 2 * 2, 16)
     top = (height_px - crop_h) // 2
     left = (width_px - crop_w) // 2
     # Normalized coordinate of the crop centre: the prediction is made there.
@@ -177,20 +191,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     measured: Dict[str, List[np.ndarray]] = {name: [] for name in names}
     predicted: Dict[str, List[np.ndarray]] = {name: [] for name in names}
     skipped = {"rotation": 0, "speed": 0, "response": 0}
-    import cv2
-
     for event in events:
         t0 = float(plan.exposure_t0_s[event])
         t1 = float(plan.exposure_t1_s[event])
         geometry = pair_geometry(attitude, t0, t1)
         rotation = geometry["relative_rotation"].astype(np.float64)
         angle = math.degrees(math.acos(max(-1.0, min(1.0, (np.trace(rotation) - 1.0) / 2.0))))
-        if angle > args.max_rotation_deg:
+        if angle > max_rotation_deg:
             skipped["rotation"] += 1
             continue
         mid = 0.5 * (t0 + t1)
         velocity = np.array([np.interp(mid, times, velocity_body[:, k]) for k in range(3)])
-        if float(np.hypot(velocity[0], velocity[1])) < args.min_speed:
+        if float(np.hypot(velocity[0], velocity[1])) < min_speed:
             skipped["speed"] += 1
             continue
         first, second = source.load_pair(int(event))
@@ -221,7 +233,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             denominator = max(1.0 - s_centre * u[2], 0.05)
             shift = s_centre * (u[2] * centre[:2] - u[:2]) / denominator
             results[name] = (np.array([dx / working[0, 0], dy / working[1, 1]]), shift, response)
-        if max(r[2] for r in results.values()) < args.min_response:
+        if max(r[2] for r in results.values()) < min_response:
             skipped["response"] += 1
             continue
         for name, (shift_measured, shift_predicted, _) in results.items():
@@ -258,11 +270,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     refined = about_optical_axis @ best_matrix
     spread = float(np.median(np.abs(wrap_degrees(offsets - misalignment))))
 
-    report = {
+    return {
         "dataset": str(root),
         "pairs_used": int(used),
         "pairs_skipped": skipped,
-        "frame_gap": int(args.frame_gap),
+        "frame_gap": int(frame_gap),
         "best_mounting": best,
         "relative_error_per_mounting": scores,
         "yaw_misalignment_deg": misalignment,
@@ -271,6 +283,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "scale_ratio_p25_p75": [float(np.percentile(ratio, 25)), float(np.percentile(ratio, 75))],
         "camera_from_body": refined.round(6).tolist(),
     }
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    root = args.dataset.expanduser().resolve()
+    csv_path = root / args.csv_name
+    attitude = load_attitude_altitude(
+        csv_path, time_column=args.time_column, time_scale=args.time_scale,
+        altitude_column=args.altitude_column,
+    )
+    times, velocity_body = reference_body_velocity(
+        csv_path, time_column=args.time_column, time_scale=args.time_scale
+    )
+    report = estimate_mounting(
+        root,
+        attitude=attitude,
+        times=times,
+        velocity_body=velocity_body,
+        calibration=load_camera_calibration(args.calibration),
+        image_size=args.image_size,
+        image_folder=args.image_folder,
+        image_time_offset=float(args.image_time_offset),
+        frame_gap=args.frame_gap,
+        pairs=args.pairs,
+        max_rotation_deg=args.max_rotation_deg,
+        min_speed=args.min_speed,
+        min_response=args.min_response,
+        crop=args.crop,
+    )
+    used = report["pairs_used"]
+    skipped = report["pairs_skipped"]
+    best = report["best_mounting"]
+    scores = report["relative_error_per_mounting"]
+    misalignment = report["yaw_misalignment_deg"]
+    spread = report["direction_spread_deg"]
+    refined = np.asarray(report["camera_from_body"])
     print(f"pairs used {used} (skipped {skipped})")
     print(f"best nadir mounting: {best}  (median relative error per mounting: "
           + ", ".join(f"{k} {v:.2f}" for k, v in sorted(scores.items())) + ")")

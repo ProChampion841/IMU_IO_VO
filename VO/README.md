@@ -294,7 +294,13 @@ swaps or negates the forward and lateral axes - so do not guess it. Its
 if it is not, fix the altitude column, the focal length or the image time
 offset before training.
 
-The planar-specific commands are the "200 m" section of
+`--frontend planar` needs no other flag: it sets `--frame-gap` to the frames
+in `--planar-baseline-s` (1.0 s: 20 at 20 Hz), caps the pair interval at 1.5x
+that, sets `--warmup` past the first pair's arrival, uses radius 3 and the
+`simple` loss, and - when neither `--camera-mounting` nor the calibration
+gives a mounting - measures the mounting from the training images at
+start-up. Every value it chose is printed and recorded in the checkpoint;
+any flag given explicitly wins. The commands are the "200 m" section of
 [`commands.txt`](commands.txt). `--color` loads RGB frames for a colour
 camera, and `--photometric-augment 0.15` jitters exposure between the two
 frames of a pair during training, as an auto-exposure camera does.

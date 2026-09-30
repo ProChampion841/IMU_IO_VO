@@ -337,7 +337,13 @@ def build_parser() -> argparse.ArgumentParser:
     window = parser.add_argument_group("windows")
     window.add_argument("--window-length", type=int, default=600)
     window.add_argument("--stride", type=int, default=300)
-    window.add_argument("--warmup", type=int, default=20)
+    window.add_argument(
+        "--warmup", type=int, default=None,
+        help="Ticks at the start of every window left out of the loss (a "
+             "window is a cold start). Default 20 for the original frontend; "
+             "for --frontend planar, the ticks before a window's first image "
+             "pair can arrive (pair interval + deployment latency) plus 5.",
+    )
     window.add_argument(
         "--max-visual-events", type=int, default=120,
         help="Image pairs carried per window. A 600-tick window is 6 s, which "
@@ -346,7 +352,21 @@ def build_parser() -> argparse.ArgumentParser:
              "Checkpointing makes this nearly free in memory - see "
              "--frontend-chunk.",
     )
-    window.add_argument("--frame-gap", type=int, default=1)
+    window.add_argument(
+        "--frame-gap", type=int, default=None,
+        help="Frames between the two images of a pair. Default 1 for the "
+             "original frontend; for --frontend planar, however many frames "
+             "span --planar-baseline-s (1.0 s) at this capture's median frame "
+             "rate - 20 at 20 Hz. tools/check_motion_budget.py shows what each "
+             "gap buys.",
+    )
+    window.add_argument(
+        "--planar-baseline-s", type=float, default=1.0,
+        help="Time between the two images of a pair that the planar default "
+             "--frame-gap aims for (default 1.0 s: about 13 cells of ground "
+             "motion at 200 m and 20 m/s, 1 percent single-pair precision, "
+             "80-90 percent image overlap).",
+    )
     window.add_argument("--deployment-latency-s", type=float, default=0.35)
     window.add_argument(
         "--max-frame-gap-s", type=float, default=None,
@@ -355,8 +375,9 @@ def build_parser() -> argparse.ArgumentParser:
              "apart in time; across that gap the true displacement leaves the "
              "correlator's bounded search window, so what comes back is a "
              "confident wrong match rather than a large one. Unset means every "
-             "pair is kept however long its interval. About 3x the nominal "
-             "frame interval is a reasonable starting point.",
+             "pair is kept however long its interval for the original "
+             "frontend, and 1.5x the nominal pair interval for --frontend "
+             "planar.",
     )
     window.add_argument(
         "--image-time-offset", type=float, default=0.0,
@@ -405,7 +426,12 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument("--patch-size", type=int, default=8)
     model.add_argument("--context-grid", type=int, nargs=2, default=(12, 16))
     model.add_argument("--token-grid", type=int, default=6)
-    model.add_argument("--correlation-radius", type=int, default=4)
+    model.add_argument(
+        "--correlation-radius", type=int, default=None,
+        help="Correlation search radius in cells. Default 4 for the original "
+             "frontend, 3 for --frontend planar (its search is already centred "
+             "on the predicted motion).",
+    )
     model.add_argument("--aiding-dim", type=int, default=64)
     model.add_argument("--fusion-dim", type=int, default=96)
     model.add_argument("--dropout", type=float, default=0.1)
@@ -505,14 +531,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     planar = parser.add_argument_group("planar frontend (--frontend planar)")
     planar.add_argument(
-        "--camera-mounting", default=None, metavar="NAME|MATRIX|FILE",
+        "--camera-mounting", default=None, metavar="NAME|MATRIX|FILE|auto",
         help="Camera-to-body rotation. One of top_forward, right_forward, "
              "left_forward, bottom_forward (which image edge faces the nose, "
              "optical axis straight down); or a 3x3 camera_from_body matrix as "
              "JSON; or a JSON file with a camera_from_body key (the output of "
-             "tools/estimate_camera_mounting.py). Default: the calibration "
-             "file's mounting.camera_from_body. Required for --frontend planar: "
-             "a wrong one swaps or negates the forward and lateral axes.",
+             "tools/estimate_camera_mounting.py); or 'auto' to measure it from "
+             "the training images at start-up. Default: the calibration file's "
+             "mounting.camera_from_body, and 'auto' when it has none. A wrong "
+             "mounting swaps or negates the forward and lateral axes.",
     )
     planar.add_argument(
         "--prior-velocity", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
@@ -575,8 +602,10 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--grad-clip", type=float, default=1.0)
     train.add_argument("--direction-weight", type=float, default=0.5)
     train.add_argument(
-        "--velocity-loss", choices=("nll", "simple"), default="nll",
-        help="'nll' (default) is the Gaussian NLL plus von Mises-Fisher "
+        "--velocity-loss", choices=("nll", "simple"), default=None,
+        help="Default 'nll' for the original frontend and 'simple' for "
+             "--frontend planar. "
+             "'nll' is the Gaussian NLL plus von Mises-Fisher "
              "direction term, with learned variance and concentration. "
              "'simple' is deterministic Smooth L1 on velocity plus a FIXED "
              "cosine direction term, with no uncertainty heads in the loss at "
@@ -928,9 +957,131 @@ def parse_camera_mounting(value: Any) -> List[List[float]]:
         raise SystemExit(f"invalid camera mounting {value!r}: {error}") from error
 
 
-def resolve_camera_mounting(args: argparse.Namespace) -> Optional[List[List[float]]]:
-    """``--camera-mounting``, else the calibration's mounting, else None."""
+def resolve_frontend_defaults(
+    args: argparse.Namespace, *, frame_interval_s: float, tick_interval_s: float
+) -> List[str]:
+    """Fill the flags whose right value depends on the frontend.
 
+    The original frontend keeps its historical defaults exactly (frame gap 1,
+    warmup 20, radius 4, NLL loss, no pair-interval cap), so every older
+    command line means what it always meant. The planar frontend gets the
+    values its geometry needs, derived from THIS capture's clocks:
+
+    * ``--frame-gap``: the frames spanning ``--planar-baseline-s`` at the
+      median frame interval (20 at 20 Hz for 1 s);
+    * ``--max-frame-gap-s``: 1.5x that pair interval, so a dropped frame's
+      doubled interval is refused rather than matched outside the window;
+    * ``--warmup``: the ticks before a window's first pair can arrive (pair
+      interval + deployment latency) plus 5 - earlier ticks are blind;
+    * ``--correlation-radius`` 3 and ``--velocity-loss simple``.
+
+    Anything given on the command line is left alone. Mutates ``args`` - so
+    the checkpoint, the fingerprint and the evaluator all see the resolved
+    values - and returns one log line per value it chose.
+    """
+
+    planar = getattr(args, "frontend", "mamba_correlation") == "planar"
+    chosen: List[str] = []
+    usable_clock = frame_interval_s > 0 and math.isfinite(frame_interval_s)
+    if args.frame_gap is None:
+        if planar and usable_clock:
+            args.frame_gap = max(1, int(round(args.planar_baseline_s / frame_interval_s)))
+            chosen.append(
+                f"--frame-gap {args.frame_gap} ({args.frame_gap * frame_interval_s:.2f} s "
+                f"at the capture's {1.0 / frame_interval_s:.1f} Hz)"
+            )
+        else:
+            args.frame_gap = 1
+    if args.max_frame_gap_s is None and planar and usable_clock:
+        args.max_frame_gap_s = round(1.5 * args.frame_gap * frame_interval_s, 3)
+        chosen.append(f"--max-frame-gap-s {args.max_frame_gap_s:g}")
+    if args.warmup is None:
+        if planar and usable_clock and tick_interval_s > 0:
+            # The epsilon keeps 135.00000000000003 ticks from rounding up to 136.
+            blind = math.ceil(
+                (args.deployment_latency_s + args.frame_gap * frame_interval_s) / tick_interval_s
+                - 1e-6
+            )
+            args.warmup = int(blind) + 5
+            chosen.append(f"--warmup {args.warmup} (first pair arrives after ~{blind} ticks)")
+        else:
+            args.warmup = 20
+    if args.correlation_radius is None:
+        args.correlation_radius = 3 if planar else 4
+        if planar:
+            chosen.append("--correlation-radius 3")
+    if args.velocity_loss is None:
+        args.velocity_loss = "simple" if planar else "nll"
+        if planar:
+            chosen.append("--velocity-loss simple")
+    return chosen
+
+
+def auto_camera_mounting(
+    args: argparse.Namespace,
+    world: "Distributed",
+    calibration,
+    root: Path,
+    image_time_offset,
+    frame_interval_s: float,
+) -> List[List[float]]:
+    """Measure the camera mounting from the training images at start-up.
+
+    The same measurement as ``tools/estimate_camera_mounting.py`` (its
+    reference velocity is read only as a yardstick, never as a model input).
+    Deterministic, so every rank - and a resume - arrives at the same matrix.
+    """
+
+    from tools.estimate_camera_mounting import estimate_mounting
+    from vio.data.attitude import load_attitude_altitude
+
+    csv_path = root / args.csv_name
+    attitude = load_attitude_altitude(
+        csv_path, time_column=args.time_column, time_scale=args.time_scale,
+        attitude_columns=args.attitude_columns, altitude_column=args.altitude_column,
+        allow_reference_attitude=args.allow_reference_attitude,
+    )
+    times, velocity_body = reference_body_frame(
+        csv_path, time_column=args.time_column, time_scale=args.time_scale
+    )[:2]
+    # About 0.3 s between the two frames: enough motion to measure, little
+    # enough rotation that most pairs qualify.
+    gap = max(1, int(round(0.3 / frame_interval_s))) if frame_interval_s > 0 else 6
+    world.log(f"camera mounting: measuring it from {root} (frame gap {gap}) ...")
+    report = estimate_mounting(
+        root,
+        attitude=attitude,
+        times=times,
+        velocity_body=velocity_body,
+        calibration=calibration,
+        image_size=args.image_size,
+        image_folder=args.image_folder,
+        image_time_offset=image_time_offset,
+        frame_gap=gap,
+        pairs=200,
+    )
+    world.log(
+        f"camera mounting: {report['best_mounting']}, misalignment "
+        f"{report['yaw_misalignment_deg']:+.2f} deg, measured/predicted motion "
+        f"{report['scale_ratio_median']:.3f} over {report['pairs_used']} pairs"
+    )
+    if abs(float(report["scale_ratio_median"]) - 1.0) > 0.05:
+        world.log(
+            "  WARNING measured and predicted ground motion disagree by more than "
+            "5%: check that the altitude column is height above the ground, the "
+            "focal length, and --image-time-offset before trusting this run"
+        )
+    return [[float(v) for v in row] for row in report["camera_from_body"]]
+
+
+def resolve_camera_mounting(args: argparse.Namespace) -> Optional[List[List[float]]]:
+    """``--camera-mounting``, else the calibration's mounting, else None.
+
+    ``auto`` also returns None: the caller measures it (it needs the data).
+    """
+
+    if getattr(args, "camera_mounting", None) == "auto":
+        return None
     if getattr(args, "camera_mounting", None):
         return parse_camera_mounting(args.camera_mounting)
     if args.calibration is not None:
@@ -2308,6 +2459,27 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
         ranges = resolve_ranges(args, source.times_s.size)
     world.log("ranges:", json.dumps(ranges))
 
+    # The flags whose default depends on the frontend (see
+    # resolve_frontend_defaults) are settled here, from the training images'
+    # own clock, before anything reads them.
+    from vio.data.images import numeric_image_manifest
+
+    _, capture_times = numeric_image_manifest(
+        phase_roots["train"] / args.image_folder, "*.jpg", 0.001
+    )
+    frame_interval = float(np.median(np.diff(capture_times))) if capture_times.size > 1 else 0.0
+    tick_interval = float(np.median(np.diff(source.times_s))) if source.times_s.size > 1 else 0.0
+    for line in resolve_frontend_defaults(
+        args, frame_interval_s=frame_interval, tick_interval_s=tick_interval
+    ):
+        world.log(f"  {args.frontend} default: {line}")
+    if args.warmup >= args.window_length:
+        raise SystemExit(
+            f"--warmup {args.warmup} ticks does not fit in --window-length "
+            f"{args.window_length}: with --frame-gap {args.frame_gap} the first image "
+            "pair of a window arrives that late. Lengthen the window."
+        )
+
     for phase in ("train", "validation", "test"):
         if phase not in phase_roots:
             continue
@@ -2469,6 +2641,10 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
 
     velocity_mode = resolve_velocity_mode(args)
     camera_from_body = resolve_camera_mounting(args)
+    if args.frontend == "planar" and camera_from_body is None and calibration is not None:
+        camera_from_body = auto_camera_mounting(
+            args, world, calibration, phase_roots["train"], image_time_offset, frame_interval
+        )
     prior_velocity = (
         [float(v) for v in args.prior_velocity]
         if args.prior_velocity is not None

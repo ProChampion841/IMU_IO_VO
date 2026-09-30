@@ -145,11 +145,45 @@ def test_a_resume_under_a_different_mounting_is_refused(rendered, tmp_path):
         )
 
 
-def test_the_trainer_refuses_planar_without_a_mounting_and_residual_without_planar(
+def test_planar_defaults_come_from_the_capture_and_the_mounting_is_measured(
     rendered, tmp_path
 ):
-    with pytest.raises(SystemExit, match="camera mounting"):
-        train_fixedwing_vo.main(planar_argv(rendered, tmp_path / "a", camera_mounting=None))
+    """``--frontend planar`` alone must be a working configuration: the frame
+    gap, pair-interval cap, warm-up, search radius, loss and camera mounting
+    are all derived from this capture when not given."""
+
+    run_dir = tmp_path / "run"
+    assert train_fixedwing_vo.main(
+        planar_argv(
+            rendered, run_dir, camera_mounting=None, frame_gap=None, warmup=None,
+            correlation_radius=None, velocity_loss=None,
+        )
+    ) == 0
+    saved = load_checkpoint(run_dir / "last.pt", map_location="cpu")["args"]
+    # 20 Hz images, 1 s baseline.
+    assert saved["frame_gap"] == 20
+    assert saved["max_frame_gap_s"] == pytest.approx(1.5)
+    # 1.0 s pair + 0.35 s latency at 100 Hz, plus 5.
+    assert saved["warmup"] == 140
+    assert saved["correlation_radius"] == 3
+    assert saved["velocity_loss"] == "simple"
+    # The renderer's mount, measured from the images.
+    assert np.allclose(saved["camera_from_body"], NADIR_MOUNTINGS["right_forward"], atol=0.03)
+
+
+def test_the_original_frontend_keeps_its_historical_defaults():
+    args = train_fixedwing_vo.build_parser().parse_args(["--dataset", "ignored"])
+    chosen = train_fixedwing_vo.resolve_frontend_defaults(
+        args, frame_interval_s=0.05, tick_interval_s=0.01
+    )
+    assert chosen == []
+    assert (args.frame_gap, args.warmup, args.correlation_radius, args.velocity_loss) == (
+        1, 20, 4, "nll"
+    )
+    assert args.max_frame_gap_s is None
+
+
+def test_the_trainer_refuses_residual_without_planar(rendered, tmp_path):
     with pytest.raises(SystemExit, match="geometric_residual needs --frontend planar"):
         train_fixedwing_vo.main(
             planar_argv(rendered, tmp_path / "b", frontend="mamba_correlation",

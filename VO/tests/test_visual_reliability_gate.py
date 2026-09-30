@@ -469,6 +469,11 @@ def test_gate_flags_reach_the_parser():
     assert args.min_cell_confidence == 0.0
     assert args.reject_boundary_peaks is False
     assert args.min_reliable_cell_fraction == 0.0
+    # The loss default depends on the frontend and is resolved at start-up;
+    # for the original frontend it is still the NLL.
+    from tools.train_fixedwing_vo import resolve_frontend_defaults
+
+    resolve_frontend_defaults(args, frame_interval_s=0.05, tick_interval_s=0.01)
     assert args.velocity_loss == "nll"
 
     tightened = build_parser().parse_args([
