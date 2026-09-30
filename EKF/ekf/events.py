@@ -21,7 +21,7 @@ _PRIO = {"INIT": 0, "IMU": 1, "GPS": 2, "VO": 3, "ATT": 4}
 
 def build_events(fl, vo, t_init, t_end, gps_until=None, gps_rate_hz=5.0, gps_std=0.1,
                  att_source="gt", vo_latency_s=0.0, imu_drop=0.0, seed=0,
-                 init="gt", init_vo=None, init_att_std_deg=1.0):
+                 init="gt", init_vo=None, init_att_std_deg=1.0, imu_fn=None):
     """Message log for one flight.
 
     fl         dict from pipeline.load_flight (raw IMU, truth)
@@ -36,6 +36,10 @@ def build_events(fl, vo, t_init, t_end, gps_until=None, gps_rate_hz=5.0, gps_std
                      VO velocity at/after t_init (std from that VO variance), attitude =
                      the nav attitude; the start moves to that VO sample.  init_vo is
                      the VOStream used for it (defaults to vo).
+    imu_fn     None: raw IMU messages.  Otherwise imu_fn(kept_indices) returns the IMU
+               messages to send, [(arrival_t, stamp_t, acc, gyro), ...] -- e.g. the
+               learned correction run causally (ekf/imu_model.py), which releases each
+               sample a little after its own timestamp.
     """
     rng = np.random.default_rng(seed)
     t = fl["t"]
@@ -54,12 +58,17 @@ def build_events(fl, vo, t_init, t_end, gps_until=None, gps_rate_hz=5.0, gps_std
     else:
         ev = [(t[i0], "INIT", t[i0], np.r_[fl["p_gt"][i0], fl["v_gt"][i0],
                                             so3.mat_to_quat(fl["R_gt"][i0])])]
+    kept = []
     for k in range(i0, i1 + 1):
         if k > i0 and imu_drop and rng.random() < imu_drop:
             continue
-        ev.append((t[k], "IMU", t[k], np.r_[fl["acc"][k], fl["gyro"][k]]))
+        kept.append(k)
         if k > i0:
             ev.append((t[k], "ATT", t[k], so3.mat_to_quat(R_att[k])))
+    if imu_fn is None:
+        ev += [(t[k], "IMU", t[k], np.r_[fl["acc"][k], fl["gyro"][k]]) for k in kept]
+    else:
+        ev += [(ta, "IMU", ts, np.r_[a, g]) for ta, ts, a, g in imu_fn(kept)]
     if gps_until is not None:
         for tg in np.arange(t[i0] + 1.0 / gps_rate_hz, min(gps_until, t[i1]), 1.0 / gps_rate_hz):
             k = int(np.clip(np.searchsorted(t, tg), 0, len(t) - 1))

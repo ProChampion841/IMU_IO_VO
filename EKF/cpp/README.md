@@ -82,6 +82,41 @@ State s = ekf.state();       // s.t, s.p, s.v, s.R (s.q()), s.ba, s.bg, s.P (15x
 - **IMU gaps:** a gap longer than `stream.max_imu_gap_s` is not integrated. The
   state coasts and its uncertainty grows. `counters().imu_gap` counts these.
 
+## The learned IMU model in C++ (optional, needs ONNX Runtime)
+
+`include/imuvo_imu_model.hpp` / `src/imuvo_imu_model.cpp` is the C++ version of
+`ekf/imu_model.py`: the IMU model run causally on a sliding window.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_DIR=/opt/onnxruntime
+cmake --build build -j        # + library imuvo_imu_model, tool imu_correct_replay
+```
+
+- `ONNXRUNTIME_DIR` is an unpacked ONNX Runtime C++ release, with `include/` and
+  `lib/`. On the Jetson use the aarch64 build (e.g. `onnxruntime-linux-aarch64-*`,
+  or the Jetson Zoo package).
+- Without `ONNXRUNTIME_DIR`, only the dependency-free EKF is built.
+
+```cpp
+#include "imuvo_imu_model.hpp"
+imuvo::StreamImuCorrector corr("tilt_rotate_40s.onnx", /*every=*/10, /*delay=*/16);
+corr.setActive(false);                          // raw while GPS is up ...
+// at the outage: corr.setFreeze(b_acc, b_gyro); corr.setActive(true);
+for each raw IMU sample (SI, FLU) with the nav attitude R_nav at that sample:
+    for (const auto& s : corr.push(t, acc, gyro, R_nav))
+        ekf.onImu(s.t, s.acc, s.gyro);          // corrected, in order, ~0.16-0.26 s late
+```
+
+- **Speed:** the 40 s model takes **7.5 ms per run** on one x86 CPU thread. At
+  10 runs per second that is about 8 % of a core. Expect a few times slower on
+  the Jetson CPU. To reduce the load, raise `every`, or use the CUDA / TensorRT
+  execution provider.
+- **Parity:** C++ matches the Python corrector to 1.2e-7 (`tests/test_imu_model.py`,
+  run with `ONNXRUNTIME_DIR` set).
+- **Freeze:** the 15 s bias freeze (`setFreeze`) is computed by the IMU project's
+  Python `freeze_biases`. It is not ported to C++ yet. Without it, pass zeros; that
+  is what `--no_gt` does.
+
 ## Frames
 
 The EKF runs in world **NWU** / body **FLU**, the same as the IMU project. The

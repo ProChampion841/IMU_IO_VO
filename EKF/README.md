@@ -165,6 +165,36 @@ python run_stream.py --imu_config ../IMU/configs/exp/UAV/tilt_rotate.conf \
     --horizons 30s 1m 2m 3m 4m 5m 10m 15m 20m 30m 40m --out_csv no_gt.csv
 ```
 
+## IMU input in the stream: raw or the learned model (`--imu raw|model`)
+
+`run_stream.py --imu model --imu_onnx IMU/tilt_rotate_40s.onnx` feeds the EKF the
+learned IMU correction instead of the raw IMU. Both arms (ekf and imu-only) get
+the same IMU, so the comparison stays fair.
+
+It runs **causally**, as it would on the aircraft (`ekf/imu_model.py`):
+- **Sliding window:** every `--imu_every` samples (default 10, i.e. 10 Hz) the model
+  runs on the **latest** 40 s of IMU. Nothing after "now" is used.
+- **Look-ahead delay:** the model's CNN looks about 12 samples ahead, so a corrected
+  sample is released only once a run has seen `--imu_delay` (16) samples after it.
+  The EKF therefore runs about 0.16–0.26 s behind real time. VO and attitude
+  messages wait in its queue until the IMU catches up; every message keeps its own
+  timestamp.
+- **Warm-up:** raw IMU is used until the first full window exists (40 s for a
+  40 s model). Export a shorter model (`--frames 1000`) for a shorter warm-up.
+- **Bias freeze:**
+  - With GPS (`--gps_s`), the model is used from the outage on, with the 15 s
+    pre-outage bias freeze it was trained with (fitted by the IMU project's own
+    function).
+  - With `--no_gt` there is no GPS, so the model gets **no freeze**. That is a
+    known mismatch with training.
+
+Tests (`tests/test_imu_model.py`):
+- the corrector is causal: changing future data never changes a released sample
+- no sample is lost or reordered, and each is released 16–26 samples late
+- the full `run_stream.py --imu model` run works in GPS and no-GT modes, and the
+  C++ EKF matches Python on it
+- the **C++ corrector matches Python** (max difference 1.2e-7)
+
 ## Horizons 30 s … 40 min
 
 Both scripts take `--horizons 30s 1m 2m 3m 4m 5m 10m 15m 20m 30m 40m`, which is

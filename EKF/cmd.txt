@@ -88,3 +88,26 @@ python run_stream.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
 python run_stream.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
   --splits inference --vo_onnx ..\VO\export\onnx --vo_datasets vo_flights --vo_cache_dir vo_cache ^
   --no_gt --events_out events_nogt.csv --cpp cpp\build\ekf_replay
+
+:: ---------------------------------------------------------------- IMU: RAW or MODEL (stream)
+:: export the IMU model once (from the IMU folder), then --imu model in any run_stream command
+cd ..\IMU
+python -m tools.export_onnx --config configs\exp\UAV\tilt_rotate.conf ^
+  --ckpt experiments\UAV\tilt_rotate\ckpt\best_model.ckpt --frames 4000 --out tilt_rotate_40s.onnx
+cd ..\EKF
+:: raw IMU (default)
+python run_stream.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --vo_dir vo_cache --no_gt --imu raw --out_csv no_gt_raw.csv
+:: learned IMU model
+python run_stream.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --vo_dir vo_cache --no_gt --imu model --imu_onnx ..\IMU\tilt_rotate_40s.onnx ^
+  --out_csv no_gt_model.csv
+:: with GPS 60 s first: the model starts at the outage, with the 15 s freeze it was trained with
+python run_stream.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --vo_dir vo_cache --gps_s 60 --imu model --imu_onnx ..\IMU\tilt_rotate_40s.onnx
+
+:: C++ with the IMU model (needs ONNX Runtime C++; on the Jetson use its aarch64 release)
+cd cpp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_DIR=C:\onnxruntime
+cmake --build build -j
+cd ..

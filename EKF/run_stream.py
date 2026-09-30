@@ -20,6 +20,12 @@ attitude x VO velocity, attitude = nav).  GPS truth is used only to SCORE it:
 position error is on the distance travelled since the start, and horizons are
 counted from the start.
 
+--imu model --imu_onnx FILE: the learned IMU correction (IMU/tools/export_onnx.py),
+run causally on a sliding window (ekf/imu_model.py) -- both arms get the same IMU.
+With GPS it is used from the outage on, with the 15 s pre-outage bias freeze it was
+trained with; with --no_gt it is used from the start with no freeze.  --imu raw
+(default) feeds the raw IMU.
+
 --events_out writes the message log of the FIRST flight; --cpp runs the C++
 ekf_replay on it and checks it matches Python.
 
@@ -42,6 +48,7 @@ from ekf import horizons as HZ                                        # noqa: E4
 from ekf.events import build_events, run_stream, stream_from_config, write_events  # noqa: E402
 from ekf.vo import load_vo_csv, simulate_vo                           # noqa: E402
 from ekf import vo_onnx                                               # noqa: E402
+from ekf import imu_model as IM                                       # noqa: E402
 import run_ekf                                                        # noqa: E402
 
 ARMS = ("ekf", "imu")
@@ -141,6 +148,14 @@ def main(argv=None):
                          "one continuous run over the whole flight, no reset")
     ap.add_argument("--horizons", nargs="+", default=HZ.DEFAULT,
                     help="into the outage: 30s 1m 2m ... 40m (a bare number = seconds)")
+    ap.add_argument("--imu", choices=["raw", "model"], default="raw",
+                    help="raw IMU, or the learned IMU correction (needs --imu_onnx)")
+    ap.add_argument("--imu_onnx", default=None, help="IMU model from IMU/tools/export_onnx.py")
+    ap.add_argument("--imu_every", type=int, default=10,
+                    help="run the IMU model every N samples (10 = 10 Hz at 100 Hz IMU)")
+    ap.add_argument("--imu_delay", type=int, default=16,
+                    help="samples of look-ahead a corrected sample waits for (CNN edge); "
+                         "0 for a causal_cnn model")
     ap.add_argument("--gps_std", type=float, default=0.1, help="GPS velocity noise, m/s")
     ap.add_argument("--vo_latency_s", type=float, default=0.0,
                     help="extra delay between a VO output's timestamp and its arrival")
@@ -156,6 +171,15 @@ def main(argv=None):
 
     if a.gps_s is None:
         a.gps_s = 0.0 if a.no_gt else 60.0
+    corrector = None
+    if a.imu == "model":
+        if not a.imu_onnx:
+            ap.error("--imu model needs --imu_onnx")
+        from tools.onnx_inference import OnnxModel          # IMU/tools
+        corrector = IM.StreamImuCorrector(OnnxModel(a.imu_onnx), every=a.imu_every,
+                                          delay=a.imu_delay)
+        print("[imu] model %s: %g s window, run every %d samples, released %d samples late"
+              % (a.imu_onnx, corrector.m.frames / 100.0, a.imu_every, a.imu_delay))
     cfg = run_ekf.load_config(a.ekf_config)
     make = stream_from_config(cfg)
     hs = sorted(HZ.parse(h, plain="seconds") for h in a.horizons)       # frames
@@ -163,9 +187,10 @@ def main(argv=None):
     att = cfg["attitude_aid"].get("source") or "gt"
     rows_out, first_ev, nis_all = [], None, []
     flights = flight_list(a)
-    print("[stream] %d flight(s) | %s | GPS %.0f s then outage | horizons %s"
+    print("[stream] %d flight(s) | %s | IMU %s | GPS %.0f s then outage | horizons %s"
           % (len(flights), "NO GT: start from VO + nav attitude, no reset" if a.no_gt
-             else "start from the GPS/nav state", a.gps_s, " ".join(HZ.label(h) for h in hs)))
+             else "start from the GPS/nav state", a.imu, a.gps_s,
+             " ".join(HZ.label(h) for h in hs)))
     for root, name in flights:
         try:
             fl = PL.load_flight(os.path.join(root, name))
@@ -186,6 +211,19 @@ def main(argv=None):
                   gps_until=t_out if a.gps_s > 0 else None, gps_std=a.gps_std, att_source=att,
                   vo_latency_s=a.vo_latency_s, imu_drop=a.imu_drop, seed=0,
                   init="vo" if a.no_gt else "gt", init_vo=vo)
+        if corrector is not None:
+            freeze, act = None, None
+            if a.gps_s > 0:                    # model from the outage, trained-style freeze
+                act = t_start + a.gps_s
+                freeze = IM.freeze_at(fl, act)
+            cache = {}
+
+            def imu_fn(kept, _f=IM.stream_imu_fn(fl, corrector, att, act, freeze)):
+                key = (len(kept), kept[0], kept[-1])
+                if key not in cache:
+                    cache[key] = _f(kept)
+                return cache[key]
+            kw["imu_fn"] = imu_fn
         try:
             ev = build_events(fl, vo, **kw)
         except ValueError as e:
