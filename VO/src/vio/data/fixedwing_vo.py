@@ -47,7 +47,7 @@ from .attitude import (
     aiding_features,
     body_rates_from_quaternions,
     load_attitude_altitude,
-    pair_geometry,
+    pair_geometry_batch,
 )
 from .image_pairs import VisualPairSource
 
@@ -274,6 +274,10 @@ class FixedWingVODataset(Dataset):
         self.warmup = int(warmup)
         self.max_visual_events = int(max_visual_events)
         self.index_ranges = tuple(ranges)
+        # Done here, in the parent, so forked loader workers share it. A
+        # dataset built only to exercise window bookkeeping has no images.
+        if image_source is not None:
+            self._precompute_event_inputs()
 
         features = aiding_features(attitude)
         self.log_altitude = features[:, 4].astype(np.float32)
@@ -329,62 +333,56 @@ class FixedWingVODataset(Dataset):
             f"{self.index_ranges}"
         )
 
-    def _event_body_rates(self, start: int, end: int, offsets: torch.Tensor,
-                          valid: torch.Tensor) -> torch.Tensor:
-        """Attitude-derived body rate averaged over each pair's exposure."""
+    def _precompute_event_inputs(self) -> None:
+        """Body rate and pair geometry for EVERY plan event, once.
 
-        return self._event_inputs(start, end)["visual_event_body_rate"]
-
-    def _event_inputs(self, start: int, end: int) -> Dict[str, torch.Tensor]:
-        """Everything read from the attitude log for each of a window's events.
-
-        The body rate over the exposure (what the older frontend centres its
-        search with) and the pair's exact geometry - relative rotation, ground
-        normal in the body frame, altitude at both exposures - which the
-        flat-ground frontend needs (:func:`vio.data.attitude.pair_geometry`).
-        Both are produced for every window whichever frontend trains, because
-        they are a few hundred bytes against the megabytes of pixels beside
-        them, and a frontend reading only what it needs keeps one dataset
-        serving both.
-
-        The event selection is exactly :meth:`VisualPairSource.window_pairs`'s,
-        so slot ``k`` here always describes the pixels in slot ``k`` there.
-        Padding slots hold an identity rotation, a level ground normal and a
-        unit altitude - finite values a frontend can run through harmlessly;
-        ``visual_event_valid`` is what says they are not real.
+        Each event's attitude-derived inputs are fixed, so computing them per
+        window per epoch inside the loader workers - as the per-event loop
+        this replaces did - repeats identical work every epoch.
         """
 
-        selected = self.image_source.events_in_window(
-            start, end, min_capture_tick=self._range_start(start)
-        )
-        slots = self.max_visual_events
+        plan = self.image_source.plan
+        count = int(plan.ready_tick.size)
+        rates = np.zeros((count, 3), dtype=np.float32)
+        for event in range(count):
+            rates[event] = self.image_source.rate_over_exposure(
+                self.attitude.body_rate_rad_s, self.attitude.times_s, event
+            )
+        geometry = pair_geometry_batch(self.attitude, plan.exposure_t0_s, plan.exposure_t1_s)
+        self._event_rate = torch.from_numpy(rates)
+        self._event_rotation = torch.from_numpy(geometry["relative_rotation"])
+        self._event_down = torch.from_numpy(geometry["down_body"])
+        self._event_altitude = torch.from_numpy(geometry["altitude_m"])
+
+    def _event_inputs(self, events: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Attitude-derived inputs for a window's event slots.
+
+        ``events`` is ``visual_event_index`` from
+        :meth:`VisualPairSource.window_pairs` - so slot ``k`` here always
+        describes the pixels in slot ``k`` there. The body rate over the
+        exposure is what the original frontend centres its search with; the
+        pair geometry (relative rotation, ground normal in the body frame,
+        altitude at both exposures) is what the flat-ground frontend needs
+        (:func:`vio.data.attitude.pair_geometry`). Both are produced whichever
+        frontend trains: they are a few hundred bytes beside megabytes of
+        pixels. Padding slots hold zero rate, an identity rotation, a level
+        ground normal and unit altitude - finite values a frontend runs
+        through harmlessly; ``visual_event_valid`` says they are not real.
+        """
+
+        slots = int(events.shape[0])
+        real = events >= 0
+        picked = events.clamp_min(0)
         rates = torch.zeros(slots, 3)
         rotation = torch.eye(3).repeat(slots, 1, 1)
         down = torch.zeros(slots, 3)
         down[:, 2] = 1.0
         altitude = torch.ones(slots, 2)
-        if selected.size > slots:
-            pick = np.unique(
-                np.linspace(0, selected.size - 1, slots).round().astype(np.int64)
-            )
-            selected = selected[pick]
-        plan = self.image_source.plan
-        for slot, event in enumerate(selected):
-            rates[slot] = torch.from_numpy(
-                self.image_source.rate_over_exposure(
-                    self.attitude.body_rate_rad_s,
-                    self.attitude.times_s,
-                    int(event),
-                ).astype(np.float32)
-            )
-            geometry = pair_geometry(
-                self.attitude,
-                float(plan.exposure_t0_s[event]),
-                float(plan.exposure_t1_s[event]),
-            )
-            rotation[slot] = torch.from_numpy(geometry["relative_rotation"])
-            down[slot] = torch.from_numpy(geometry["down_body"])
-            altitude[slot] = torch.from_numpy(geometry["altitude_m"])
+        if bool(real.any()):
+            rates[real] = self._event_rate[picked[real]]
+            rotation[real] = self._event_rotation[picked[real]]
+            down[real] = self._event_down[picked[real]]
+            altitude[real] = self._event_altitude[picked[real]]
         return {
             "visual_event_body_rate": rates,
             "visual_event_rotation": rotation,
@@ -420,7 +418,7 @@ class FixedWingVODataset(Dataset):
             start, end, self.max_visual_events, min_capture_tick=range_start
         )
         item.update(pairs)
-        item.update(self._event_inputs(start, end))
+        item.update(self._event_inputs(pairs["visual_event_index"]))
         # A window whose visual events all land before its first usable tick
         # would train the fusion on presence bits that never fire.
         item["visual_event_valid"] = pairs["visual_event_valid"]

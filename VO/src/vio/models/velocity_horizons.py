@@ -54,7 +54,11 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from vio.data.attitude import AttitudeAltitude, pair_geometry
-from vio.data.fixedwing_vo import BODY_RATE_AIDING_SLICE, visual_age_seconds
+from vio.data.fixedwing_vo import (
+    BODY_RATE_AIDING_SLICE,
+    hold_visual_velocity,
+    visual_age_seconds,
+)
 from vio.data.image_pairs import VisualPairSource
 from vio.utils.velocity_metrics import AXIS_NAMES
 
@@ -527,29 +531,26 @@ def scatter_span_velocity(
     held_valid = torch.zeros(count, ticks, 1, device=device, dtype=dtype)
     if len(tokens) == 0 or tokens.velocity is None:
         return held, held_valid
-    reliable = tokens.pair_reliable
-    keep_all = np.flatnonzero(
-        (reliable.reshape(-1) > 0).cpu().numpy()
-        if reliable is not None
-        else np.ones(len(tokens), dtype=bool)
+    reliable = (
+        tokens.pair_reliable.reshape(-1) > 0
+        if tokens.pair_reliable is not None
+        else torch.ones(len(tokens), dtype=torch.bool)
     )
     for row, (start, end) in enumerate(bounds):
         inside = np.flatnonzero((tokens.tick >= start) & (tokens.tick < end))
-        inside = np.intersect1d(inside, keep_all, assume_unique=False)
         if inside.size == 0:
             continue
-        offsets = (tokens.tick[inside] - start).astype(np.int64)
-        order = np.argsort(offsets, kind="stable")
-        offsets, inside = offsets[order], inside[order]
-        values = tokens.velocity[inside].to(dtype)
-        # For every tick, the last delivered event at or before it.
-        position = np.searchsorted(offsets, np.arange(ticks), side="right") - 1
-        seen = position >= 0
-        chosen = torch.from_numpy(np.clip(position, 0, None))
-        filled = values[chosen]
-        mask = torch.from_numpy(seen).to(dtype).unsqueeze(-1)
-        held[row] = (filled * mask).to(device)
-        held_valid[row] = mask.to(device)
+        # The training-time hold itself, so a same-tick collision or a refused
+        # pair is resolved identically in training and here.
+        leg, leg_valid, _ = hold_visual_velocity(
+            tokens.velocity[inside].to(device=device, dtype=dtype).unsqueeze(0),
+            torch.from_numpy((tokens.tick[inside] - start).astype(np.int64)).to(device).unsqueeze(0),
+            torch.ones(1, inside.size, device=device),
+            window_length=ticks,
+            delivered=reliable[torch.from_numpy(inside)].to(device=device, dtype=dtype).unsqueeze(0),
+        )
+        held[row] = leg[0]
+        held_valid[row] = leg_valid[0]
     return held, held_valid
 
 

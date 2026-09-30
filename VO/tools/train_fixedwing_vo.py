@@ -2509,8 +2509,10 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
     # own clock, before anything reads them.
     from vio.data.images import numeric_image_manifest
 
+    from vio.data.image_pairs import DEFAULT_IMAGE_PATTERN, DEFAULT_IMAGE_TIME_SCALE
+
     _, capture_times = numeric_image_manifest(
-        phase_roots["train"] / args.image_folder, "*.jpg", 0.001
+        phase_roots["train"] / args.image_folder, DEFAULT_IMAGE_PATTERN, DEFAULT_IMAGE_TIME_SCALE
     )
     frame_interval = float(np.median(np.diff(capture_times))) if capture_times.size > 1 else 0.0
     tick_interval = float(np.median(np.diff(source.times_s))) if source.times_s.size > 1 else 0.0
@@ -3092,27 +3094,9 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             "  each leg starts from a zeroed state and is streamed unbroken to "
             "its end"
         )
-        # Every horizon leg is a COLD START, so no visual event can exist
-        # before one deployment latency plus roughly one camera frame interval
-        # have elapsed. A shorter --warmup scores those ticks as if the model
-        # had vision, inflating the earliest part of every horizon silently.
-        # This is a diagnostic, not an auto-correction: the right cold-start
-        # warmup is still an open question (see PLAN.txt SS9).
-        pair_dt = datasets["train"].image_source.plan.pair_dt_s
-        frame_interval = float(np.median(pair_dt)) if pair_dt.size else 0.0
-        tick_interval = float(np.median(np.diff(source.times_s)))
-        if tick_interval > 0:
-            min_cold_start_warmup = int(
-                np.ceil((args.deployment_latency_s + frame_interval) / tick_interval)
-            )
-            if args.warmup < min_cold_start_warmup:
-                world.log(
-                    f"  WARNING --warmup {args.warmup} ticks is shorter than the "
-                    f"guaranteed cold-start blind period (~{min_cold_start_warmup} "
-                    f"ticks = deployment latency {args.deployment_latency_s:.3f}s + "
-                    f"one frame interval {frame_interval:.3f}s, at a measured tick "
-                    f"interval of {tick_interval:.4f}s)."
-                )
+        # Every horizon leg is a cold start too; the general --warmup check
+        # after the datasets are built already warns when the warm-up is
+        # shorter than the time to the first image pair.
 
     # Same as the val_* set, appended rather than interleaved for the same
     # reason the horizon columns are: an existing metrics.csv without
@@ -3144,6 +3128,10 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
     # Epochs since the selection metric last improved by --min-delta, for
     # --patience. Carried in every checkpoint so a resumed run keeps counting.
     stale_epochs = 0
+    # The score patience measures against. It only moves when an epoch beats
+    # it by more than --min-delta, so a run of small gains that add up to
+    # more than min_delta still resets patience when the sum crosses it.
+    patience_reference = float("inf")
     if normalizer is None:
         raise SystemExit(
             "no split produced a dataset, so there is nothing to train on; "
@@ -3200,8 +3188,15 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             )
         model.load_state_dict(saved["model"], strict=True)
         optimizer.load_state_dict(saved["optimizer"])
-        schedule.load_state_dict(saved["scheduler"])
         start_epoch = int(saved["epoch"]) + 1
+        saved_epochs = int(saved.get("epochs", args.epochs))
+        saved_warmup = int(saved.get("args", {}).get("lr_warmup_epochs", 0) or 0)
+        # A schedule saved under a different shape (another --epochs, or a
+        # warm-up added/removed - which also changes the scheduler CLASS) is
+        # not loaded but rebuilt and fast-forwarded below.
+        reshaped = saved_epochs != args.epochs or saved_warmup != args.lr_warmup_epochs
+        if not reshaped:
+            schedule.load_state_dict(saved["scheduler"])
         # The metric best.pt was chosen on is recorded, so a resume that
         # changes --select-on starts its search again rather than comparing
         # this run's numbers against a different quantity from the last one.
@@ -3211,14 +3206,14 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
                 saved.get("best_val_score", saved.get(f"best_val_{saved_metric}", float("inf")))
             )
             stale_epochs = int(saved.get("stale_epochs", 0))
+            patience_reference = float(saved.get("patience_reference", best))
         else:
             world.log(
                 f"selection metric changed ({saved_metric} -> {args.select_on}), "
                 "so best.pt is contested from scratch"
             )
             best = float("inf")
-        saved_epochs = int(saved.get("epochs", args.epochs))
-        if saved_epochs != args.epochs:
+        if reshaped:
             # A restored scheduler carries the T_max it was built with, so a
             # changed --epochs would otherwise be ignored - and silently, in
             # the worst way: a run cut short at its own T_max has already
@@ -3242,9 +3237,10 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
                 for _ in range(start_epoch - 1):
                     schedule.step()
             world.log(
-                f"  --epochs changed {saved_epochs} -> {args.epochs}: the "
-                f"cosine schedule is re-stretched to the new total, resuming "
-                f"at lr {optimizer.param_groups[0]['lr']:g}"
+                f"  schedule changed (--epochs {saved_epochs} -> {args.epochs}, "
+                f"--lr-warmup-epochs {saved_warmup} -> {args.lr_warmup_epochs}): "
+                f"rebuilt and fast-forwarded, resuming at lr "
+                f"{optimizer.param_groups[0]['lr']:g}"
             )
         world.log(
             f"resumed {resume_path} at epoch {start_epoch} of {args.epochs} "
@@ -3340,6 +3336,7 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             "val_score": score,
             "best_val_score": best,
             "stale_epochs": stale_epochs,
+            "patience_reference": patience_reference,
             "val_vel_rmse_y": score if args.select_on == "vel_rmse_y" else float("nan"),
             "best_val_vel_rmse_y": best if args.select_on == "vel_rmse_y" else float("nan"),
             "world_size": world.world_size,
@@ -3473,12 +3470,15 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             score = validation[args.select_on]
             # --min-delta only decides whether patience resets; best.pt still
             # follows every improvement, however small.
-            improved = score < best - float(args.min_delta)
+            if score < patience_reference - float(args.min_delta):
+                patience_reference = score
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
             if score < best:
                 best = score
                 if world.is_main:
                     torch.save(checkpoint_payload(epoch, score), best_path)
-            stale_epochs = 0 if improved else stale_epochs + 1
             skill = validation["skill_vs_mean_y"]
             skill_text = "n/a" if math.isnan(skill) else f"{skill:+.3f}"
             world.log(

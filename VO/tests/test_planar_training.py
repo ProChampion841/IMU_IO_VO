@@ -356,3 +356,35 @@ def test_held_outputs_fill_until_the_next_emission_and_carry_across_blocks():
     later, carry2 = _hold_emitted(predicted + 10, torch.tensor([[False, False, True, False, False, False]]), carry)
     assert later[0, :, 0].tolist() == [4, 4, 12, 12, 12, 12]
     assert carry2[0, 0] == 12
+
+
+def test_min_delta_counts_gains_since_the_last_real_improvement(rendered, tmp_path, monkeypatch):
+    """0.005 better every epoch with --min-delta 0.01: every second epoch the
+    accumulated gain crosses 0.01, so patience 3 must never run out (the
+    earlier rule compared each epoch with the previous best and stopped)."""
+
+    original = train_fixedwing_vo.evaluate
+    calls = {"n": 0}
+
+    def slowly_better(*args, **kwargs):
+        metrics = original(*args, **kwargs)
+        metrics["vel_rmse"] = 1.0 - 0.005 * calls["n"]
+        calls["n"] += 1
+        return metrics
+
+    monkeypatch.setattr(train_fixedwing_vo, "evaluate", slowly_better)
+    run_dir = tmp_path / "run"
+    assert train_fixedwing_vo.main(
+        planar_argv(rendered, run_dir, epochs="5", patience="3", min_delta="0.01")
+    ) == 0
+    with (run_dir / "metrics.csv").open(newline="", encoding="utf-8") as handle:
+        assert len(list(csv.DictReader(handle))) == 5
+
+
+def test_a_resume_may_add_a_learning_rate_warmup(rendered, tmp_path):
+    run_dir = tmp_path / "run"
+    assert train_fixedwing_vo.main(planar_argv(rendered, run_dir)) == 0
+    assert train_fixedwing_vo.main(
+        planar_argv(rendered, run_dir, epochs="2", lr_warmup_epochs="1") + ["--resume", "auto"]
+    ) == 0
+    assert load_checkpoint(run_dir / "last.pt", map_location="cpu")["epoch"] == 2

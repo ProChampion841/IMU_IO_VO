@@ -298,7 +298,15 @@ class PlanarFlowFrontend(VisionMambaFlowFrontend):
         features0 = self.stem(image0)
         features1 = self.stem(warped1)
         fine_size = (features0.shape[2], features0.shape[3])
-        fine_valid = (F.adaptive_avg_pool2d(warp_valid, fine_size) > 0.99).to(dtype)
+        # Validity per feature cell over EXACTLY the pixels that cell's patch
+        # covers: the stem's strided patch convolution drops any remainder
+        # row/column, so the mask must crop the same way rather than spread
+        # the whole frame over the grid (adaptive pooling would misalign cells
+        # whenever the image is not a multiple of the patch).
+        patch = self.patch_size
+        pixel_valid = warp_valid[:, :, : fine_size[0] * patch, : fine_size[1] * patch]
+        fine_fraction = F.avg_pool2d(pixel_valid, patch)
+        fine_valid = (fine_fraction > 0.99).to(dtype)
         normal = ground_normal_camera(down, mounting_batch)
         # The altimeter's word on the motion along the normal: n . u.
         along_normal = (height0 - height1) / height0
@@ -325,7 +333,8 @@ class PlanarFlowFrontend(VisionMambaFlowFrontend):
             centre = normalized_to_cells(
                 planar_displacement(u_prior, s_c, x_c, y_c), matrix, coarse_cell
             ).round()
-            coarse_valid = (F.adaptive_avg_pool2d(warp_valid, coarse_size) > 0.99).to(dtype)
+            # Pooled from the fine cells exactly as the coarse features are.
+            coarse_valid = (F.avg_pool2d(fine_fraction, self.coarse_factor) > 0.99).to(dtype)
             coarse = self.coarse_correlation(
                 coarse0, coarse1, search_center=centre, target_valid=coarse_valid
             )
@@ -400,13 +409,9 @@ class PlanarFlowFrontend(VisionMambaFlowFrontend):
         per_second = dt.view(batch, 1, 1, 1)
         residual_flow = (measured - model_flow) / per_second
         plane_flow = model_flow / per_second
-        weight = (
-            correlation["usable_confidence"]
-            * correlation["flow_valid"].to(dtype)
-            * self._reliable_cells(correlation, dtype)
-        )
+        # ``weight`` and ``reliable_cell`` are the last fine pass's, which is
+        # the correlation everything below describes.
         valid_count = valid_cells.sum(dim=(1, 2, 3)).clamp_min(1.0)
-        reliable_cell = self._reliable_cells(correlation, dtype)
         reliable_fraction = reliable_cell.sum(dim=(1, 2, 3)) / valid_count
         pair_reliable = (
             reliable_fraction >= self.min_reliable_cell_fraction

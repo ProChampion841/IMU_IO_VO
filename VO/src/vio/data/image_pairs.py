@@ -33,6 +33,13 @@ from .images import (
 )
 
 
+#: The frame file pattern and filename time unit VisualPairSource assumes by
+#: default. Named so a caller that reads the same folder's clock (the trainer's
+#: frame-rate probe) cannot drift from the loader.
+DEFAULT_IMAGE_PATTERN = "*.jpg"
+DEFAULT_IMAGE_TIME_SCALE = 0.001
+
+
 def resize_camera_matrix(
     camera_matrix: np.ndarray,
     native_size: Tuple[int, int],
@@ -109,8 +116,8 @@ class VisualPairSource:
         telemetry_times_s: np.ndarray,
         *,
         image_folder: str = "images",
-        image_pattern: str = "*.jpg",
-        image_time_scale: float = 0.001,
+        image_pattern: str = DEFAULT_IMAGE_PATTERN,
+        image_time_scale: float = DEFAULT_IMAGE_TIME_SCALE,
         image_time_offset_s: "float | Mapping[str, Sequence[float]]" = 0.0,
         deployment_latency_s: float = 0.35,
         frame_gap: int = 1,
@@ -496,18 +503,30 @@ class VisualPairSource:
         offset = torch.zeros(max_events, dtype=torch.long)
         interval = torch.ones(max_events)
         valid = torch.zeros(max_events)
+        # Which plan event fills each slot (-1 for padding), so anything else
+        # read per event - body rate, pair geometry - indexes exactly these
+        # events instead of repeating the selection above.
+        index = torch.full((max_events,), -1, dtype=torch.long)
         for slot, event in enumerate(selected):
             first[slot], second[slot] = self.load_pair(int(event))
             offset[slot] = int(self.plan.ready_tick[event]) - start
             interval[slot] = float(self.plan.pair_dt_s[event])
             valid[slot] = 1.0
+            index[slot] = int(event)
         return {
             "visual_image0": first,
             "visual_image1": second,
             "visual_event_offset": offset,
             "visual_event_dt_s": interval,
             "visual_event_valid": valid,
+            "visual_event_index": index,
         }
 
 
-__all__ = ["VisualPairPlan", "VisualPairSource", "resize_camera_matrix"]
+__all__ = [
+    "DEFAULT_IMAGE_PATTERN",
+    "DEFAULT_IMAGE_TIME_SCALE",
+    "VisualPairPlan",
+    "VisualPairSource",
+    "resize_camera_matrix",
+]
