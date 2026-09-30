@@ -14,7 +14,21 @@ python -m pytest tests -q
 python run_ekf.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
   --splits inference --vo_sim --horizons 3000 6000 12000 --out_csv ekf_sim.csv
 
-:: ---------------------------------------------------------------- real VO
+:: ---------------------------------------------------------------- VO ONNX model
+:: Runs VO\tools\onnx_inference.py on the VO flight folder (flight.csv + images\),
+:: keeps one output per delivered image pair, uses VO's own variance.
+:: Export first:  cd ..\VO  &  python tools\export_onnx.py runs\vo_planar_s0\best.pt --output-dir export\onnx
+python run_ekf.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --csv 2026_02_06_143_23_sensor_data.csv ^
+  --vo_onnx ..\VO\export\onnx --vo_dataset ..\VO\data_split\test ^
+  --vo_cache_dir vo_cache --horizons 3000 6000 12000 --plot_dir ekf_plots
+
+:: many flights: vo_flights\<flight name>\flight.csv + images\ per IMU flight
+python run_ekf.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --vo_onnx ..\VO\export\onnx --vo_datasets vo_flights ^
+  --vo_cache_dir vo_cache --horizons 3000 6000 12000 18000 24000 30000 --out_csv ekf_windows.csv
+
+:: ---------------------------------------------------------------- VO CSV
 :: vo_predictions\<flight>_vo.csv per flight: time, body_velocity_m_s_x/y/z (FRD),
 :: velocity_log_variance_x/y/z -- the VO model's output contract.
 python run_ekf.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^

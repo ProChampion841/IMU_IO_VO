@@ -24,7 +24,8 @@ CSV this module reads -- one row per VO output, any extra columns ignored:
     logvar_x/y/z           optional; aliases: velocity_log_variance_x/y/z
                            or var_x/y/z (variance) or std_x/y/z (m/s)
     visual_age             optional; ticks since the last image pair (0 = fresh)
-                           alias: visual_present (1 = fresh)
+                           aliases: visual_present, pair_delivered (1 = fresh) --
+                           pair_delivered is what VO/tools/onnx_inference.py writes
 Frame is FRD unless told otherwise (`frame="flu"`).  Everything is returned in
 body FLU, the frame the EKF runs in: FRD -> FLU flips y and z; variances do not
 change.
@@ -125,9 +126,10 @@ def load_vo_csv(path, frame="frd", time_offset=0.0, default_std=None, var_scale=
         if "visual_age" in header:
             ok &= np.array([float(r["visual_age"]) == 0 for r in rows])
             how = "visual_age == 0"
-        elif "visual_present" in header:
-            ok &= np.array([float(r["visual_present"]) > 0.5 for r in rows])
-            how = "visual_present == 1"
+        elif "visual_present" in header or "pair_delivered" in header:
+            c = "pair_delivered" if "pair_delivered" in header else "visual_present"
+            ok &= np.array([float(r[c]) > 0.5 for r in rows])
+            how = "%s == 1" % c
         elif min_interval_s and min_interval_s > 0:
             keep = np.zeros(len(t), bool)
             last = -np.inf

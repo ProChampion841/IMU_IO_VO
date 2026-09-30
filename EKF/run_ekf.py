@@ -6,8 +6,12 @@ project) it runs three arms on the same data and reports, per horizon:
     vel_rmse  vel_max_error  dir_rmse  dir_max_error  pos_error
     for   imu (IMU + attitude aid)   vo (VO velocity integrated)   ekf (IMU + VO)
 
-VO input: --vo_csv (one flight), --vo_dir (one CSV per flight), or --vo_sim
-(SIMULATED from GPS truth -- for testing the filter only, never a result).
+VO input:
+  --vo_onnx DIR --vo_dataset FOLDER   run the VO ONNX runtime (VO/tools/onnx_inference.py)
+                                      on one flight folder (flight.csv + images/);
+                                      --vo_datasets ROOT for ROOT/<flight>/ per flight
+  --vo_csv FILE / --vo_dir DIR        VO predictions already written to CSV
+  --vo_sim                            SIMULATED from GPS truth (tests the filter only)
 IMU input: raw (freeze-corrected) or, with --imu_onnx, the learned correction.
 
 Run from the EKF folder, e.g.
@@ -29,6 +33,7 @@ sys.path.insert(0, HERE)
 from ekf import pipeline as PL                                   # noqa: E402
 from ekf.eskf import ESKFParams                                  # noqa: E402
 from ekf.vo import load_vo_csv, simulate_vo                      # noqa: E402
+from ekf import vo_onnx                                          # noqa: E402
 
 
 def load_config(path):
@@ -48,6 +53,31 @@ def vo_for_flight(a, cfg, flight, win):
                            white_std=s["white_std"], bias_std=s["bias_std"],
                            tau_s=s["tau_s"], seed=s["seed"] + win["start"],
                            var_scale=vc["var_scale"])
+    if a.vo_onnx:
+        folder = a.vo_dataset
+        if a.vo_datasets:
+            stem = os.path.splitext(flight)[0]
+            for cand in (stem, stem.replace("_sensor_data", "")):
+                if os.path.isdir(os.path.join(a.vo_datasets, cand)):
+                    folder = os.path.join(a.vo_datasets, cand)
+                    break
+            else:
+                return None
+        if folder not in a._vo_cache:
+            cache = None
+            if a.vo_cache_dir:
+                cache = os.path.join(a.vo_cache_dir, os.path.splitext(flight)[0] + "_vo.csv")
+            if cache and os.path.isfile(cache):
+                print("  [vo] reusing %s" % cache)
+                a._vo_cache[folder] = load_vo_csv(
+                    cache, frame="frd", time_offset=vc["time_offset_s"],
+                    var_scale=vc["var_scale"], min_std=vc["min_std"], fresh_only=True)
+            else:
+                a._vo_cache[folder] = vo_onnx.replay(
+                    a.vo_onnx, folder, time_offset=vc["time_offset_s"],
+                    var_scale=vc["var_scale"], min_std=vc["min_std"], save_csv=cache)
+            print("  [vo] %s" % a._vo_cache[folder].source)
+        return a._vo_cache[folder]
     path = a.vo_csv
     if a.vo_dir:
         stem = os.path.splitext(flight)[0]
@@ -94,9 +124,16 @@ def main(argv=None):
     ap.add_argument("--csv", default=None, help="one IMU flight log instead of a split")
     ap.add_argument("--data_root", default=None)
     vo = ap.add_mutually_exclusive_group(required=True)
+    vo.add_argument("--vo_onnx", help="VO ONNX export folder (VO/tools/export_onnx.py)")
     vo.add_argument("--vo_csv", help="VO predictions for the ONE flight given by --csv")
     vo.add_argument("--vo_dir", help="folder with one VO CSV per flight (<flight>_vo.csv)")
     vo.add_argument("--vo_sim", action="store_true", help="SIMULATED VO from GPS truth (testing)")
+    ap.add_argument("--vo_dataset", default=None,
+                    help="--vo_onnx: the VO flight folder (flight.csv + images/) of --csv")
+    ap.add_argument("--vo_datasets", default=None,
+                    help="--vo_onnx: root with one VO flight folder per IMU flight")
+    ap.add_argument("--vo_cache_dir", default=None,
+                    help="--vo_onnx: save / reuse the VO output as <flight>_vo.csv here")
     ap.add_argument("--imu_onnx", default=None, help="learned IMU correction (export_onnx.py)")
     ap.add_argument("--horizons", type=int, nargs="+", default=[3000, 6000, 12000],
                     help="frames at 100 Hz; the window is the longest one")
@@ -109,6 +146,10 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.vo_csv and not a.csv:
         ap.error("--vo_csv belongs to one flight: give that flight with --csv")
+    if a.vo_onnx and not (a.vo_dataset or a.vo_datasets):
+        ap.error("--vo_onnx needs --vo_dataset (one flight, with --csv) or --vo_datasets")
+    if a.vo_dataset and not a.csv:
+        ap.error("--vo_dataset belongs to one flight: give that flight's IMU log with --csv")
     a._vo_cache = {}
     cfg = load_config(a.ekf_config)
     params = ESKFParams.from_dict(cfg["eskf"])
@@ -124,12 +165,13 @@ def main(argv=None):
     from pyhocon import ConfigFactory
     att_source_net = str(ConfigFactory.parse_file(a.imu_config).train.get("att_source", "gt"))
     print("[ekf] window %g s | attitude aid %s | VO %s"
-          % (W / 100.0, aid.get("source"), "SIMULATED" if a.vo_sim else (a.vo_csv or a.vo_dir)))
+          % (W / 100.0, aid.get("source"), "SIMULATED" if a.vo_sim else
+             ("onnx %s" % a.vo_onnx if a.vo_onnx else (a.vo_csv or a.vo_dir))))
 
     all_rows, results, npz = [], {}, {}
     for split in a.splits:
         rows, n, t0 = [], 0, time.time()
-        stats = {"vel_ok": 0, "vel_rej": 0, "nis": [], "ba": [], "bg": []}
+        stats = {"vel_ok": 0, "vel_rej": 0, "nis": [], "ba": [], "bg": [], "vo_err": []}
         for win in PL.load_windows(a.imu_config, split, W, csv=a.csv, data_root=a.data_root,
                                    max_flights=a.max_flights, first_only=a.first_only):
             if a.max_windows and n >= a.max_windows:
@@ -139,6 +181,15 @@ def main(argv=None):
                 print("  [skip] %s: no VO file" % win["flight"])
                 continue
             vo = vo.window(win["t"][0], win["t"][-1])
+            if len(vo) == 0:
+                print("  [skip] %s start %d: no VO sample inside the window -- check the "
+                      "clock (vo.time_offset_s)" % (win["flight"], win["start"]))
+                continue
+            # VO against GPS body velocity at the VO timestamps: a wrong clock offset or
+            # frame shows up here long before it shows up in the EKF numbers.
+            k = np.clip(np.searchsorted(win["t"], vo.t), 0, len(win["t"]) - 1)
+            vb_true = np.einsum("nji,nj->ni", PL.rot_source(win, "gt")[k], win["v_gt"][k])
+            stats["vo_err"].append(vo.v - vb_true)
             if onnx is not None:
                 acc, gyro = PL.onnx_correct(win, onnx, att_source_net)
             else:
@@ -183,6 +234,11 @@ def main(argv=None):
                  nis.mean() if len(nis) else float("nan"),
                  np.linalg.norm(stats["ba"], axis=1).mean(),
                  np.degrees(np.linalg.norm(stats["bg"], axis=1).mean())))
+        if stats["vo_err"]:
+            e = np.concatenate(stats["vo_err"])
+            print("[%s] VO vs GPS body velocity (FLU) at VO times: bias %s  rmse %s m/s"
+                  % (split, np.array2string(e.mean(0), precision=2),
+                     np.array2string(np.sqrt((e ** 2).mean(0)), precision=2)))
         if a.vo_sim:
             print("*** VO IS SIMULATED from GPS truth: these numbers test the filter, they are "
                   "NOT a VO result.")

@@ -20,6 +20,7 @@ EKF/
   ekf/so3.py          rotations (exp/log/skew, Euler, FRD↔FLU)
   ekf/eskf.py         the filter: 15-state ESKF, predict + VO / attitude updates
   ekf/vo.py           VO input: read the VO model's CSV, or SIMULATE VO from GPS
+  ekf/vo_onnx.py      run the VO ONNX runtime (VO/tools/onnx_inference.py) on a flight folder
   ekf/pipeline.py     windows from the IMU project, ONNX correction, the 3 arms, metrics
   run_ekf.py          command line: evaluate over flights, print table, save CSV/npz/plots
   configs/ekf_default.json   noise and aiding settings
@@ -58,9 +59,31 @@ applied first. It runs in blocks of the model's length (e.g. 40 s): the first
 block gets the same 9-sample padding as training, and later blocks get the
 real 9 samples before them.
 
-**VO** is given as one CSV per flight (`--vo_dir`, named `<flight>_vo.csv`) or
-a single file (`--vo_csv` together with `--csv`). The columns follow the VO
-model's own output contract (`VO/logs/input_contract.json`):
+**VO** comes from the VO project's ONNX runtime, or from CSV files.
+
+**Option 1 (recommended): run the VO ONNX model directly.** Use
+`--vo_onnx export/onnx` (made by `VO/tools/export_onnx.py`) with
+`--vo_dataset <flight folder>` for one flight, or `--vo_datasets <root>` for one
+folder per flight (`<root>/<flight name>/flight.csv + images/`).
+- The EKF replays each flight through `VO/tools/onnx_inference.py` (numpy +
+  onnxruntime only).
+- It keeps the ticks where a new image pair was delivered (`pair_delivered`).
+  With `--frame-gap 10` and `--output-on-pairs`, that is one per 500 ms. The
+  rows in between re-read the same image token, so they carry no new
+  information and would make the filter over-confident.
+- It uses VO's own variance, `exp(velocity_log_variance)`, and flips FRD to FLU.
+- `--vo_cache_dir DIR` saves the VO output as `<flight>_vo.csv`, so the slow
+  image pass runs once per flight.
+- The VO `flight.csv` has the same logger columns as the IMU `*_sensor_data.csv`,
+  so the two share one clock. If they don't, set `vo.time_offset_s`.
+- The run prints the VO error against GPS body velocity at the VO timestamps.
+  A large bias there means a clock or frame problem.
+
+**Option 2: VO predictions already in CSV.** Use one CSV per flight
+(`--vo_dir`, named `<flight>_vo.csv`), or a single file (`--vo_csv` together
+with `--csv`). The CSV written by `VO/tools/onnx_inference.py --output` works
+as is (`time_s, vx, vy, vz, …, pair_delivered`). It has no variance column, so
+the measured VO RMSE is used instead. The accepted columns are:
 
 | column | meaning |
 |---|---|
@@ -93,6 +116,12 @@ observable, and they will drift.
 ## Run (from the `EKF` folder)
 
 ```bash
+# the VO ONNX model on one flight (VO flight folder + the IMU log of the same flight)
+python run_ekf.py --imu_config ../IMU/configs/exp/UAV/tilt_rotate.conf \
+    --csv 2026_02_06_143_23_sensor_data.csv \
+    --vo_onnx ../VO/export/onnx --vo_dataset ../VO/data_split/test \
+    --vo_cache_dir vo_cache --horizons 3000 6000 12000 --plot_dir ekf_plots
+
 # simulated VO: check the filter on your real IMU flights
 python run_ekf.py --imu_config ../IMU/configs/exp/UAV/tilt_rotate.conf \
     --splits inference --vo_sim --horizons 3000 6000 12000
