@@ -63,3 +63,15 @@ tensorboard --logdir experiments/UAV --host 0.0.0.0
 #   validation is 3 dates, not 11 flights -- part of the train/val gap is shift
 #   eval: vel/dir pooled over every frame; pos_error = drift at window end
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# v3: loss + architecture update (one change-set per arm)
+# ---------------------------------------------------------------------------
+# train (V3A: loss only -- burn-in, drift term, detached variance NLL)
+python train.py --config configs/exp/UAV/velnet_v3a_loss.conf --device cuda:0
+
+# train (V3B: architecture only -- GroupNorm CNN, GRU warm-up context, velocity bias init)
+python train.py --config configs/exp/UAV/velnet_v3b_arch.conf --device cuda:0
+
+# train (V3: both)
+python train.py --config configs/exp/UAV/velnet_v3.conf --device cuda:0
