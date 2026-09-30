@@ -828,6 +828,15 @@ def main_worker(local_rank, device_ids, args):
     metric_horizons = [int(h) for h in conf.train.get("metric_horizons", [])]
 
     train_dataset = SeqeuncesDataset(data_set_config=conf.dataset.train)
+    # The train_* CSV columns are NAMED after metric_horizons[0], but the TRAIN window
+    # is not overridden -- it stays conf.dataset.train.window_size.  Say so when the
+    # two differ: the tilt_aware run logged `train_pos_error_60s` from 40 s windows.
+    if metric_horizons and is_main():
+        _tw = sorted({int(e["window_size"]) for e in conf.dataset.train.data_list})
+        if _tw != [metric_horizons[0]]:
+            print("[metric] NOTE: train windows are %s frames but the train_* columns are "
+                  "labelled %s (metric_horizons[0]); the label is the VAL horizon, not "
+                  "the train window." % (_tw, horizon_tag(metric_horizons[0])))
     _test_conf = conf.dataset.test
     if metric_horizons:
         _test_conf = copy.deepcopy(conf.dataset.test)

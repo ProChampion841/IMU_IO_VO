@@ -12,7 +12,12 @@ about 4.5 min per epoch). Plot: `tilt_aware_training.png`.
 - **Splits:** 55 train flights plus `train.csv`. `test` and `eval` use **the same 11 flights**
   plus `valid1.csv`; they are the checkpoint-selection flights, **not held-out data**.
   `inference` has the 11 held-out flights, and it **is not scored anywhere in this log.**
-- **Horizons:** train and primary val run at 60 s (6000 frames). Extra val horizons are 30 s and 120 s.
+- **Horizons:** **training windows are 40 s** (4000 frames, step 1000 s per `parameters.yaml`). Primary
+  validation is **60 s**, because `metric_horizons[0]` = 6000 overrides the test window; the extra val
+  horizons are 30 s and 120 s. The `eval/*` columns use 40 s windows.
+  *Correction:* an earlier version of this note said training ran at 60 s. The CSV column
+  `train_pos_error_60s` is **mislabelled**: train.py names it after `metric_horizons[0]`, but the
+  training windows were 40 s.
   The checkpoint is selected on a 3-epoch trailing mean of `val_pos_error_60s`.
 
 ## 2. Headline: this arm learns, and the earlier arms did not
@@ -20,7 +25,7 @@ about 4.5 min per epoch). Plot: `tilt_aware_training.png`.
 The model/raw ratio uses the same windows on both sides, so it is valid (see §4 for why the
 absolute values are not):
 
-| epochs | LR | val 30 s | val 60 s | val 120 s | train 60 s |
+| epochs | LR | val 30 s | val 60 s | val 120 s | train (40 s windows) |
 |---|---|---|---|---|---|
 | 0–9 | 1e-3 | 0.978 ± 0.047 | 0.965 ± 0.044 | 0.949 ± 0.053 | 0.949 |
 | 10–49 | 1e-3 | 0.961 ± 0.020 | 0.941 ± 0.018 | 0.906 ± 0.023 | 0.904 |
@@ -46,10 +51,10 @@ Only `--splits inference --per_flight` can decide pass or fail (§6).
 
 ## 3. Training dynamics
 
-- **The generalisation gap is large and still growing.** Train at 60 s goes 0.95 → 0.75; val at 60 s
-  goes 0.96 → 0.93. From epoch 309 (LR floor) onward, val 30 s and 60 s are flat (slope ≈ +0.0001 per 100 epochs), but
+- **The generalisation gap is large and still growing.** Train (40 s windows) goes 0.95 → 0.75; val at 60 s
+  goes 0.96 → 0.93. The horizons differ (40 s vs 60 s), so the gap is indicative, not exact. From epoch 309 (LR floor) onward, val 30 s and 60 s are flat (slope ≈ +0.0001 per 100 epochs), but
   **val 120 s is still improving by −0.0018 per 100 epochs** and train by −0.0013. The run
-  still fits the train set. Only the 120 s horizon, which it was never trained at, keeps
+  still fits the train set. Only the 120 s horizon, 3× the 40 s training window, keeps
   benefiting.
 - **LR schedule:** four cuts at epochs 126, 187, 248 and 309. The floor has been reached since epoch 309, and
   about 800 epochs have run there. The cut at epoch 126 is what stabilised val: the ±0.05 spikes stop and
@@ -73,7 +78,7 @@ make every **absolute** value in `metric.csv` and TensorBoard wrong.
 
 1. **`train()` never increments `n_win`** (`train.py:589`, divided by at `:645–655`).
    Everything is divided by `max(1, 0) = 1`, so every `train_*` column is a **sum over
-   batches**, not a mean. That is why `train_pos_error_60s` is about 33 000 m while val is about 700 m, and
+   batches**, not a mean. That is why `train_pos_error_60s` (actually 40 s windows) is about 33 000 m while val is about 700 m, and
    why `train_loss` is about 37–47 while `val_loss` is about 0.68. It also affects `train_cov_*` and `pred_cov_*`.
 2. **`test()` weights by batch size but divides by batch count.** It accumulates `x * bs` and
    then divides by `(i+1)` (`train.py:727–735`) instead of `n_win`. That multiplies every val
