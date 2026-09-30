@@ -1,0 +1,38 @@
+{
+  "product": "visual_odometry_velocity",
+  "raw_imu_used": false,
+  "image_input": {
+    "kind": "grayscale_frame_pair",
+    "height": 576,
+    "width": 1024,
+    "frame_gap": 1
+  },
+  "telemetry_input": {
+    "source_attitude_columns": [
+      "NavEulX",
+      "NavEulY",
+      "NavEulZ"
+    ],
+    "source_altitude_column": "RelativeAlt",
+    "temporal_aiding_channels": [
+      "sin_roll",
+      "cos_roll",
+      "sin_pitch",
+      "cos_pitch",
+      "log_altitude_centred",
+      "p_rad_s",
+      "q_rad_s",
+      "r_rad_s",
+      "delta_time_s"
+    ],
+    "yaw_usage": "NavEulZ is used in the relative quaternion rotation between image exposures; absolute yaw is not concatenated"
+  },
+  "output": [
+    "body_velocity_m_s_x",
+    "body_velocity_m_s_y",
+    "body_velocity_m_s_z",
+    "velocity_log_variance_x",
+    "velocity_log_variance_y",
+    "velocity_log_variance_z"
+  ]
+}

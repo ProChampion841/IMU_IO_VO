@@ -1,0 +1,209 @@
+general: 
+  exp_dir: experiments/UAV/velnet_v2b_step500
+dataset: 
+  train: 
+    mode: train
+    calib: none
+    dtype: float32
+    data_list: 
+      - 
+        name: UAV
+        window_size: 6000
+        step_size: 500
+        data_root: /home/master/DATA/corvo_log_real_data/
+        data_drive: 
+          - 2025_11_22_105_21_sensor_data.csv
+          - 2025_11_22_106_18_sensor_data.csv
+          - 2025_11_22_106_19_sensor_data.csv
+          - 2025_11_22_106_20_sensor_data.csv
+          - 2025_12_18_147_47_sensor_data.csv
+          - 2025_12_18_147_48_sensor_data.csv
+          - 2025_12_18_147_49_sensor_data.csv
+          - 2025_12_18_148_34_sensor_data.csv
+          - 2025_12_18_148_35_sensor_data.csv
+          - 2025_12_28_101_28_sensor_data.csv
+          - 2025_12_28_101_29_sensor_data.csv
+          - 2025_12_28_133_20_sensor_data.csv
+          - 2025_12_30_132_20_sensor_data.csv
+          - 2025_12_30_132_21_sensor_data.csv
+          - 2025_12_30_140_35_sensor_data.csv
+          - 2025_12_30_145_15_sensor_data.csv
+          - 2025_12_30_145_16_sensor_data.csv
+          - 2025_12_30_146_14_sensor_data.csv
+          - 2025_12_30_149_25_sensor_data.csv
+          - 2025_12_30_149_26_sensor_data.csv
+          - 2026_01_12_131_15_sensor_data.csv
+          - 2026_01_12_131_16_sensor_data.csv
+          - 2026_01_12_153_31_sensor_data.csv
+          - 2026_01_12_153_32_sensor_data.csv
+          - 2026_01_12_157_12_sensor_data.csv
+          - 2026_01_12_158_11_sensor_data.csv
+          - 2026_01_12_158_12_sensor_data.csv
+          - 2026_01_19_134_144_sensor_data.csv
+          - 2026_01_19_159_10_sensor_data.csv
+          - 2026_01_19_171_13_sensor_data.csv
+          - 2026_01_23_155_14_sensor_data.csv
+          - 2026_01_23_162_18_sensor_data.csv
+          - 2026_01_30_161_18_sensor_data.csv
+          - 2026_01_30_161_19_sensor_data.csv
+          - 2026_02_12_168_16_sensor_data.csv
+          - 2026_02_12_181_14_sensor_data.csv
+          - 2026_02_12_186_18_sensor_data.csv
+          - 2026_02_12_189_17_sensor_data.csv
+          - 2026_02_12_190_16_sensor_data.csv
+          - 2026_02_12_191_14_sensor_data.csv
+          - 2026_02_13_152_18_sensor_data.csv
+          - 2026_02_13_169_14_sensor_data.csv
+          - 2026_02_13_170_34_sensor_data.csv
+          - 2026_02_13_179_31_sensor_data.csv
+          - 2026_02_13_180_17_sensor_data.csv
+          - 2026_02_13_182_13_sensor_data.csv
+          - 2026_02_13_182_14_sensor_data.csv
+          - 2026_02_13_183_16_sensor_data.csv
+          - 2026_02_13_184_12_sensor_data.csv
+          - 2026_02_13_188_36_sensor_data.csv
+          - 2026_02_13_192_23_sensor_data.csv
+          - 2026_04_06_173_46_sensor_data.csv
+          - 2026_04_06_173_47_sensor_data.csv
+          - 2026_04_06_185_69_sensor_data.csv
+          - 2026_04_06_185_70_sensor_data.csv
+    gravity: 9.81007
+    freeze_hist_s: 0.0
+  test: 
+    mode: test
+    calib: none
+    dtype: float32
+    data_list: 
+      - 
+        name: UAV
+        window_size: 4000
+        step_size: 2000
+        data_root: /home/master/DATA/corvo_log_real_data/
+        data_drive: 
+          - valid1.csv
+          - 2025_11_17_141_12_sensor_data.csv
+          - 2025_11_25_135_4_sensor_data.csv
+          - 2025_11_25_137_5_sensor_data.csv
+          - 2025_11_25_137_6_sensor_data.csv
+          - 2026_04_07_153_67_sensor_data.csv
+          - 2026_04_07_154_48_sensor_data.csv
+          - 2026_04_07_156_63_sensor_data.csv
+          - 2026_04_07_178_46_sensor_data.csv
+          - 2026_04_07_178_47_sensor_data.csv
+          - 2026_04_07_219_54_sensor_data.csv
+          - 2026_04_07_219_55_sensor_data.csv
+    gravity: 9.81007
+    freeze_hist_s: 0.0
+  eval: 
+    mode: evaluate
+    calib: none
+    dtype: float32
+    data_list: 
+      - 
+        name: UAV
+        window_size: 4000
+        step_size: 4000
+        data_root: /home/master/DATA/corvo_log_real_data/
+        data_drive: 
+          - valid1.csv
+          - 2025_11_17_141_12_sensor_data.csv
+          - 2025_11_25_135_4_sensor_data.csv
+          - 2025_11_25_137_5_sensor_data.csv
+          - 2025_11_25_137_6_sensor_data.csv
+          - 2026_04_07_153_67_sensor_data.csv
+          - 2026_04_07_154_48_sensor_data.csv
+          - 2026_04_07_156_63_sensor_data.csv
+          - 2026_04_07_178_46_sensor_data.csv
+          - 2026_04_07_178_47_sensor_data.csv
+          - 2026_04_07_219_54_sensor_data.csv
+          - 2026_04_07_219_55_sensor_data.csv
+    gravity: 9.81007
+    freeze_hist_s: 0.0
+  inference: 
+    mode: evaluate
+    calib: none
+    dtype: float64
+    data_list: 
+      - 
+        name: UAV
+        window_size: 4000
+        step_size: 4000
+        data_root: /home/master/DATA/corvo_log_real_data/
+        data_drive: 
+          - 2025_11_06_102_32_sensor_data.csv
+          - 2025_11_06_107_23_sensor_data.csv
+          - 2026_02_06_142_21_sensor_data.csv
+          - 2026_02_06_143_23_sensor_data.csv
+          - 2026_02_06_163_17_sensor_data.csv
+          - 2026_02_06_163_18_sensor_data.csv
+          - 2026_02_06_167_45_sensor_data.csv
+          - 2026_02_06_174_20_sensor_data.csv
+          - 2026_02_06_174_21_sensor_data.csv
+          - 2026_02_06_175_22_sensor_data.csv
+          - 2026_02_06_176_32_sensor_data.csv
+    gravity: 9.81007
+    freeze_hist_s: 0.0
+  collate: padding9_honest
+train: 
+  lr: 0.001
+  weight_decay: 0.0001
+  batch_size: 4
+  min_lr: 1e-05
+  max_epoches: 6000
+  patience: 10
+  factor: 0.3
+  save_freq: 1
+  eval_freq: 2
+  cov_weight: 0.001
+  sampling: 50
+  gtinit: true
+  seed: 42
+  pos_weight: 4.9
+  vel_weight: 17.2
+  decouple_cov: true
+  use_pos_loss: false
+  use_rot_loss: false
+  rot_cov_weight: 0.0
+  pos_cov_weight: 0.0055
+  vel_cov_weight: 0.0014
+  velnet_huber_delta: 1.0
+  vel_output_scale: 10.0
+  velnet_cov_init: 1.0
+  vel_frame_source: gt
+  vel_dir_weight: 0.0
+  vel_kappa_init: 1.0
+  vel_dir_min_speed: 1.0
+  network: velnet
+  gtrot: false
+  propcov: true
+  covaug: false
+  att_input: none
+  att_source: gt
+  normalize_input: true
+  correction_mode: affine
+  scale_std: 0.05
+  gru_hidden: 256
+  mamba_dim: 128
+  mamba_layers: 2
+  mamba_stride: 96
+  fuse: concat
+  gru_window: 300
+  correct_gyro: false
+  aug_acc_bias_std: 
+    - 0.0798
+    - 0.0986
+    - 0.0164
+  aug_gyro_bias_std: 
+    - 0.000859
+    - 0.000559
+    - 0.001066
+  ema_decay: 0.9826
+  select_smooth: 3
+  eval_batch_size: 2
+  metric_horizons: 
+    - 6000
+    - 12000
+  select_metric: vel_error_60s
+  loss: Huber_loss005
+  pos_huber_delta: 0.6
+  vel_huber_delta: 0.27
