@@ -219,3 +219,28 @@ def reduce(rows, arm):
         out[name] = (float(np.sqrt((v ** 2).mean())) if how == "rms"
                      else float(v.max()) if how == "max" else float(v.mean()))
     return out
+
+
+# ---------------------------------------------------------------------------
+# whole flights for the stream (real-use) mode
+# ---------------------------------------------------------------------------
+def load_flight(csv, data_root=None, gravity=9.81007):
+    """One whole flight, RAW (no bias freeze -- in stream mode the filter learns the
+    biases itself while GPS is up), through the IMU project's UAV loader."""
+    from datasets.UAVdataset import UAV
+    from utils import pypose_compat
+    pypose_compat.apply()
+    root = data_root or os.path.dirname(csv) or "."
+    seq = UAV(root, os.path.basename(csv), dtype="float64", gravity=gravity,
+              mti_diagnostics=False)
+    d = seq.data
+    n = d["time"].shape[0]
+    return {
+        "flight": os.path.basename(csv),
+        "t": d["time"].numpy(), "acc": d["acc"].numpy(), "gyro": d["gyro"].numpy(),
+        "R_gt": d["gt_orientation"].matrix().numpy(),
+        "R_mti": (d["mti_orientation"].matrix().numpy() if "mti_orientation" in d
+                  else d["gt_orientation"].matrix().numpy()),
+        "v_gt": d["velocity"].numpy(), "p_gt": d["gt_translation"].numpy(),
+        "mask": d["mask"].numpy()[:n],
+    }

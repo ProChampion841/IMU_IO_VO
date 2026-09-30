@@ -85,7 +85,8 @@ class ESKF:
             P0 = np.diag(d ** 2)
         self.P = np.array(P0, dtype=float)
         self.last_gyro = np.zeros(3)
-        self.stats = {"vel": [0, 0], "att": [0, 0], "nis_vel": [], "nis_att": []}
+        self.stats = {"vel": [0, 0], "att": [0, 0], "gps": [0, 0],
+                      "nis_vel": [], "nis_att": [], "nis_gps": []}
 
     # ------------------------------------------------------------------ predict
     def predict(self, acc, gyro, dt):

@@ -22,7 +22,11 @@ EKF/
   ekf/vo.py           VO input: read the VO model's CSV, or SIMULATE VO from GPS
   ekf/vo_onnx.py      run the VO ONNX runtime (VO/tools/onnx_inference.py) on a flight folder
   ekf/pipeline.py     windows from the IMU project, ONNX correction, the 3 arms, metrics
-  run_ekf.py          command line: evaluate over flights, print table, save CSV/npz/plots
+  ekf/stream.py       stream (real-time) front end: messages in arrival order
+  ekf/events.py       message logs: build from a flight, write/read, replay
+  run_ekf.py          OFFLINE evaluation: windows from GPS truth, imu / vo / ekf table
+  run_stream.py       STREAM test: GPS then outage, EKF vs IMU-only, optional C++ check
+  cpp/                C++17 stream EKF for the Jetson (see cpp/README.md)
   configs/ekf_default.json   noise and aiding settings
   tests/              pytest (filter core, VO format, end-to-end on a synthetic flight)
   cmd.txt             commands
@@ -140,6 +144,45 @@ ratio **ekf / imu** (below 1 means VO helped). It also reports:
   VO variance is too small, below means it is too big)
 - the final bias estimates
 
+## Stream mode (real use) and C++
+
+The offline evaluator above starts every window from GPS truth. On the
+aircraft the filter works like this instead:
+- it runs **continuously**, fed message by message in arrival order
+  (`ekf/stream.py`);
+- it is corrected by **GPS velocity while GPS is up**, which is where it learns
+  the IMU biases (no offline freeze);
+- it continues on IMU + attitude + VO when GPS is lost.
+
+```bash
+python run_stream.py --csv <flight>_sensor_data.csv --vo_onnx ../VO/export/onnx \
+    --vo_dataset <VO flight folder> --gps_s 60 --horizons_s 30 60 120 180 240 300 \
+    --events_out events.csv --cpp cpp/build/ekf_replay
+```
+
+It prints the position, velocity and direction error at each horizon into the
+outage, for the EKF and for IMU-only. It also prints the biases learned before
+the outage and the VO NIS. With `--cpp` it runs the C++ build on the same
+message log and checks it matches.
+
+- **Stream vs offline:** on the same data they are **identical** (difference
+  0.0, `tests/test_stream.py`).
+- **C++:** `cpp/` is the Jetson port. See `cpp/README.md`.
+
+**Correlated VO error.** VO errors that persist for tens of seconds (a slowly
+changing velocity offset) look like real motion to a filter that treats each VO
+sample as independent. The filter then follows them.
+- A too-low NIS does not reveal this, because each sample on its own looks
+  consistent.
+- With simulated VO sized like the measured VO error (3.5 / 2.7 / 1 m/s, half
+  of it slow) on a synthetic flight with a nearly perfect IMU, the EKF ended up
+  worse than IMU-only.
+- On real flights the IMU drifts far more: about 123 m at 60 s and 358 m at
+  120 s after the freeze. There VO has much more room to help.
+- **Always compare `ekf` against `imu-only` on real flights before using VO.**
+  If VO hurts, first raise `vo.var_scale`. The real fix is VO-bias states in the
+  filter (a Gauss-Markov velocity offset), which is the next step.
+
 ## Tests
 
 ```bash
@@ -153,6 +196,8 @@ python -m pytest tests -q
 | gating, tilt-only | gating rejects outliers; the tilt-only aid leaves heading alone |
 | VO file | contract names, FRD→FLU, log-variance, time offset |
 | end-to-end | synthetic flight log with a bias drift: EKF beats IMU-only; ONNX block correction equals the IMU project's ONNX pipeline |
+| stream (`test_stream.py`) | stream = offline exactly; real use (GPS then outage, VO 0.1 s late, 1 % IMU dropped, a 0.5 s IMU dropout): biases learned, VO beats IMU-only; **C++ = Python** on the same message log |
+| VO ONNX (`test_vo_onnx.py`) | only delivered pairs are kept, FRD→FLU, variance = exp(log-variance), cache round trip |
 
 ## Tuning order
 

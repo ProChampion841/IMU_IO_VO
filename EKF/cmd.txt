@@ -49,3 +49,18 @@ python run_ekf.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
 
 :: settings (noise, attitude aid, VO variance scale): configs\ekf_default.json
 :: copy it, edit, and pass --ekf_config my.json
+
+:: ---------------------------------------------------------------- STREAM (real use)
+:: GPS for 60 s (biases learned), then outage: EKF vs IMU-only at 30 s .. 5 min
+python run_stream.py --csv 2026_02_06_143_23_sensor_data.csv ^
+  --vo_onnx ..\VO\export\onnx --vo_dataset ..\VO\data_split\test --vo_cache vo_143_23.csv ^
+  --gps_s 60 --horizons_s 30 60 120 180 240 300
+
+:: ---------------------------------------------------------------- C++ (Jetson)
+cd cpp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+cd ..
+:: run the C++ on the same message log as Python and compare (prints PASS/FAIL)
+python run_stream.py --csv 2026_02_06_143_23_sensor_data.csv --vo_csv vo_143_23.csv ^
+  --events_out events.csv --cpp cpp\build\ekf_replay

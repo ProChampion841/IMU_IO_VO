@@ -42,5 +42,12 @@
     "bias_std": null,
     "tau_s": 20.0,
     "seed": 0
+  },
+
+  "stream": {
+    "_comment": "Stream (real-time) mode only.  A measurement older than max_meas_age_s is dropped; an IMU gap longer than max_imu_gap_s is not integrated (the state coasts and its covariance grows by gap_acc_std).",
+    "max_meas_age_s": 1.0,
+    "max_imu_gap_s": 0.1,
+    "gap_acc_std": 2.0
   }
 }
