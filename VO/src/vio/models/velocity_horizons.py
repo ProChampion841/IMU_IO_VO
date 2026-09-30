@@ -53,7 +53,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from vio.data.fixedwing_vo import BODY_RATE_AIDING_SLICE, visual_age_seconds
+from vio.data.attitude import AttitudeAltitude, pair_geometry
+from vio.data.fixedwing_vo import (
+    BODY_RATE_AIDING_SLICE,
+    hold_visual_velocity,
+    visual_age_seconds,
+)
 from vio.data.image_pairs import VisualPairSource
 from vio.utils.velocity_metrics import AXIS_NAMES
 
@@ -236,6 +241,11 @@ class SpanTokens:
     # which is what an ungated frontend and every pre-gate construction site
     # (tests included) mean.
     pair_reliable: Optional[torch.Tensor] = None
+    # (N, 3) float32, CPU: the per-pair metric velocity a flat-ground frontend
+    # (PlanarFlowFrontend) measures, or None for a frontend that measures none.
+    # Scattered and HELD by :func:`scatter_span_velocity` for a
+    # geometric_residual model, under the same delivery rule as the token.
+    velocity: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         if self.tick.shape[0] != self.token.shape[0]:
@@ -252,6 +262,8 @@ class SpanTokens:
             self.pair_reliable = torch.ones((self.token.shape[0], 1))
         elif self.token.shape[0] != self.pair_reliable.shape[0]:
             raise ValueError("token and pair_reliable counts disagree")
+        if self.velocity is not None and self.velocity.shape != (self.token.shape[0], 3):
+            raise ValueError("velocity must be (N, 3), one row per token")
 
     @classmethod
     def empty(cls, visual_dim: int, *, disabled: bool = False) -> "SpanTokens":
@@ -276,11 +288,14 @@ class _SpanPairDataset(Dataset):
         events: np.ndarray,
         body_rate_rad_s: np.ndarray,
         times_s: np.ndarray,
+        attitude: Optional[AttitudeAltitude] = None,
     ) -> None:
         self.image_source = image_source
         self.events = np.asarray(events, dtype=np.int64)
         self.body_rate_rad_s = body_rate_rad_s
         self.times_s = times_s
+        # Given only for a frontend that needs each pair's geometry.
+        self.attitude = attitude
 
     def __len__(self) -> int:
         return int(self.events.size)
@@ -301,6 +316,22 @@ class _SpanPairDataset(Dataset):
             "tick": torch.tensor(
                 int(self.image_source.plan.ready_tick[event]), dtype=torch.long
             ),
+            **self._geometry(event),
+        }
+
+    def _geometry(self, event: int) -> Dict[str, torch.Tensor]:
+        if self.attitude is None:
+            return {}
+        plan = self.image_source.plan
+        geometry = pair_geometry(
+            self.attitude,
+            float(plan.exposure_t0_s[event]),
+            float(plan.exposure_t1_s[event]),
+        )
+        return {
+            "relative_rotation": torch.from_numpy(geometry["relative_rotation"]),
+            "down_body": torch.from_numpy(geometry["down_body"]),
+            "altitude_m": torch.from_numpy(geometry["altitude_m"]),
         }
 
 
@@ -329,12 +360,18 @@ def encode_span_tokens(
     num_workers: int = 0,
     disable_visual: bool = False,
     progress: bool = False,
+    attitude: Optional[AttitudeAltitude] = None,
 ) -> SpanTokens:
     """Run the frontend once over every image pair whose event lands in ``span``.
 
     This is the expensive half of a horizon evaluation and it is deliberately
     separated from the scan: the result is replayed at every horizon, so six
     horizons cost one pass over the images rather than six.
+
+    A frontend with ``requires_pair_geometry`` (the flat-ground one) also needs
+    ``attitude``, from which each pair's rotation, ground normal and altitudes
+    are read exactly as the training dataset reads them, and its per-pair
+    velocity is kept in :attr:`SpanTokens.velocity`.
     """
 
     if disable_visual:
@@ -353,8 +390,17 @@ def encode_span_tokens(
     if events.size == 0:
         return SpanTokens.empty(visual_dim)
 
+    geometric = bool(getattr(frontend, "requires_pair_geometry", False))
+    if geometric and attitude is None:
+        raise ValueError(
+            "this frontend needs each pair's geometry: pass attitude= "
+            "(the flight's AttitudeAltitude)"
+        )
     loader = DataLoader(
-        _SpanPairDataset(image_source, events, body_rate_rad_s, times_s),
+        _SpanPairDataset(
+            image_source, events, body_rate_rad_s, times_s,
+            attitude=attitude if geometric else None,
+        ),
         batch_size=max(int(batch_pairs), 1),
         shuffle=False,
         num_workers=int(num_workers),
@@ -368,15 +414,25 @@ def encode_span_tokens(
     reliabilities: List[torch.Tensor] = []
     ticks: List[np.ndarray] = []
     diagnostics: List[torch.Tensor] = []
+    velocities: List[torch.Tensor] = []
     try:
         for batch in _maybe_progress(loader, "visual tokens", progress):
+            extra = {}
+            if geometric:
+                extra = {
+                    name: batch[name].to(device, non_blocking=True)
+                    for name in ("relative_rotation", "down_body", "altitude_m")
+                }
             encoded = frontend(
                 batch["image0"].to(device, non_blocking=True).float().div(255.0),
                 batch["image1"].to(device, non_blocking=True).float().div(255.0),
                 pair_dt_s=batch["pair_dt_s"].to(device, non_blocking=True),
                 body_rate_rad_s=batch["body_rate"].to(device, non_blocking=True),
                 camera_matrix=camera_matrix,
+                **extra,
             )
+            if geometric:
+                velocities.append(encoded["geometric_velocity"].detach().float().cpu())
             tokens.append(encoded["visual_token"].detach().float().cpu())
             qualities.append(encoded["visual_quality"].detach().float().cpu())
             reliabilities.append(encoded["pair_reliable"].detach().float().cpu())
@@ -396,6 +452,7 @@ def encode_span_tokens(
         diagnostics=torch.cat(diagnostics),
         pair_reliable=torch.cat(reliabilities),
         visual_dim=int(visual_dim),
+        velocity=torch.cat(velocities) if velocities else None,
     )
 
 
@@ -449,6 +506,52 @@ def scatter_span_tokens(
         quality[row, offset] = tokens.quality[inside].to(device=device, dtype=dtype)
         present[row, offset] = 1.0
     return field, quality, present
+
+
+def scatter_span_velocity(
+    tokens: SpanTokens,
+    bounds: Sequence[Tuple[int, int]],
+    ticks: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Held per-pair velocity over C legs: ``(C, ticks, 3)`` and ``(C, ticks, 1)``.
+
+    The same placement and refusal rule as :func:`scatter_span_tokens` - a
+    delivered pair lands on its ready tick, a refused one does not land at
+    all - and then each value is HELD until the next delivered pair, exactly
+    as :func:`vio.data.fixedwing_vo.hold_visual_velocity` holds it in
+    training. Each leg starts with nothing held: a leg is a cold start. The
+    validity field is 0 before a leg's first delivery and 1 after.
+    """
+
+    count = len(bounds)
+    held = torch.zeros(count, ticks, 3, device=device, dtype=dtype)
+    held_valid = torch.zeros(count, ticks, 1, device=device, dtype=dtype)
+    if len(tokens) == 0 or tokens.velocity is None:
+        return held, held_valid
+    reliable = (
+        tokens.pair_reliable.reshape(-1) > 0
+        if tokens.pair_reliable is not None
+        else torch.ones(len(tokens), dtype=torch.bool)
+    )
+    for row, (start, end) in enumerate(bounds):
+        inside = np.flatnonzero((tokens.tick >= start) & (tokens.tick < end))
+        if inside.size == 0:
+            continue
+        # The training-time hold itself, so a same-tick collision or a refused
+        # pair is resolved identically in training and here.
+        leg, leg_valid, _ = hold_visual_velocity(
+            tokens.velocity[inside].to(device=device, dtype=dtype).unsqueeze(0),
+            torch.from_numpy((tokens.tick[inside] - start).astype(np.int64)).to(device).unsqueeze(0),
+            torch.ones(1, inside.size, device=device),
+            window_length=ticks,
+            delivered=reliable[torch.from_numpy(inside)].to(device=device, dtype=dtype).unsqueeze(0),
+        )
+        held[row] = leg[0]
+        held_valid[row] = leg_valid[0]
+    return held, held_valid
 
 
 # ---------------------------------------------------------------------------
@@ -902,8 +1005,15 @@ def run_span_horizons(
     progress: bool = False,
     ablate_body_rate: bool = False,
     ablate_visual_age: bool = False,
+    output_on_pairs: bool = False,
 ) -> Tuple[Dict[str, Dict[str, object]], Dict[str, object]]:
     """Stream ``span`` once, start to end, and score every horizon prefix.
+
+    ``output_on_pairs`` scores a model trained with ``--output-on-pairs`` the
+    way it is deployed: its velocity is an output only on the tick an image
+    pair is delivered, so the velocity metrics count only those ticks, and
+    the dead-reckoned position integrates that output HELD until the next
+    one - what a consumer of one velocity per pair actually integrates.
 
     Returns ``(horizons, whole_span)``. ``horizons`` has one entry per label
     (``"h5m"``), each covering the FIRST H minutes of the span and nothing
@@ -1020,6 +1130,15 @@ def run_span_horizons(
     age_field, _ = visual_age_seconds(present_field, leg_clock, deployment_latency_s)
     if ablate_visual_age:
         age_field = torch.zeros_like(age_field)
+    # A geometric_residual model reads the held per-pair velocity too - built
+    # once over the whole span and sliced per block, like age and for the
+    # same reason: the hold must survive a block boundary.
+    geometric = getattr(model, "velocity_mode", "heads") == "geometric_residual"
+    velocity_field = velocity_valid_field = None
+    if geometric:
+        velocity_field, velocity_valid_field = scatter_span_velocity(
+            tokens, [(start, end)], span_ticks, device=device
+        )
 
     mask = torch.ones(1, span_ticks, device=device)
     # The first ticks after the reset have no visual event yet - the camera
@@ -1053,6 +1172,8 @@ def run_span_horizons(
     model.eval()
     try:
         state: Optional[VOStreamState] = None
+        # The last emitted output, carried across blocks (--output-on-pairs).
+        held_output: Optional[torch.Tensor] = None
         step = max(int(block_ticks), 1)
         blocks = list(range(0, span_ticks, step))
         for begin in _maybe_progress(
@@ -1067,33 +1188,47 @@ def run_span_horizons(
                 visual_quality=quality_field[:, begin:stop],
                 log_altitude=leg_altitude[:, begin:stop],
                 state=state,
+                visual_velocity=(
+                    None if velocity_field is None else velocity_field[:, begin:stop]
+                ),
+                visual_velocity_valid=(
+                    None if velocity_valid_field is None
+                    else velocity_valid_field[:, begin:stop]
+                ),
             )
             predicted = outputs["predicted_velocity"]
             block_target = leg_target[:, begin:stop]
             block_mask = mask[:, begin:stop]
+            score_mask = block_mask
+            drift_predicted = predicted
+            if output_on_pairs:
+                fired = present_field[:, begin:stop, 0] > 0
+                score_mask = block_mask * fired.to(block_mask.dtype)
+                drift_predicted, held_output = _hold_emitted(predicted, fired, held_output)
             block_rotation = (
                 None if leg_rotation is None else leg_rotation[:, begin:stop]
             )
             block_clock = leg_clock[:, begin:stop]
             tick_index = torch.arange(begin, stop, device=device).unsqueeze(0)
 
-            def feed(stats, drift, reference, active) -> None:
-                stats.update(predicted, block_target, active, begin)
+            def feed(stats, drift, reference, prefix) -> None:
+                scored = score_mask * prefix
+                stats.update(predicted, block_target, scored, begin)
                 if drift is not None:
                     drift.update(
-                        predicted,
+                        drift_predicted,
                         block_target,
                         block_rotation,
                         block_clock,
-                        active,
+                        block_mask * prefix,
                         begin,
                     )
                 if reference is not None:
                     reference.update(
-                        constant.expand_as(block_target), block_target, active
+                        constant.expand_as(block_target), block_target, scored
                     )
 
-            feed(span_stats, span_drift, span_reference, block_mask)
+            feed(span_stats, span_drift, span_reference, torch.ones_like(block_mask))
             for ticks, stats, drift, reference in buckets:
                 # A prefix that ended before this block has nothing to add.
                 if begin >= ticks:
@@ -1102,7 +1237,7 @@ def run_span_horizons(
                     stats,
                     drift,
                     reference,
-                    block_mask * (tick_index < ticks).to(block_mask.dtype),
+                    (tick_index < ticks).to(block_mask.dtype),
                 )
     finally:
         model.train(was_training)
@@ -1201,6 +1336,31 @@ def run_span_horizons(
     )
     whole_span["whole_span_minutes"] = span_minutes
     return results, whole_span
+
+
+def _hold_emitted(
+    predicted: torch.Tensor, fired: torch.Tensor, carried: Optional[torch.Tensor]
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Hold each emitted output ``(C, L, 3)`` until the next one fires.
+
+    Ticks before the first emission (in this block and, via ``carried``, in
+    every earlier one) keep the model's own per-tick value. Returns the held
+    series and the output to carry into the next block.
+    """
+
+    count, length, _ = predicted.shape
+    index = torch.arange(length, device=predicted.device).expand(count, length)
+    latest, _ = torch.cummax(torch.where(fired, index, torch.full_like(index, -1)), dim=1)
+    held = predicted.gather(1, latest.clamp_min(0).unsqueeze(-1).expand(count, length, 3))
+    before = (latest < 0).unsqueeze(-1)
+    if carried is not None:
+        fallback = carried.unsqueeze(1).expand(count, length, 3)
+    else:
+        fallback = predicted
+    held = torch.where(before, fallback, held)
+    if carried is None and not bool((latest[:, -1] >= 0).any()):
+        return held, None
+    return held, held[:, -1]
 
 
 def stream_horizon_metrics(
@@ -1360,6 +1520,7 @@ __all__ = [
     "prefix_leg",
     "run_span_horizons",
     "scatter_span_tokens",
+    "scatter_span_velocity",
     "stream_horizon_metrics",
     "ticks_per_horizon",
     "whole_span_series",

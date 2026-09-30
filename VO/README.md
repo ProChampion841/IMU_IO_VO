@@ -184,10 +184,15 @@ already inside that job on the second entry) - there is no separate
 it grows with the number of ranks; the start banner prints `world=…` and
 `effective_batch=…` to confirm it did what you intended.
 
-**No early stopping.** `--epochs` is the whole budget; pick it from
+**Early stopping is opt-in.** `--epochs` is the budget; pick it from
 *optimiser steps* (windows / (batch x ranks) per epoch), not wall clock -
 300 epochs at ten ranks on a short split can be a few hundred steps, which is
-a convergence pilot, not a trained model. Watch `runs/<name>/metrics.csv`.
+a convergence pilot, not a trained model. `--patience N` stops a run whose
+`--select-on` metric has not improved by `--min-delta` for N epochs (the count
+survives a resume); `best.pt` is the selected checkpoint either way. Watch
+`runs/<name>/metrics.csv`. `--lr-warmup-epochs N` ramps the learning rate in
+over the first N epochs - worth it with `--lr-scaling linear` over many ranks,
+where the first epochs otherwise take very large steps.
 
 **Resuming** re-runs the *original* command with `--resume <path>` added
 (`last.pt` is written after every completed epoch). The dataset, the input
@@ -234,6 +239,72 @@ that bypasses `DistributedDataParallel`'s gradient-sync hooks - so do not
 attempt to enable it in a multi-GPU run; it is a later, separate piece of
 work.
 
+## High altitude: the planar frontend
+
+At a few hundred metres one frame of separation moves the ground less than
+one correlation cell (0.66 cells at 200 m, 20 m/s, 20 Hz, 1024 px wide with
+f = 1052 px), so the per-pair speed is a sub-cell measurement and is at the
+mercy of matching noise; a model trained on it memorises the flight instead
+of measuring it. The remedy is a longer baseline - but a one-second baseline
+brings ten-plus degrees of rotation between the two frames, which the
+learned small-angle rotation field cannot remove. `--frontend planar` is built
+for this regime:
+
+1. the second frame is **warped by the exact interframe rotation** from the
+   attitude log (not a linearised field), so what remains is translation;
+2. a **coarse search, voted on by the whole image**, finds the ground motion
+   around a nominal velocity (`--prior-velocity`, default the training mean),
+   on features with their local mean removed (`--coarse-highpass`,
+   `--fine-highpass`) so a large field or forest cannot pose as a match;
+3. a **fine per-cell search** around the motion that estimate predicts,
+   then a **robust least-squares fit of the camera translation over a flat
+   ground plane**, with the ground tilt from roll/pitch and the altimeter
+   pinning the vertical component (`--altitude-constraint`);
+4. the output is a **metric velocity per pair**, and the default
+   `--velocity-mode geometric_residual` makes the model's prediction that
+   velocity (held between pairs) plus a learned correction that starts at
+   zero - an untrained model already outputs the closed-form estimate.
+
+On a flight rendered by `tools/make_synthetic_flight.py` at 200 m, 20 m/s,
+20 Hz and 1024x576 (f = 1052 px) with S-turns to 25 deg of bank, the
+**untrained** planar frontend measures velocity to 0.20 m/s RMS per pair at a
+one-second baseline and 0.33 m/s at half a second; the model it replaces
+reports 2.6-3.7 m/s per axis on the real flight. The real flight will be
+harder (texture, lens residual, clock offset, rolling shutter), but those
+are the numbers to beat.
+
+Before the first planar run, once per capture:
+
+```bash
+# how far the ground moves per --frame-gap, and which gap to use
+python tools/check_motion_budget.py --dataset data \
+    --calibration configs/vo/camera_fixedwing.json --output artifacts/motion_budget.json
+
+# which way the camera points on the airframe (and a scale check that
+# RelativeAlt, the focal length and the clock agree)
+python tools/estimate_camera_mounting.py --dataset data \
+    --calibration configs/vo/camera_fixedwing.json --output artifacts/camera_mounting.json
+```
+
+`estimate_camera_mounting.py` prints a `mounting.camera_from_body` block to
+paste into the calibration file (or pass `--camera-mounting
+artifacts/camera_mounting.json`). A wrong mounting is not a small error - it
+swaps or negates the forward and lateral axes - so do not guess it. Its
+"measured / predicted motion" ratio should be within a few percent of 1.0;
+if it is not, fix the altitude column, the focal length or the image time
+offset before training.
+
+`--frontend planar` needs no other flag: it sets `--frame-gap` to the frames
+in `--planar-baseline-s` (1.0 s: 20 at 20 Hz), caps the pair interval at 1.5x
+that, sets `--warmup` past the first pair's arrival, uses radius 3 and the
+`simple` loss, and - when neither `--camera-mounting` nor the calibration
+gives a mounting - measures the mounting from the training images at
+start-up. Every value it chose is printed and recorded in the checkpoint;
+any flag given explicitly wins. The commands are the "200 m" section of
+[`commands.txt`](commands.txt). `--color` loads RGB frames for a colour
+camera, and `--photometric-augment 0.15` jitters exposure between the two
+frames of a pair during training, as an auto-exposure camera does.
+
 ## Evaluating
 
 ```bash
@@ -250,11 +321,57 @@ cannot, whether the recurrent state accumulates error over a long flight.
 `--splits full` scores the whole capture and is a drift diagnostic, not a
 held-out number. `--plots` (on by default) writes a dead-reckoned trajectory
 figure, a per-axis velocity-vs-truth figure, an error-growth figure, and a
-summary against horizon length.
+summary against horizon length. `--stratify` (on by default) also breaks the
+whole-split error down by turn rate, bank angle, altitude and ground speed,
+so a model that is good in cruise and poor in turns says so.
 
 Run it three ways per checkpoint before trusting a result: on `validation`
 while iterating, on `validation --disable-visual-input` as the visual-blind
 floor, and on `--splits test` exactly once, at the end.
+
+## Exporting to ONNX
+
+```bash
+pip install onnx onnxruntime
+python tools/export_onnx.py runs/vo_planar_500ms/best.pt --output-dir export/onnx
+python tools/onnx_inference.py export/onnx --dataset data_split/test \
+    --checkpoint runs/vo_planar_500ms/best.pt --output artifacts/onnx_velocity_test.csv
+```
+
+Two graphs, because the model runs at two rates:
+
+* `frontend.onnx` - once per image pair: both frames at the working size
+  (float 0-1, `(1, C, H, W)`), `pair_dt_s`, and the pair geometry
+  (`relative_rotation`, `down_body`, `altitude_m`). The working-resolution
+  intrinsics are baked in. Returns the visual token, quality, whether the pair
+  is delivered (`pair_reliable`) and the per-pair metric velocity.
+* `temporal_step.onnx` - once per telemetry tick: the aiding vector, the
+  current visual inputs and the carried recurrent state in; the velocity
+  (m/s, body frame) and the next state out. Batch is dynamic.
+
+`vo_onnx.json` records everything a runtime must reproduce: image
+preprocessing, intrinsics, the aiding channels and normaliser, the per-tick
+rules (presence, visual age, held velocity, state feedback), timing, and the
+measured ONNX-vs-PyTorch difference. The export fails if any output differs
+from PyTorch by more than `--tolerance` (1e-3).
+
+`tools/onnx_inference.py` is the deployable runtime: numpy, onnxruntime and
+Pillow only (OpenCV only for lens distortion), no torch, no project code.
+Copy it with the export folder. `VOOnnxRuntime.add_frame(image, t)` takes
+every camera frame, `add_telemetry(t, roll, pitch, yaw, rel_alt)` every
+telemetry row and returns that tick's velocity; `emitted` is True on the
+ticks that carry a new output (one per pair with `--output-on-pairs`). It
+reproduces the training rules exactly - pairing, delivery one latency after
+the second exposure, attitude interpolated at both exposures, refused pairs
+not delivered, held velocity, visual age. Given `--dataset` it replays a
+flight folder through the same class; `--checkpoint` also runs the PyTorch
+model (via `tools/onnx_reference.py`) and fails unless both deliver pairs on
+the same ticks and agree within `--tolerance` (0.05 m/s).
+
+ONNX has no matrix inverse and cannot trace the adaptive pooling here, so
+during export only the 3x3 solves use the closed-form adjugate and adaptive
+pooling uses exact averaging matrices; both are covered by
+`tests/test_onnx_export.py`.
 
 ## GPU gate, before spending server time on a full run
 

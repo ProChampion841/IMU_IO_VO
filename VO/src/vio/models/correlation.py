@@ -239,17 +239,54 @@ class LocalCorrelation(nn.Module):
         sampled = sampled.reshape(batch, channels, candidates, height, width)
         return sampled, valid
 
+    def _target_validity(
+        self,
+        target_valid: torch.Tensor,
+        center_map: Optional[torch.Tensor],
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        """Whether each candidate's TARGET cell holds real image content.
+
+        Sampled with the very same integer-shift or grid-sample machinery the
+        features go through, so the mask and the correlation cannot disagree
+        about which cell a candidate reads. Nearest rather than bilinear
+        semantics via the 0.5 threshold: a candidate half on missing pixels is
+        treated as missing.
+        """
+
+        mask = target_valid.to(dtype=torch.float32)
+        if center_map is None:
+            padded = F.pad(mask, (self.radius, self.radius, self.radius, self.radius))
+            sampled, _ = self._all_integer_shifts(mask, padded, height, width)
+        else:
+            sampled, _ = self._all_grid_samples(mask, center_map.to(mask.dtype), height, width)
+        return sampled[:, 0] > 0.5
+
     def forward(
         self,
         feature_t: torch.Tensor,
         feature_tp1: torch.Tensor,
         search_center: Optional[torch.Tensor] = None,
+        target_valid: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        """``target_valid`` is an optional ``(B, 1, H, W)`` mask on the SECOND
+        map: 1 where it holds real image content. A second frame warped by a
+        rotation homography has regions no pixel of the original reached, and
+        a candidate landing there compares against zero-padding - a black
+        border that correlates with nothing, or worse, with any dark ground.
+        Such candidates are removed exactly like candidates off the edge of
+        the map, so every statistic below (confidence floor, entropy,
+        ``flow_valid``) accounts for them.
+        """
+
         if feature_t.ndim != 4 or feature_t.shape != feature_tp1.shape:
             raise ValueError("Feature maps must be matching BxCxHxW tensors")
         if not feature_t.is_floating_point() or not feature_tp1.is_floating_point():
             raise TypeError("Feature maps must be floating-point tensors")
         batch, _, height, width = feature_t.shape
+        if target_valid is not None and target_valid.shape != (batch, 1, height, width):
+            raise ValueError("target_valid must have shape (B, 1, H, W)")
         if self.center_features:
             # Subtract the component every position shares before normalising.
             # Without it the cosine is dominated by the map's DC term: on a
@@ -273,6 +310,8 @@ class LocalCorrelation(nn.Module):
             shifted, valid = self._all_integer_shifts(right, padded_right, height, width)
         else:
             shifted, valid = self._all_grid_samples(right, center_map, height, width)
+        if target_valid is not None:
+            valid = valid & self._target_validity(target_valid, center_map, height, width)
         # (B, C, K, H, W) x (B, C, 1, H, W) -> sum over C -> (B, K, H, W), the
         # same per-candidate cosine correlation the old loop built one
         # candidate at a time.
