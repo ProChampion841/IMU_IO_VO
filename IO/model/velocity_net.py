@@ -97,6 +97,21 @@ class VelocityNet(Encoder):
         # Scales the head's raw output into m/s so the zero-init start is not
         # numerically tiny relative to a ~20 m/s target.
         self.vel_output_scale = float(conf.get("vel_output_scale", 10.0))
+        # Optional STARTING velocity, body frame, m/s (default: none = start at zero).
+        # Put the corpus-mean body velocity here and the head starts at the
+        # "always predict the mean" baseline and learns the residual around it,
+        # instead of spending its first epochs climbing from 0 to ~22 m/s.  Only the
+        # final bias is set -- the weight stays zero -- so the start is still
+        # deterministic.  No new parameter, so checkpoints load either way.
+        vel_bias_init = conf.get("vel_bias_init", None)
+        if vel_bias_init is not None:
+            b = torch.tensor([float(v) for v in vel_bias_init],
+                             dtype=self.vel_decoder[-1].bias.dtype)
+            if b.shape != (3,):
+                raise ValueError("vel_bias_init must be 3 numbers (body x, y, z m/s), "
+                                 "got %r" % (vel_bias_init,))
+            with torch.no_grad():
+                self.vel_decoder[-1].bias.copy_(b / self.vel_output_scale)
         # Initial variance, (m/s)^2.  HybridNet's heads used exp(h - 5) = 6.7e-3, which
         # is right for a CORRECTION residual and badly wrong here: the model starts at
         # ZERO velocity, so the initial error is ~|v| ~ 25 m/s and err^2/sigma^2 would

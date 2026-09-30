@@ -90,16 +90,9 @@ def _head(d_in, d_hidden, d_out=3):
 def _zero_last(seq):
     """Zero the final Linear of a head so it emits exactly 0 at initialisation.
 
-    CURRENTLY UNCALLED, and kept for that reason.  Its only call site was
-    ``HybridNet.__init__``, which applied it to the four correction heads before
-    those were deleted.  ``VelocityNet.__init__`` (model/velocity_net.py:73-74)
-    builds ``vel_decoder`` / ``velcov_decoder`` with plain ``_head()`` and never
-    calls this -- so the comment above those two lines, which states they are
-    zero-initialised, does NOT describe the code.  Measured consequence at step 0:
-    ``vel_body`` is a random field of mean norm ~3.2 m/s instead of 0, and
-    ``vel_cov`` spans ~0.41-2.67 (m/s)^2 instead of sitting at ``velnet_cov_init``.
-    Calling this on both heads is the two-line fix; it CHANGES training behaviour,
-    so it is deliberately not applied here.
+    Called by ``VelocityNet.__init__`` on ``vel_decoder`` / ``velcov_decoder`` (and
+    ``veldir_decoder`` when built), so velnet starts at exactly zero velocity and
+    ``vel_cov == velnet_cov_init``.
 
     The upstream heads rely on ``default_init * acc_std`` being "small".  It is
     not especially small: measured, the untrained CodeNet emits a correction of
@@ -170,6 +163,16 @@ class Encoder(ModelBase):
         self.gru_window = (max(1, int(round(gru_window_frames / float(self.interval))))
                            if gru_window_frames > 0 else 0)
         self.gru_window_frames = self.gru_window * self.interval
+        # `gru_context` (FRAMES, default 0 = off) gives every chunk a WARM-UP prefix:
+        # the chunk is run over the `gru_context` frames before it as well, and only
+        # its own outputs are kept.  Without it the hard cutoff above leaves the output
+        # at each chunk start with zero history -- an amnesia every 2.97 s at
+        # gru_window 300.  With context C, every output sees at least C frames and
+        # at most C + gru_window.  Cost: (W + C) / W times the GRU compute.
+        # Only meaningful with gru_window > 0; no parameters, so checkpoints load.
+        gru_context_frames = int(conf.get("gru_context", 0))
+        self.gru_context = (max(0, int(round(gru_context_frames / float(self.interval))))
+                            if self.gru_window > 0 else 0)
         mamba_dim = int(conf.get("mamba_dim", 128))
         mamba_layers = int(conf.get("mamba_layers", 2))
         self.mamba_stride = int(conf.get("mamba_stride", 8))
@@ -267,7 +270,9 @@ class Encoder(ModelBase):
         # Zero everywhere except airspeed, so `(x - in_offset) / in_scale` is
         # bit-identical to the old `x / in_scale` for every pre-existing config.
         self.register_buffer("in_offset", torch.cat(_offset))
-        self.cnn = CNNEncoder(c_list=[self.in_dim, 32, cnn_dim], k_list=[7, 7], s_list=[3, 3])
+        self.cnn_norm = str(conf.get("cnn_norm", "batch"))
+        self.cnn = CNNEncoder(c_list=[self.in_dim, 32, cnn_dim], k_list=[7, 7], s_list=[3, 3],
+                              norm=self.cnn_norm)
 
         # `branches` selects which of the two paths is BUILT.  "mamba" and "gru" skip
         # constructing the other branch entirely rather than building it and not calling
@@ -328,9 +333,11 @@ class Encoder(ModelBase):
         gw = ("whole window" if self.gru_window == 0
               else "%d tok = %d frames = %.2f s" % (self.gru_window, self.gru_window_frames,
                                                     self.gru_window_frames / 100.0))
-        print("[encoder] branches=%s in_dim=%d (att_input=%s, att_source=%s) "
+        if self.gru_context:
+            gw += " + %d tok context" % self.gru_context
+        print("[encoder] branches=%s in_dim=%d (att_input=%s, att_source=%s) cnn_norm=%s "
               "fuse=%s fuse_dropout=%.2f%s%s params=%d"
-              % (self.branches, self.in_dim, self.att_input, self.att_source,
+              % (self.branches, self.in_dim, self.att_input, self.att_source, self.cnn_norm,
                  self.fuse_mode, self.fuse_dropout,
                  (" gru(hidden=%d, window=%s)" % (gru_hidden, gw)) if self.use_gru else "",
                  (" mamba(dim=%d, layers=%d, stride=%d -> %.2f s/step, kernel=%s)"
@@ -444,7 +451,26 @@ class Encoder(ModelBase):
         pad = n * W - T
         if pad:
             tokens = torch.cat([tokens, tokens.new_zeros(B, pad, C)], dim=1)
-        h = self._gru_stack(tokens.reshape(B * n, W, C))              # (B*n, W, H)
+        K = self.gru_context
+        if K <= 0:
+            h = self._gru_stack(tokens.reshape(B * n, W, C))          # (B*n, W, H)
+            return h.reshape(B, n * W, -1)[:, :T, :]
+        # Overlapping chunks: chunk i covers tokens [i*W - K, (i+1)*W).  The first
+        # chunk has no real history, so its prefix is the first token repeated -- the
+        # same "repeat the first real sample" rule as padding9_honest, rather than
+        # zeros the CNN never emits.  Outputs of the prefix are discarded.
+        # Built from reshape/slice/cat only (no Tensor.unfold) so it exports to ONNX.
+        main = tokens.reshape(B, n, W, C)
+        first = tokens[:, :1].unsqueeze(1)                            # (B, 1, 1, C)
+        if K <= W:
+            # Chunk i's context is the last K tokens of chunk i-1.
+            ctx = torch.cat([first.expand(B, 1, K, C), main[:, :-1, W - K:]], dim=1)
+        else:
+            # Context longer than a chunk: slice it out of the prefixed sequence.
+            seq = torch.cat([first[:, 0].expand(B, K, C), tokens], dim=1)
+            ctx = torch.stack([seq[:, i * W:i * W + K] for i in range(n)], dim=1)
+        chunks = torch.cat([ctx, main], dim=2).reshape(B * n, K + W, C)
+        h = self._gru_stack(chunks)[:, K:, :]                         # (B*n, W, H)
         return h.reshape(B, n * W, -1)[:, :T, :]
 
     def encoder(self, x):

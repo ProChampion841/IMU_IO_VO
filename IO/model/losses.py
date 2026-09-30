@@ -47,11 +47,23 @@ def velocity_loss(inte_state, label, confs):
     gt_body = gt_rot[:, :n].Inv() @ gt_vel[:, :n]
 
     dist = pred - gt_body
+
+    # ---- BURN-IN (opt-in, `loss_burnin` in FRAMES, default 0 = off) ------------------
+    # Both branches start every window from h0 = 0.  The first frames of a window are
+    # predicted from almost no history -- the Mamba branch does not take its first
+    # real step until 9 * mamba_stride frames in (8.64 s at stride 96) -- yet they were
+    # scored exactly like frames with a full minute behind them, so part of the
+    # gradient was spent on frames the model cannot get right.  Burn-in drops them from
+    # the OBJECTIVE only.  The reported `vel`/`pos` metrics below still cover every
+    # frame, so runs with and without burn-in stay comparable on the same numbers.
+    b = min(max(int(confs.get("loss_burnin", 0)), 0), n - 1)
+    pred_l, gt_l, dist_l = pred[:, b:], gt_body[:, b:], dist[:, b:]
+
     # NOT `vel_huber_delta` -- that key already exists in these configs at 0.27,
     # a CORRECTION-scale delta.  Reusing the name would silently apply 0.27 m/s
     # to a ~20 m/s target, which is pure L1 by accident rather than by choice.
     delta = float(confs.get("velnet_huber_delta", 1.0))
-    loss = torch.nn.functional.huber_loss(pred, gt_body, delta=delta)
+    loss = torch.nn.functional.huber_loss(pred_l, gt_l, delta=delta)
 
     out = {"vel": dist.norm(dim=-1).mean(),
            "vel_rel": (dist[:, 1:] - dist[:, :-1]).norm(dim=-1).mean()}
@@ -64,14 +76,66 @@ def velocity_loss(inte_state, label, confs):
         out["pos"] = out["vel"].new_zeros(())
         out["pos_rel"] = out["vel"].new_zeros(())
 
+    # ---- DRIFT TERM (opt-in, `drift_weight` > 0) ----------------------------------------
+    # Position error is the INTEGRAL of velocity error, so what drives drift is the
+    # low-frequency part of the error -- a bias held for tens of seconds -- while
+    # per-frame Huber weighs a +3/-3 m/s zig-zag (which integrates to ~0) the same as a
+    # steady +3 m/s (which integrates to 30 m per 10 s).  This term scores the MEAN
+    # world-frame velocity error over non-overlapping segments of `drift_seg`
+    # frames, i.e. the displacement error of each segment divided by its duration.
+    # World frame, because displacement is accumulated in the world frame: a body-frame
+    # mean would let a lateral error cancel through a turn that the position does not
+    # forget.  The rotation is label['gt_rot'] -- the same attitude the label uses.
+    drift_w = float(confs.get("drift_weight", 0.0))
+    if drift_w > 0.0:
+        S = max(int(confs.get("drift_seg", 1000)), 1)
+        k = dist_l.shape[1] // S
+        if k >= 1:
+            err_w = gt_rot[:, b:b + k * S] @ dist_l[:, :k * S]
+            seg = err_w.reshape(err_w.shape[0], k, S, 3).mean(dim=2)       # (B, k, 3)
+            drift = torch.nn.functional.huber_loss(
+                seg, torch.zeros_like(seg),
+                delta=float(confs.get("drift_huber_delta", delta)))
+            loss = loss + drift_w * drift
+            out["drift_loss"] = (drift_w * drift).detach()
+            # m/s: the average size of a segment's mean velocity error -- the number
+            # that multiplies by segment length to give drift.
+            out["seg_vel_bias"] = seg.detach().norm(dim=-1).mean()
+
     # Uncertainty: err^2/sigma^2 + ln sigma^2.  Without it the head is free to
     # emit any constant and the covariance would mean nothing.
+    #
+    # `cov_nll_mode` (default "plain" = unchanged):
+    #   "detach"  the NLL sees a DETACHED error, so it trains the variance head only
+    #             and never pulls on the velocity.  The mean is then set by Huber
+    #             alone, and cov_weight can be raised without trading accuracy for
+    #             calibration.
+    #   "beta"    beta-NLL (Seitzer et al., ICLR 2022): each term is weighted by a
+    #             DETACHED sigma^(2*beta), `cov_nll_beta` (default 0.5).  Plain NLL
+    #             down-weights exactly the frames with large error (their gradient is
+    #             divided by sigma^2); beta-NLL removes most of that bias.
+    # Note the measured overconfidence on validation is mostly the train/val gap --
+    # the head is calibrated on TRAIN -- so no NLL form fixes it on its own.
     cov = inte_state.get("vel_cov")
     if confs.propcov and cov is not None:
-        nll = diag_ln_cov_loss(dist, cov[:, :n])
+        cov_n = cov[:, :n]
+        cov_l = cov_n[:, b:]
+        mode = str(confs.get("cov_nll_mode", "plain"))
+        if mode == "plain":
+            nll = diag_ln_cov_loss(dist_l, cov_l)
+        elif mode == "detach":
+            nll = diag_ln_cov_loss(dist_l.detach(), cov_l)
+        elif mode == "beta":
+            beta = float(confs.get("cov_nll_beta", 0.5))
+            per = dist_l.pow(2) / cov_l + torch.log(cov_l)
+            nll = (cov_l.detach().pow(beta) * per).mean()
+        else:
+            raise ValueError("cov_nll_mode must be plain|detach|beta, got %r" % (mode,))
         loss = loss + confs.cov_weight * nll
         out["cov_loss"] = (confs.cov_weight * nll).detach()
-        out["cov_nll_vel"] = nll.detach()
+        # Always the UNWEIGHTED plain NLL over every frame, whatever the training
+        # form, so this column stays comparable across modes and burn-in settings.
+        out["cov_nll_vel"] = diag_ln_cov_loss(dist, cov_n).detach()
         out["cov_nll_rot"] = nll.new_zeros(())
         out["cov_nll_pos"] = nll.new_zeros(())
         out["pred_cov_vel"] = cov[:, :n].mean().detach()
@@ -99,7 +163,7 @@ def velocity_loss(inte_state, label, confs):
     dir_w = float(confs.get("vel_dir_weight", 0.0))
     if kappa is not None and dir_w > 0.0:
         dir_nll, cos, n_used = vmf_dir_nll(
-            pred, gt_body, kappa[:, :n],
+            pred_l, gt_l, kappa[:, b:n],
             min_speed=float(confs.get("vel_dir_min_speed", 1.0)))
         loss = loss + dir_w * dir_nll
         k_det = kappa[:, :n].detach()

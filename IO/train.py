@@ -331,6 +331,11 @@ class EpochLogger:
                                    d.get("pred_dir_sigma_deg"), epoch)
                 self.tb.add_scalar("%s_dir/kappa" % tag, d.get("pred_kappa"), epoch)
                 self.tb.add_scalar("%s_dir/loss" % tag, d.get("dir_loss"), epoch)
+            # Drift term (drift_weight > 0): TensorBoard only, so metric.csv keeps its
+            # header.  seg_vel_bias is the mean velocity error per drift segment, m/s.
+            if d.get("seg_vel_bias") is not None:
+                self.tb.add_scalar("%s_drift/loss" % tag, d.get("drift_loss"), epoch)
+                self.tb.add_scalar("%s_drift/seg_vel_bias_mps" % tag, d["seg_vel_bias"], epoch)
             self.tb.add_scalar("%s/loss" % tag, d["loss"], epoch)
             self.tb.add_scalar("%s/pos_error_m" % tag, d["pos_loss"], epoch)
             self.tb.add_scalar("%s/vel_error_mps" % tag, d["vel_loss"], epoch)
@@ -578,7 +583,8 @@ def train(network, loader, confs, epoch, optimizer, ema=None, ema_decay=0.0):
     # feature off and no column appears -- metric.csv keeps its existing shape.
     # dir_err_deg is how wrong the direction IS; pred_dir_sigma_deg is how wrong the
     # model THINKS it is. Watching them converge is the whole point of the head.
-    _DIR_KEYS = ('dir_loss', 'dir_nll', 'dir_err_deg', 'pred_dir_sigma_deg', 'pred_kappa')
+    _DIR_KEYS = ('dir_loss', 'dir_nll', 'dir_err_deg', 'pred_dir_sigma_deg', 'pred_kappa',
+                 'drift_loss', 'seg_vel_bias')
     dir_acc = {}
     # When rotation is not scored it is not accumulated either.  losses.py still
     # returns the key (the covariance NLL needs rot_dist), we simply do not read
@@ -674,7 +680,8 @@ def test(network, loader, confs, epoch=None):
         # feature off and no column appears -- metric.csv keeps its existing shape.
         # dir_err_deg is how wrong the direction IS; pred_dir_sigma_deg is how wrong the
         # model THINKS it is. Watching them converge is the whole point of the head.
-        _DIR_KEYS = ('dir_loss', 'dir_nll', 'dir_err_deg', 'pred_dir_sigma_deg', 'pred_kappa')
+        _DIR_KEYS = ('dir_loss', 'dir_nll', 'dir_err_deg', 'pred_dir_sigma_deg', 'pred_kappa',
+                     'drift_loss', 'seg_vel_bias')
         dir_acc = {}
 
         desc = "val   ep %03d" % epoch if epoch is not None else "val"
