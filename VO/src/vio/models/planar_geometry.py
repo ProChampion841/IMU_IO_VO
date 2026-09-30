@@ -46,11 +46,64 @@ Conventions, used everywhere below:
 
 from __future__ import annotations
 
+import contextlib
 import math
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Iterator, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# 3x3 linear algebra
+# ---------------------------------------------------------------------------
+
+#: Set only while exporting to ONNX (see :func:`onnx_safe_linalg`). ONNX has no
+#: matrix inverse or linear solve, so every 3x3 one below switches to the
+#: closed-form adjugate while this is on. Training and evaluation never see it.
+_CLOSED_FORM_3X3 = False
+
+
+@contextlib.contextmanager
+def onnx_safe_linalg() -> Iterator[None]:
+    """Use closed-form 3x3 inverses/solves inside this block (ONNX export)."""
+
+    global _CLOSED_FORM_3X3
+    previous = _CLOSED_FORM_3X3
+    _CLOSED_FORM_3X3 = True
+    try:
+        yield
+    finally:
+        _CLOSED_FORM_3X3 = previous
+
+
+def inverse_3x3(matrix: torch.Tensor) -> torch.Tensor:
+    """Inverse of a batch of 3x3 matrices, ``(..., 3, 3)``, by the adjugate."""
+
+    a, b, c = matrix[..., 0, 0], matrix[..., 0, 1], matrix[..., 0, 2]
+    d, e, f = matrix[..., 1, 0], matrix[..., 1, 1], matrix[..., 1, 2]
+    g, h, i = matrix[..., 2, 0], matrix[..., 2, 1], matrix[..., 2, 2]
+    co_a, co_b, co_c = e * i - f * h, f * g - d * i, d * h - e * g
+    determinant = a * co_a + b * co_b + c * co_c
+    adjugate = torch.stack(
+        (
+            torch.stack((co_a, c * h - b * i, b * f - c * e), dim=-1),
+            torch.stack((co_b, a * i - c * g, c * d - a * f), dim=-1),
+            torch.stack((co_c, b * g - a * h, a * e - b * d), dim=-1),
+        ),
+        dim=-2,
+    )
+    return adjugate / determinant.unsqueeze(-1).unsqueeze(-1)
+
+
+def _inv3(matrix: torch.Tensor) -> torch.Tensor:
+    return inverse_3x3(matrix) if _CLOSED_FORM_3X3 else torch.linalg.inv(matrix)
+
+
+def _solve3(matrix: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    if _CLOSED_FORM_3X3:
+        return inverse_3x3(matrix) @ rhs
+    return torch.linalg.solve(matrix, rhs)
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +261,7 @@ def rotation_homography(camera_matrix: torch.Tensor, rotation_camera: torch.Tens
     ``R^T r0`` and projects to ``K R^T K^-1 p0``.
     """
 
-    inverse = torch.linalg.inv(camera_matrix)
+    inverse = _inv3(camera_matrix)
     return camera_matrix @ rotation_camera.transpose(-1, -2) @ inverse
 
 
@@ -367,7 +420,7 @@ def fit_planar_translation(
 
     def solve(row_weight: torch.Tensor) -> torch.Tensor:
         normal, rhs = system(row_weight)
-        return torch.linalg.solve(normal, rhs.unsqueeze(-1)).squeeze(-1)
+        return _solve3(normal, rhs.unsqueeze(-1)).squeeze(-1)
 
     u = solve(base)
     for _ in range(max(int(iterations), 0)):
@@ -397,7 +450,7 @@ def fit_planar_translation(
         # The effective sample count is the weight sum over the mean weight, so
         # a fit on many low-confidence cells is not credited as if each were exact.
         mean_weight = weight_sum / (final_weight > 0).sum(dim=1).clamp_min(1)
-        covariance = torch.linalg.inv(information) * (variance * mean_weight).view(-1, 1, 1)
+        covariance = _inv3(information) * (variance * mean_weight).view(-1, 1, 1)
         residual_rms = variance.clamp_min(0.0).sqrt()
         inlier_fraction = final_weight.sum(dim=1) / base.sum(dim=1).clamp_min(1e-12)
     return {
@@ -582,9 +635,11 @@ __all__ = [
     "ground_normal_camera",
     "local_highpass",
     "half_rotation",
+    "inverse_3x3",
     "matrix_to_axis_angle",
     "mounting_matrix",
     "normalized_to_cells",
+    "onnx_safe_linalg",
     "plane_scale",
     "planar_displacement",
     "relative_rotation_camera",

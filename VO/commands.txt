@@ -41,3 +41,7 @@ python tools/train_fixedwing_vo.py --dataset data_split/train --validation-datas
 
 # 4. evaluate (the checkpoint carries frame gap, mounting, colour; --stratify is on by default)
 python tools/evaluate_velocity_horizons.py runs/vo_planar_s0/best.pt --dataset data_split/validation --device cuda:0 --output artifacts/eval_planar.json --plot-dir artifacts/plots_planar
+
+# 5. export to ONNX (checked against PyTorch), then standalone ONNX inference over the test split
+python tools/export_onnx.py runs/vo_planar_s0/best.pt --output-dir export/onnx
+python tools/onnx_inference.py export/onnx --dataset data_split/test --checkpoint runs/vo_planar_s0/best.pt --output artifacts/onnx_velocity_test.csv

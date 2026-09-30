@@ -329,6 +329,50 @@ Run it three ways per checkpoint before trusting a result: on `validation`
 while iterating, on `validation --disable-visual-input` as the visual-blind
 floor, and on `--splits test` exactly once, at the end.
 
+## Exporting to ONNX
+
+```bash
+pip install onnx onnxruntime
+python tools/export_onnx.py runs/vo_planar_500ms/best.pt --output-dir export/onnx
+python tools/onnx_inference.py export/onnx --dataset data_split/test \
+    --checkpoint runs/vo_planar_500ms/best.pt --output artifacts/onnx_velocity_test.csv
+```
+
+Two graphs, because the model runs at two rates:
+
+* `frontend.onnx` - once per image pair: both frames at the working size
+  (float 0-1, `(1, C, H, W)`), `pair_dt_s`, and the pair geometry
+  (`relative_rotation`, `down_body`, `altitude_m`). The working-resolution
+  intrinsics are baked in. Returns the visual token, quality, whether the pair
+  is delivered (`pair_reliable`) and the per-pair metric velocity.
+* `temporal_step.onnx` - once per telemetry tick: the aiding vector, the
+  current visual inputs and the carried recurrent state in; the velocity
+  (m/s, body frame) and the next state out. Batch is dynamic.
+
+`vo_onnx.json` records everything a runtime must reproduce: image
+preprocessing, intrinsics, the aiding channels and normaliser, the per-tick
+rules (presence, visual age, held velocity, state feedback), timing, and the
+measured ONNX-vs-PyTorch difference. The export fails if any output differs
+from PyTorch by more than `--tolerance` (1e-3).
+
+`tools/onnx_inference.py` is the deployable runtime: numpy, onnxruntime and
+Pillow only (OpenCV only for lens distortion), no torch, no project code.
+Copy it with the export folder. `VOOnnxRuntime.add_frame(image, t)` takes
+every camera frame, `add_telemetry(t, roll, pitch, yaw, rel_alt)` every
+telemetry row and returns that tick's velocity; `emitted` is True on the
+ticks that carry a new output (one per pair with `--output-on-pairs`). It
+reproduces the training rules exactly - pairing, delivery one latency after
+the second exposure, attitude interpolated at both exposures, refused pairs
+not delivered, held velocity, visual age. Given `--dataset` it replays a
+flight folder through the same class; `--checkpoint` also runs the PyTorch
+model (via `tools/onnx_reference.py`) and fails unless both deliver pairs on
+the same ticks and agree within `--tolerance` (0.05 m/s).
+
+ONNX has no matrix inverse and cannot trace the adaptive pooling here, so
+during export only the 3x3 solves use the closed-form adjugate and adaptive
+pooling uses exact averaging matrices; both are covered by
+`tests/test_onnx_export.py`.
+
 ## GPU gate, before spending server time on a full run
 
 ```bash

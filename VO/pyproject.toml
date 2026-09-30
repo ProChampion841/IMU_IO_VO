@@ -36,6 +36,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# tools/export_onnx.py and tools/onnx_inference.py only.
+onnx = [
+    "onnx",
+    "onnxruntime",
+]
 dev = [
     "pytest>=7",
     "ruff>=0.4",
