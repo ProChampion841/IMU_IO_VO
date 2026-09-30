@@ -26,12 +26,14 @@ repeat the first attitude's g_body and use init_rot^T @ [0,0,g] for acc, 0 gyro.
 
 FIXED LENGTH.  The graph is exported for one window length (--frames).  The GRU
 chunking and the Mamba scan are unrolled at that length, so feed exactly N frames.
-Batch is dynamic.  Export once per length you need (e.g. 3000 / 6000 / 12000).
+Batch is dynamic.  Default 4000 frames = 40 s, the TRAINING window of the
+tilt_aware run (logs/parameters.yaml: window_size 4000).  Export once per length
+you need (e.g. --frames 3000 / 6000 / 12000).
 
 Usage (from the IMU folder):
     python -m tools.export_onnx --config configs/exp/UAV/tilt_rotate.conf \
         --ckpt experiments/UAV/tilt_rotate/ckpt/best_model.ckpt \
-        --frames 6000 --out tilt_rotate_6000.onnx
+        --frames 4000 --out tilt_rotate_40s.onnx
 
 It always runs a check afterwards: ONNX Runtime vs PyTorch on random windows, and
 fails loudly if they disagree beyond --atol.
@@ -187,15 +189,17 @@ def main():
                     "unless --random_weights)")
     ap.add_argument("--random_weights", action="store_true",
                     help="export an untrained network -- plumbing test only")
-    ap.add_argument("--frames", type=int, default=6000,
-                    help="output window length in frames (100 Hz); input is frames+9")
-    ap.add_argument("--out", default=None, help="default: <config name>_<frames>.onnx")
+    ap.add_argument("--frames", type=int, default=4000,
+                    help="output window length in frames (100 Hz); input is frames+9. "
+                         "Default 4000 = 40 s, the training window")
+    ap.add_argument("--out", default=None, help="default: <config name>_<seconds>s.onnx")
     ap.add_argument("--opset", type=int, default=17)
     ap.add_argument("--atol", type=float, default=1e-4)
     a = ap.parse_args()
     if not a.ckpt and not a.random_weights:
         sys.exit("give --ckpt, or --random_weights for a plumbing test")
-    out = a.out or "%s_%d.onnx" % (os.path.splitext(os.path.basename(a.config))[0], a.frames)
+    out = a.out or "%s_%gs.onnx" % (os.path.splitext(os.path.basename(a.config))[0],
+                                    a.frames / 100.0)
     model = build(a.config, a.ckpt)
     if a.random_weights:
         print("[onnx] WARNING: exporting RANDOM weights -- not a usable model")

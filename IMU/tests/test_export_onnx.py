@@ -63,3 +63,16 @@ def test_export_causal_cnn(tmp_path):
     out = str(tmp_path / "m.onnx")
     export(m, FRAMES, out)
     assert verify(m, out, FRAMES, batches=(1, 4)) <= 1e-4
+
+
+def test_export_40s_default_window(tmp_path):
+    """The shipped default: 4000 frames = 40 s, the training window."""
+    m = build(_cfg("tilt_rotate"))
+    randomise_zero_heads(m)
+    out = str(tmp_path / "tilt_rotate_40s.onnx")
+    export(m, 4000, out)
+    import onnx
+    g = onnx.load(out).graph
+    dims = [d.dim_value for d in g.input[0].type.tensor_type.shape.dim]
+    assert dims[1:] == [4009, 3]                      # 4000 + 9 history samples
+    assert verify(m, out, 4000, batches=(1, 2)) <= 1e-4

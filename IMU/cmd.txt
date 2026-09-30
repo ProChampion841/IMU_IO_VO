@@ -104,6 +104,7 @@ python -m tools.eval_vel_horizons --config configs/exp/UAV/tilt_rotate.conf ^
 :: window length, then checks ONNX Runtime against PyTorch and prints PASS/FAIL.
 python -m tools.export_onnx --config configs/exp/UAV/tilt_rotate.conf ^
   --ckpt experiments/UAV/tilt_rotate/ckpt/best_model.ckpt ^
-  --frames 6000 --out tilt_rotate_6000.onnx
+  --frames 4000 --out tilt_rotate_40s.onnx
+:: 4000 frames = 40 s, the training window.  Input is 4009 samples (9 of history).
 
 :: tests (CPU, no data):  python -m pytest tests -q
