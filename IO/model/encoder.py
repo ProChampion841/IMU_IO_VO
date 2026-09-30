@@ -459,9 +459,17 @@ class Encoder(ModelBase):
         # chunk has no real history, so its prefix is the first token repeated -- the
         # same "repeat the first real sample" rule as padding9_honest, rather than
         # zeros the CNN never emits.  Outputs of the prefix are discarded.
-        tokens = torch.cat([tokens[:, :1].expand(B, K, C), tokens], dim=1)
-        chunks = tokens.unfold(1, W + K, W)                           # (B, n, C, W+K)
-        chunks = chunks.permute(0, 1, 3, 2).reshape(B * n, W + K, C)
+        # Built from reshape/slice/cat only (no Tensor.unfold) so it exports to ONNX.
+        main = tokens.reshape(B, n, W, C)
+        first = tokens[:, :1].unsqueeze(1)                            # (B, 1, 1, C)
+        if K <= W:
+            # Chunk i's context is the last K tokens of chunk i-1.
+            ctx = torch.cat([first.expand(B, 1, K, C), main[:, :-1, W - K:]], dim=1)
+        else:
+            # Context longer than a chunk: slice it out of the prefixed sequence.
+            seq = torch.cat([first[:, 0].expand(B, K, C), tokens], dim=1)
+            ctx = torch.stack([seq[:, i * W:i * W + K] for i in range(n)], dim=1)
+        chunks = torch.cat([ctx, main], dim=2).reshape(B * n, K + W, C)
         h = self._gru_stack(chunks)[:, K:, :]                         # (B*n, W, H)
         return h.reshape(B, n * W, -1)[:, :T, :]
 

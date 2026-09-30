@@ -75,3 +75,10 @@ python train.py --config configs/exp/UAV/velnet_v3b_arch.conf --device cuda:0
 
 # train (V3: both)
 python train.py --config configs/exp/UAV/velnet_v3.conf --device cuda:0
+
+# ---------------------------------------------------------------------------
+# ONNX export (+ automatic onnxruntime vs PyTorch check). Window length is FIXED.
+# inputs: acc (B,F,3) m/s^2 FLU, gyro (B,F,3) rad/s FLU [, airspeed (B,F,1)]
+# outputs: vel_body (B,F,3) m/s, vel_cov (B,F,3) (m/s)^2
+# ---------------------------------------------------------------------------
+python -m tools.export_onnx --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --out experiments/UAV/velnet_v3/velnet_6000.onnx --frames 6000
