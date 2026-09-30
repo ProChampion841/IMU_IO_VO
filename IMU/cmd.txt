@@ -108,3 +108,20 @@ python -m tools.export_onnx --config configs/exp/UAV/tilt_rotate.conf ^
 :: 4000 frames = 40 s, the training window.  Input is 4009 samples (9 of history).
 
 :: tests (CPU, no data):  python -m pytest tests -q
+
+:: ---------------------------------------------------------------- ONNX inference
+:: Flight logs -> ONNX model -> vel/dir/pos errors, same numbers as eval_vel_horizons.
+:: The window comes from the ONNX file (40 s export -> 40 s windows); every horizon
+:: must fit inside it.  For 3-5 min horizons export with --frames 30000 first.
+python -m tools.onnx_inference --onnx tilt_rotate_40s.onnx ^
+  --config configs/exp/UAV/tilt_rotate.conf --splits inference ^
+  --horizons 3000 4000 --out_csv onnx_windows.csv
+
+:: one flight, and check ONNX against the PyTorch checkpoint on real data
+python -m tools.onnx_inference --onnx tilt_rotate_40s.onnx ^
+  --config configs/exp/UAV/tilt_rotate.conf --splits inference ^
+  --csv 2026_02_06_143_23_sensor_data.csv --horizons 3000 4000 ^
+  --compare_ckpt experiments/UAV/tilt_rotate/ckpt/best_model.ckpt
+
+:: arrays only (no dataset code, no PyTorch): acc, gyro, g_body of (4009, 3)
+python -m tools.onnx_inference --onnx tilt_rotate_40s.onnx --npz window.npz --out_npz window_out.npz
