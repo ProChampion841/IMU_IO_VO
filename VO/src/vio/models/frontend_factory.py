@@ -92,8 +92,8 @@ def build_frontend(
             prior_velocity_body=(
                 (20.0, 0.0, 0.0) if prior_velocity is None else tuple(float(v) for v in prior_velocity)
             ),
-            coarse_factor=int(get("coarse_factor", 4)),
-            coarse_radius=int(get("coarse_radius", 6)),
+            coarse_factor=int(get("coarse_factor", 4) or 4),
+            coarse_radius=int(get("coarse_radius", 6) or 6),
             coarse_highpass=int(get("coarse_highpass", 5)),
             fine_highpass=int(get("fine_highpass", 9)),
             fine_iterations=int(get("fine_iterations", 2)),

@@ -557,10 +557,12 @@ def build_parser() -> argparse.ArgumentParser:
              "training split's mean velocity. The coarse window reaches +/- "
              "(--coarse-radius x --coarse-factor) cells around it.",
     )
-    planar.add_argument("--coarse-factor", type=int, default=4,
-                        help="Feature pooling for the coarse stage (default 4).")
-    planar.add_argument("--coarse-radius", type=int, default=6,
-                        help="Coarse search radius in pooled cells (default 6).")
+    planar.add_argument("--coarse-factor", type=int, default=None,
+                        help="Feature pooling for the coarse stage. Default 4, or 2 "
+                             "when the feature map is too small for 4.")
+    planar.add_argument("--coarse-radius", type=int, default=None,
+                        help="Coarse search radius in pooled cells. Default 6, "
+                             "reduced to fit a small feature map.")
     planar.add_argument("--coarse-highpass", type=int, default=5,
                         help="Local-mean kernel removed from coarse features (odd; 1 = off).")
     planar.add_argument("--fine-highpass", type=int, default=9,
@@ -1027,6 +1029,21 @@ def resolve_frontend_defaults(
             chosen.append(f"--warmup {args.warmup} (first pair arrives after ~{blind} ticks)")
         else:
             args.warmup = 20
+    if planar and (args.coarse_factor is None or args.coarse_radius is None):
+        # The coarse window must fit inside the pooled feature map; pick the
+        # largest settings (up to 4x pooling, radius 6) that do, so a small
+        # --image-size works instead of failing at start-up.
+        short_side = min(int(args.image_size[0]), int(args.image_size[1])) // int(args.patch_size)
+        wanted = args.coarse_radius if args.coarse_radius is not None else 6
+        factor = args.coarse_factor
+        if factor is None:
+            factor = 4 if short_side // 4 >= 2 * wanted + 1 else 2
+        radius = args.coarse_radius
+        if radius is None:
+            radius = max(1, min(6, (short_side // factor - 1) // 2))
+        if args.coarse_factor is None or args.coarse_radius is None:
+            chosen.append(f"--coarse-factor {factor} --coarse-radius {radius} (feature map short side {short_side} cells)")
+        args.coarse_factor, args.coarse_radius = int(factor), int(radius)
     if args.correlation_radius is None:
         args.correlation_radius = 3 if planar else 4
         if planar:

@@ -182,7 +182,9 @@ class PlanarFlowFrontend(VisionMambaFlowFrontend):
         if min(fine_size) // int(coarse_factor) < 2 * int(coarse_radius) + 1:
             raise ValueError(
                 f"a {coarse_factor}x-pooled {fine_size[0]}x{fine_size[1]} feature map "
-                f"is too small for a coarse search radius of {coarse_radius}"
+                f"is too small for a coarse search radius of {coarse_radius}: use "
+                f"--coarse-factor 2 and/or a smaller --coarse-radius, or a larger "
+                f"--image-size"
             )
         self.coarse_factor = int(coarse_factor)
         self.coarse_radius = int(coarse_radius)
