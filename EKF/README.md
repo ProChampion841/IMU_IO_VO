@@ -11,6 +11,7 @@ at every horizon: `vel_rmse`, `vel_max_error`, `dir_rmse`, `dir_max_error` and
 IMU (acc, gyro, 100 Hz) ─► [optional ONNX IMU correction] ─► ESKF predict
 VO  (body velocity + log-variance, FRD) ─► FRD→FLU ─────────► ESKF update (velocity)
 attitude (GPSNavEul, or MTi EulX/Y/Z) ──────────────────────► ESKF update (tilt / heading)
+land matching (absolute position, NWU m, may arrive late) ──► ESKF update (position, rewind)
 ```
 
 ## Layout
@@ -24,6 +25,7 @@ EKF/
   ekf/pipeline.py     windows from the IMU project, ONNX correction, the 3 arms, metrics
   ekf/stream.py       stream (real-time) front end: messages in arrival order
   ekf/events.py       message logs: build from a flight, write/read, replay
+  ekf/landmatch.py    land-matching position fixes: simulate, read CSV, lat/lon → NWU
   run_ekf.py          OFFLINE evaluation: windows from GPS truth, imu / vo / ekf table
   run_stream.py       STREAM test: GPS then outage, EKF vs IMU-only, optional C++ check
   cpp/                C++17 stream EKF for the Jetson (see cpp/README.md)
@@ -49,6 +51,7 @@ EKF/
 | predict | a_w = R(acc − b_a) − g; p += v·dt + ½a_w·dt²; v += a_w·dt; R = R·Exp((gyro − b_g)·dt) |
 | VO update | z = Rᵀv (+ ω × lever arm); H_v = Rᵀ, H_θ = [Rᵀv]×, H_bg = [lever]× |
 | attitude update | z = Log(R_meas·Rᵀ) in the world frame; rows 1–2 are tilt, row 3 is heading, and each can be switched off |
+| position update | z = p + R·lever (world NWU, m); H_p = I, H_θ = −R[lever]×; north/west rows only unless `pos_use_vertical` |
 
 - Every update is **χ²-gated** (99.9 %) and uses the Joseph form.
 - With no updates, the prediction step is exactly the IMU project's integrator.
@@ -195,6 +198,80 @@ Tests (`tests/test_imu_model.py`):
   C++ EKF matches Python on it
 - the **C++ corrector matches Python** (max difference 1.2e-7)
 
+## Land matching: absolute position fixes (`--pos_sim`, `--pos_csv`, `--pos_dir`)
+
+VO and attitude never observe **position**, so without an absolute fix position
+only drifts. A land-matching (map-matching) fix corrects it directly. Through the
+filter's correlations it also corrects velocity, makes **heading** observable once
+the aircraft turns or accelerates, and keeps the IMU biases learnable during the
+GPS outage.
+
+```bash
+# simulated fixes (GPS truth + 10 m noise, 1 Hz, 0.5 s late): a FILTER test
+python run_stream.py --imu_config ../IMU/configs/exp/UAV/tilt_rotate.conf \
+    --splits inference --vo_dir vo_cache --pos_sim --gps_s 60 \
+    --horizons 30s 1m 2m 5m 10m --out_csv stream_landmatch.csv
+
+# your matcher's fixes, one CSV per flight (<flight>_pos.csv); VO is optional
+python run_stream.py --imu_config ../IMU/configs/exp/UAV/tilt_rotate.conf \
+    --splits inference --pos_dir landmatch --pos_origin 37.123456 127.123456 50.0
+```
+
+The fixes go to the **ekf** arm only, so the table reads "ekf (VO + land match) /
+imu-only". The run also prints how many fixes were accepted, gated, rewound,
+dropped, or caused a reset, and the NIS mean of the accepted fixes (2 with
+north/west only; above that, raise the fix std).
+
+**Fix CSV** (`ekf/landmatch.py`, one row per fix; column names are not case-sensitive):
+
+| column | meaning |
+|---|---|
+| `time` (or `t`, `time_s`) | when the **image** was taken, same clock as the IMU (`--pos_time_offset` otherwise) |
+| `arrival` (optional) | when the matcher delivered the fix; else `time + --pos_latency_s` |
+| `north, west[, up]` or `x, y[, z]` | position in the filter's NWU frame, m |
+| `lat, lon[, alt]` | WGS-84 degrees instead; needs `--pos_origin LAT LON [ALT]`, the point where the filter's position is 0 |
+| `std`, or `std_x/y/z`, or `var_x/y/z` (optional) | the fix's uncertainty; else `position_aid.pos_std_m`; × `pos_var_scale` |
+| `valid` (optional) | rows with 0 are skipped |
+
+**The fix must be where the aircraft (or camera) is.** If the matcher reports
+the ground point at the image centre instead, that point is off by height above
+ground × tan(tilt) (100 m and 5°: 8.7 m). Convert it before feeding the filter.
+A camera offset from the IMU goes in `position_aid.pos_lever_arm_m`.
+
+**Frame.** The filter works in local NWU metres. In this project position 0 is
+the start of the log (truth = integrated GPS velocity), so `--pos_origin` must be
+the GPS position at that moment. On the aircraft, pick any origin, convert fixes
+with `geodetic_to_nwu` / C++ `geodeticToNwu`, and start the filter at the first fix.
+
+**Late fixes.** Matching takes time. A fix applied to the current state would
+be wrong by speed × delay (25 m/s × 0.5 s = 12.5 m). The filter therefore keeps
+the last `pos_replay_s` (3 s) of its history. A late fix **rewinds** to its image
+time, is applied there, and everything since is re-run. The result is
+bit-identical to an on-time fix (`tests/test_position.py`). A fix older than
+`pos_replay_s` is dropped; raise it if your matcher is slower. The cost is about
+0.6 MB of history in C++.
+
+**Wrong matches and lock-out.**
+- Every fix is χ²-gated (99.9 %), so a wrong match over repetitive terrain is
+  rejected.
+- After a long outage the filter can be confidently wrong, and then it would
+  reject every good fix. When `pos_reset_after` (3) fixes in a row are rejected
+  **and agree with each other** (within `pos_reset_agree_sigma` = 3 σ), the
+  position is reset to the fix. Wrong matches do not agree, so they never reset.
+  Set `pos_reset_after: 0` to disable this.
+
+| `position_aid` key | default | meaning |
+|---|---|---|
+| `pos_use_vertical` | false | use the fix height too (matchers rarely give a usable one) |
+| `pos_lever_arm_m` | [0, 0, 0] | IMU → the point the fix refers to (camera), body FLU, m |
+| `pos_replay_s` | 3.0 | history kept for late fixes; 0 = apply late fixes at once |
+| `pos_reset_after`, `pos_reset_agree_sigma` | 3, 3.0 | lock-out reset (see above) |
+| `pos_std_m`, `pos_var_scale` | 10.0, 1.0 | std for a CSV without one; inflation of the variance (matching errors are correlated, like VO's) |
+
+`pos_sim` sets the simulated fixes: rate, white and slow (Gauss-Markov) error,
+latency, and a fraction of wrong matches. `--pos_rate_hz`, `--pos_std_m` and
+`--pos_latency_s` override it from the command line.
+
 ## Horizons 30 s … 40 min
 
 Both scripts take `--horizons 30s 1m 2m 3m 4m 5m 10m 15m 20m 30m 40m`, which is
@@ -268,6 +345,7 @@ python -m pytest tests -q
 | end-to-end | synthetic flight log with a bias drift: EKF beats IMU-only; ONNX block correction equals the IMU project's ONNX pipeline |
 | stream (`test_stream.py`) | stream = offline exactly; real use (GPS then outage, VO 0.1 s late, 1 % IMU dropped, a 0.5 s IMU dropout): biases learned, VO beats IMU-only; **C++ = Python** on the same message log |
 | VO ONNX (`test_vo_onnx.py`) | only delivered pairs are kept, FRD→FLU, variance = exp(log-variance), cache round trip |
+| land matching (`test_position.py`) | update and lever-arm Jacobian; a fix 0.5 / 0.9 s late gives **exactly** the on-time result; fixes older than the history are dropped; fixes bound the drift and wrong matches are gated; the lock-out reset; CSV and lat/lon input; **C++ = Python** with late fixes, wrong matches and a reset |
 
 ## Tuning order
 

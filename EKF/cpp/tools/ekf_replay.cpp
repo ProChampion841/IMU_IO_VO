@@ -9,6 +9,8 @@
 //   VO,t,vx,vy,vz,varx,vary,varz          body FLU (use imuvo::frdToFlu on VO output)
 //   ATT,t,qw,qx,qy,qz                     nav attitude, body -> world
 //   GPS,t,vx,vy,vz,varx,vary,varz         world velocity while GPS is up
+//   POS,t,px,py,pz,varx,vary,varz         land-matching position fix, world NWU m, stamped
+//                                         with its image time (the line sits where it ARRIVED)
 // Lines starting with '#' are ignored.
 // states.csv: the state after every IMU message.
 #include <chrono>
@@ -68,6 +70,8 @@ int main(int argc, char** argv) {
             ekf.onAttitude(x[0], quatToMat({x[1], x[2], x[3], x[4]}));
         } else if (type == "GPS" && x.size() >= 7) {
             ekf.onGpsVelocity(x[0], {x[1], x[2], x[3]}, {x[4], x[5], x[6]});
+        } else if (type == "POS" && x.size() >= 7) {
+            ekf.onPosition(x[0], {x[1], x[2], x[3]}, {x[4], x[5], x[6]});
         } else {
             std::cerr << "skipping line: " << line << "\n";
             continue;
@@ -89,8 +93,10 @@ int main(int argc, char** argv) {
     std::fclose(out);
     const Counters& c = ekf.counters();
     std::printf("messages %ld | imu %ld (gaps %ld) | vo %ld (gated %ld, late %ld, dropped %ld) | "
-                "att %ld | gps %ld | out-of-order %ld | %.2f us per message\n",
+                "att %ld | gps %ld | pos %ld (gated %ld, late %ld, dropped %ld, resets %ld) | "
+                "out-of-order %ld | %.2f us per message\n",
                 n_msg, c.imu, c.imu_gap, c.vo, c.vo_gated, c.vo_late, c.vo_dropped, c.att, c.gps,
-                c.out_of_order, 1e6 * busy_s / std::max(1L, n_msg));
+                c.pos, c.pos_gated, c.pos_late, c.pos_dropped, c.pos_reset, c.out_of_order,
+                1e6 * busy_s / std::max(1L, n_msg));
     return 0;
 }

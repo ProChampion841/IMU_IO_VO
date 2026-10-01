@@ -56,6 +56,20 @@ python run_stream.py --csv 2026_02_06_143_23_sensor_data.csv ^
   --vo_onnx ..\VO\export\onnx --vo_dataset ..\VO\data_split\test --vo_cache vo_143_23.csv ^
   --gps_s 60 --horizons 30s 1m 2m 3m 4m 5m
 
+:: ---------------------------------------------------------------- LAND MATCHING (absolute position)
+:: SIMULATED fixes from GPS truth (10 m, 1 Hz, 0.5 s late; settings: pos_sim in the config)
+python run_stream.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --vo_dir vo_cache --pos_sim --gps_s 60 ^
+  --horizons 30s 1m 2m 5m 10m --out_csv stream_landmatch.csv
+:: your matcher's fixes: landmatch\<flight>_pos.csv (time, lat, lon[, std][, arrival]),
+:: origin = GPS position at the log start.  VO is optional.
+python run_stream.py --imu_config ..\IMU\configs\exp\UAV\tilt_rotate.conf ^
+  --splits inference --pos_dir landmatch --pos_origin 37.123456 127.123456 50.0 ^
+  --gps_s 60 --horizons 30s 1m 2m 5m 10m
+:: check C++ = Python on a log with late fixes
+python run_stream.py --csv 2026_02_06_143_23_sensor_data.csv --vo_csv vo_143_23.csv ^
+  --pos_sim --events_out events_pos.csv --cpp cpp\build\ekf_replay
+
 :: ---------------------------------------------------------------- C++ (Jetson)
 cd cpp
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

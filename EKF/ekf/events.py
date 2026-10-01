@@ -10,18 +10,21 @@ how the two are compared.  Format (one message per line, SI, NWU / FLU):
     VO,t,vx,vy,vz,varx,vary,varz        body FLU velocity + variance
     ATT,t,qw,qx,qy,qz                   nav attitude, body -> world
     GPS,t,vx,vy,vz,varx,vary,varz       world velocity (only while GPS is up)
+    POS,t,px,py,pz,varx,vary,varz       absolute position fix (land matching), world NWU m
+                                        (t = the time the image was taken; the line sits
+                                        where the fix ARRIVED, which may be much later)
 """
 import numpy as np
 
 from . import so3
 from .stream import StreamEKF
 
-_PRIO = {"INIT": 0, "IMU": 1, "GPS": 2, "VO": 3, "ATT": 4}
+_PRIO = {"INIT": 0, "IMU": 1, "POS": 1.5, "GPS": 2, "VO": 3, "ATT": 4}
 
 
 def build_events(fl, vo, t_init, t_end, gps_until=None, gps_rate_hz=5.0, gps_std=0.1,
                  att_source="gt", vo_latency_s=0.0, imu_drop=0.0, seed=0,
-                 init="gt", init_vo=None, init_att_std_deg=1.0, imu_fn=None):
+                 init="gt", init_vo=None, init_att_std_deg=1.0, imu_fn=None, pos=None):
     """Message log for one flight.
 
     fl         dict from pipeline.load_flight (raw IMU, truth)
@@ -40,6 +43,8 @@ def build_events(fl, vo, t_init, t_end, gps_until=None, gps_rate_hz=5.0, gps_std
                messages to send, [(arrival_t, stamp_t, acc, gyro), ...] -- e.g. the
                learned correction run causally (ekf/imu_model.py), which releases each
                sample a little after its own timestamp.
+    pos        PosFixes (ekf/landmatch.py) or None: absolute position fixes, each sent
+               at its own arrival time (fix.t_arrival) and stamped with fix.t.
     """
     rng = np.random.default_rng(seed)
     t = fl["t"]
@@ -78,6 +83,10 @@ def build_events(fl, vo, t_init, t_end, gps_until=None, gps_rate_hz=5.0, gps_std
         for tv, v, var in zip(vo.t, vo.v, vo.var):
             if t[i0] < tv <= t[i1]:
                 ev.append((tv + vo_latency_s, "VO", tv, np.r_[v, var]))
+    if pos is not None:
+        for tp, ta, p, var in zip(pos.t, pos.t_arrival, pos.p, pos.var):
+            if t[i0] < tp <= t[i1]:
+                ev.append((ta, "POS", tp, np.r_[p, var]))
     ev.sort(key=lambda e: (e[0], _PRIO[e[1]]))
     return [(typ, tt, vals) for _, typ, tt, vals in ev]
 
@@ -103,6 +112,8 @@ def run_stream(events, make_filter):
     """Replay through a StreamEKF.  Returns the state after every IMU message:
     (M, 19) = t, p, v, q(wxyz), ba, bg, std_p, std_v -- the columns ekf_replay writes."""
     s = make_filter()
+    if not any(e[0] == "POS" for e in events):
+        s.replay_s = 0.0      # no fixes: skip the replay history (results are identical)
     rows = []
     for typ, t, x in events:
         if typ == "INIT":
@@ -121,6 +132,8 @@ def run_stream(events, make_filter):
             s.on_attitude(t, so3.quat_to_mat(x[0:4]))
         elif typ == "GPS":
             s.on_gps_velocity(t, x[0:3], x[3:6])
+        elif typ == "POS":
+            s.on_position(t, x[0:3], x[3:6])
     return np.array(rows), s
 
 
@@ -130,6 +143,8 @@ def stream_from_config(cfg):
     aid, vo = cfg["attitude_aid"], cfg["vo"]
     lever = np.asarray(vo.get("lever_arm_m", [0, 0, 0]), float)
     st = cfg.get("stream", {})
+    pa = cfg.get("position_aid", {})
+    pos_lever = np.asarray(pa.get("pos_lever_arm_m", [0, 0, 0]), float)
     return lambda: StreamEKF(ESKFParams.from_dict(cfg["eskf"]),
                              attitude_every=aid.get("every", 10),
                              std_tilt_deg=aid.get("std_tilt_deg"),
@@ -137,4 +152,9 @@ def stream_from_config(cfg):
                              lever=lever if np.any(lever) else None,
                              max_meas_age_s=st.get("max_meas_age_s", 1.0),
                              max_imu_gap_s=st.get("max_imu_gap_s", 0.1),
-                             gap_acc_std=st.get("gap_acc_std", 2.0))
+                             gap_acc_std=st.get("gap_acc_std", 2.0),
+                             pos_rows=(0, 1, 2) if pa.get("pos_use_vertical") else (0, 1),
+                             pos_lever=pos_lever if np.any(pos_lever) else None,
+                             replay_s=pa.get("pos_replay_s", 3.0),
+                             pos_reset_after=pa.get("pos_reset_after", 3),
+                             pos_reset_agree_sigma=pa.get("pos_reset_agree_sigma", 3.0))
