@@ -373,6 +373,27 @@ during export only the 3x3 solves use the closed-form adjugate and adaptive
 pooling uses exact averaging matrices; both are covered by
 `tests/test_onnx_export.py`.
 
+### Inference time against the real-time budget
+
+```bash
+python tools/benchmark_inference.py --checkpoint runs/vo_planar_s0/best.pt --threads 1 4
+python tools/benchmark_inference.py --frontend both          # untrained, trainer defaults
+python tools/benchmark_inference.py --frontend planar --frame-gap 10 --output-on-pairs
+```
+
+Prints both graphs' inputs and outputs, parameters per component, and the
+median/p90 latency of the frontend (per pair) and the temporal step (per
+tick), in PyTorch and in onnxruntime. It also times the runtime's per-frame
+JPEG decode, undistort and resize. It then sets these against the trained
+rates: frontend duty (pairs/s x (2 x preprocess + frontend), because the
+runtime preprocesses both frames of every pair), tick duty (telemetry Hz x
+step), and the latency margin against `--deployment-latency-s`, which a pair
+must beat or its token arrives later than the model was trained to expect.
+Timing does not depend on the weights, so the untrained mode is enough to
+size hardware. Run it on the target (`--providers CUDAExecutionProvider
+CPUExecutionProvider` for a GPU): numbers from another machine do not
+transfer.
+
 ## GPU gate, before spending server time on a full run
 
 ```bash
