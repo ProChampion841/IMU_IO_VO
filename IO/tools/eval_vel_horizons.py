@@ -35,14 +35,15 @@ counted and vel/dir/pos are optimistic for a GPS-denied aircraft.
 -----------
 At the first frame of each window the true velocity is known.  The offset
 
-    d = v_gt_body[0] - v_pred_body[0]
+    d = v_gt_world[0] - v_pred_world[0]
 
 is added to EVERY predicted velocity in that window, and position is re-integrated
 from the corrected velocity.  The first frame's velocity error is then exactly zero.
 `--v0_frames N` averages d over the first N frames instead of one (default 1).
 
-d is taken in the BODY frame, the frame the model predicts in, so it rotates with the
-aircraft the way a sensor or airspeed bias does.
+d is taken in the WORLD frame, so it stays fixed while the aircraft turns, the way
+wind does.  (An earlier version took it in the body frame, where it rotates with the
+aircraft like a sensor bias.)
 
 MEASURED on velnet_v2c epoch 35, eval split, 60 s windows: 44% of the residual
 variance is a constant offset, but an offset estimated from the first frame is off by
@@ -53,7 +54,7 @@ the flag and compare -- do not assume.
 
 HORIZONS
 --------
-Default: 30 s, 1 min, 5 min, 10 min, 15 min, 30 min, 40 min.  A flight shorter than T
+Default: 30 s, 1, 2, 5, 10, 15, 20, 30, 40 min.  A flight shorter than T
 supplies no window at T, so long horizons are computed on few flights or none; the
 table prints the window and flight count per row.  `--check` lists which flights are
 long enough without loading a checkpoint.
@@ -78,8 +79,8 @@ from model import net_dict
 from utils import move_to
 
 RATE_HZ = 100.0
-# 30 s, 1 min, 5 min, 10 min, 15 min, 30 min, 40 min at 100 Hz
-DEFAULT_HORIZONS = [3000, 6000, 30000, 60000, 90000, 120000, 180000, 228000]
+# 30 s, 1, 2, 5, 10, 15, 20, 30, 40 min at 100 Hz
+DEFAULT_HORIZONS = [3000, 6000, 12000, 30000, 60000, 90000, 120000, 180000, 240000]
 # Frames per batch.  Caps memory at long horizons: a 15 min window is 90,000 frames.
 FRAME_BUDGET = 240000
 METRICS = ("vel_rmse", "vel_max", "dir_rmse", "dir_max", "pos_error")
@@ -186,7 +187,7 @@ def window_errors(out, data, init_state, label, v0_frames=0):
     """Per-frame velocity and direction error, end-of-window position error.
 
     Returns (vel_err (B, n) m/s, dir_err (B, n) deg, pos_err (B,) m, offset (B, 3) or
-    None).  With v0_frames > 0 the body-frame offset between ground truth and the
+    None).  With v0_frames > 0 the world-frame offset between ground truth and the
     prediction over the first `v0_frames` frames is added to every frame, and position
     is re-integrated from the corrected velocity.
     """
@@ -197,11 +198,8 @@ def window_errors(out, data, init_state, label, v0_frames=0):
 
     if v0_frames:
         k = min(int(v0_frames), n)
-        gt_b0 = label["gt_rot"][:, :k].Inv() @ label["gt_vel"][:, :k]
-        # d = (gt_b0 - vb[:, :k]).mean(dim=1, keepdim=True)          # (B, 1, 3)
-        d = (label["gt_vel"][:, :k] - label["gt_rot"][:, :k] @ vb[:, :k]).mean(dim=1, keepdim=True)          # (B, 1, 3)
-        # vel_w = rot[:, :n] @ (vb[:, :n] + d)
-        vel_w = rot[:, :n] @ (vb[:, :n]) + d
+        d = (gt_v[:, :k] - rot[:, :k] @ vb[:, :k]).mean(dim=1, keepdim=True)   # (B, 1, 3)
+        vel_w = rot[:, :n] @ vb[:, :n] + d
         pos = integrate_pos(vel_w, data["dt"][:, :n], init_state["pos"])
         offset = d.squeeze(1)
     else:
@@ -223,12 +221,15 @@ def run_split(network, conf, section, horizon, device, batch_size, collate_fn,
     for entry in dc.data_list:
         entry["window_size"] = int(horizon)
         entry["step_size"] = int(horizon)
+    # The network runs in float32 (as in training).  The `inference` section loads
+    # float64, which crashed the first conv layer; position integration in float32 is
+    # accurate to ~1 mm over 40 min, so nothing is lost.
+    dc["dtype"] = "float32"
     ds = SeqeuncesDataset(data_set_config=dc)
     if len(ds) == 0:
         return None
     n_flights = len({int(e[0]) for e in ds.index_map})
     bs = max(1, min(int(batch_size), FRAME_BUDGET // int(horizon)))
-    bs = 1
     loader = Data.DataLoader(dataset=ds, batch_size=bs, shuffle=False,
                              collate_fn=collate_fn)
 
@@ -251,7 +252,6 @@ def run_split(network, conf, section, horizon, device, batch_size, collate_fn,
             n_win += int(ep.shape[0])
             if off is not None:
                 off_sum += float(off.norm(dim=-1).sum())
-            break
 
     return {"windows": n_win, "flights": n_flights,
             "vel_rmse": (v_sq / n_frames) ** 0.5, "vel_max": v_max,
@@ -270,14 +270,14 @@ def main():
                     "configs/exp/UAV/velnet_v1.conf")
     ap.add_argument("--ckpt", default=None, help="checkpoint (not needed with --check)")
     ap.add_argument("--horizons", type=int, nargs="+", default=DEFAULT_HORIZONS,
-                    help="horizons in FRAMES at 100 Hz (default: 30s 1min 5min 10min "
-                         "15min 30min 40min)")
+                    help="horizons in FRAMES at 100 Hz (default: 30s 1min 2min 5min 10min "
+                         "15min 20min 30min 40min)")
     ap.add_argument("--splits", nargs="+", default=["eval"],
                     help="dataset sections to evaluate (default: eval)")
     ap.add_argument("--flights", nargs="+", default=None,
                     help="only these flights: CSV name or any unique substring")
     ap.add_argument("--v0_offset", action="store_true",
-                    help="add the first-frame offset (v_gt - v_pred, body frame) to every "
+                    help="add the first-frame offset (v_gt - v_pred, world frame) to every "
                          "predicted velocity in the window, and re-integrate position")
     ap.add_argument("--v0_frames", type=int, default=1,
                     help="with --v0_offset: average the offset over this many first "
@@ -348,7 +348,7 @@ def main():
     if v0:
         offs = [r["mean_offset"] for r in rows if r["windows"]]
         if offs:
-            print("v0 offset: mean |d| removed = %.3f m/s (body frame)." % (sum(offs) / len(offs)))
+            print("v0 offset: mean |d| removed = %.3f m/s (world frame)." % (sum(offs) / len(offs)))
 
     if a.out:
         fields = ["split", "horizon", "horizon_frames", "v0_offset", "windows", "flights"]
