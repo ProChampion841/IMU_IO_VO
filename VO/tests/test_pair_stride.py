@@ -125,3 +125,66 @@ def test_the_onnx_runtime_pairs_exactly_as_training_does(rendered, tmp_path):
         str(export_dir), "--dataset", str(rendered),
         "--checkpoint", str(run_dir / "best.pt"), "--no-progress",
     ]) == 0
+
+
+def test_the_evaluator_scores_overlapping_pairs_exactly_as_training_does(rendered, tmp_path):
+    """One window through the trainer's VOStep and the same span streamed by
+    the evaluator: same delivered pairs, same scored ticks, same velocities."""
+
+    import torch
+
+    import vio.models.velocity_horizons as vh
+    from tools.export_onnx import load_models
+    from vio.data.calibration import maybe_load_camera_calibration
+    from vio.data.fixedwing_vo import VONormalizer, build_vo_dataset
+
+    run_dir = tmp_path / "run"
+    assert train_fixedwing_vo.main(
+        planar_argv(rendered, run_dir, frame_gap="20", output_on_pairs=True, pair_stride="10",
+                    dropout="0.1")
+    ) == 0
+    frontend, model, saved, camera, normalizer = load_models(run_dir / "best.pt")
+    calibration = maybe_load_camera_calibration(saved["calibration"])
+    span, warmup, length = (1200, 1600), 90, 400
+    dataset, _, attitude = build_vo_dataset(
+        rendered, span, image_size=tuple(saved["image_size"]), frame_gap=saved["frame_gap"],
+        pair_stride=saved["pair_stride"], max_frame_gap_s=saved["max_frame_gap_s"],
+        deployment_latency_s=saved["deployment_latency_s"],
+        camera_matrix=calibration.camera_matrix, calibration_image_size=calibration.native_size,
+        normalizer=VONormalizer(**normalizer), window_length=length, stride=length,
+        warmup=warmup, max_visual_events=14, grayscale=not saved.get("color", False),
+    )
+
+    step = train_fixedwing_vo.VOStep(
+        model, window_length=length, visual_dim=model.visual_dim, disable_visual=False,
+        frontend_chunk=8, deployment_latency_s=saved["deployment_latency_s"],
+        camera_matrix=camera, output_on_pairs=True,
+    ).eval()
+    item = dataset[0]
+    batch = {key: value.unsqueeze(0) for key, value in item.items()}
+    with torch.no_grad():
+        prediction, _, mask = train_fixedwing_vo.forward_batch(step, batch, torch.device("cpu"))
+    train_mask = mask[0].numpy() > 0
+    train_velocity = prediction["predicted_velocity"][0].numpy()
+    events = item["visual_event_index"][item["visual_event_valid"] > 0].numpy()
+    plan = dataset.image_source.plan
+    assert np.all(plan.second_index[events][:-2] == plan.first_index[events][2:])  # overlapping
+
+    tokens = vh.encode_span_tokens(
+        frontend, dataset.image_source, span=span, body_rate_rad_s=attitude.body_rate_rad_s,
+        times_s=attitude.times_s, visual_dim=model.visual_dim, device=torch.device("cpu"),
+        camera_matrix=camera, batch_pairs=3, attitude=attitude,
+    )
+    _, whole = vh.run_span_horizons(
+        model, aiding=dataset.aiding, log_altitude=dataset.log_altitude,
+        target_velocity=dataset.velocity_body, times_s=attitude.times_s, span=span,
+        tokens=tokens, deployment_latency_s=saved["deployment_latency_s"],
+        horizons_minutes=(0.05,), warmup_ticks=warmup, block_ticks=97,
+        collect_series=True, output_on_pairs=True,
+    )
+    streamed = whole["series"]["vel_predicted_body"][0]
+    eval_mask = np.isfinite(streamed).all(-1)
+    assert len(tokens) == events.size
+    assert train_mask.sum() > 3
+    assert np.array_equal(train_mask, eval_mask)
+    assert np.allclose(streamed[eval_mask], train_velocity[train_mask], atol=1e-5)

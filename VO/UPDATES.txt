@@ -774,8 +774,9 @@ NOT changed - decisions for the user:
       changes; neighbouring outputs share an image, so their errors are partly
       shared (vo.var_scale in the EKF is there for that).
 21.6  Refused without --output-on-pairs, or below 1 frame.
-21.7  New tests/test_pair_stride.py (6 tests), including an ONNX export and a
+21.7  New tests/test_pair_stride.py (7 tests), including an ONNX export and a
       standalone-runtime replay of a rendered flight with 1 s pairs every
       0.5 s: delivery ticks identical to PyTorch, max velocity difference
-      4.6e-5 m/s. commands.txt 3c is the run to compare against the 0.5 s
+      4.6e-5 m/s; and the evaluator against training on the same span with
+      overlapping pairs: same pairs, same scored ticks, velocities equal. commands.txt 3c is the run to compare against the 0.5 s
       baseline.
