@@ -478,6 +478,11 @@ class HybridNet(ModelBase):
         if self.att_input == "none":
             return None
         rot, _src = select_attitude(data, source=self.att_source)
+        if self.att_source == "mti" and _src != "mti":
+            # select_attitude fell back to data['rot'], the GPS-aided attitude.  For a
+            # GPS-free config that is leakage, so stop instead of warning.
+            raise RuntimeError("att_source: mti but the batch has no 'mti_rot'; refusing "
+                               "to fall back to the GPS-aided attitude")
         pad_len = data["acc"].shape[1] - rot.lshape[1]
         if pad_len < 0:
             raise RuntimeError(

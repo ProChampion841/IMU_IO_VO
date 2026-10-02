@@ -22,8 +22,9 @@ TWO MODES
 
 INTEGRATION.  `integrate_np` is a NumPy re-implementation of pypose's
 IMUPreintegrator exactly as the model uses it (gtrot: gravity removed with the
-nav-solution attitude; the specific force rotated into the world by the
-gyro-integrated attitude from the window start).  It is checked against pypose in
+attitude named by the config's rot_source -- GPSNavEul, or the MTi for a GPS-free
+model; the specific force rotated into the world by the gyro-integrated attitude
+from the window start).  It is checked against pypose in
 tests/test_onnx_inference.py.
 
 Examples (from the IMU folder):
@@ -177,7 +178,13 @@ def reduce(rows, arm):
     return out
 
 
-def print_table(split, table):
+def horizon_label(h, sampling=0):
+    """The time a horizon is actually MEASURED at: errors are recorded every
+    `sampling` frames, so 3991 frames is read at frame 3950 = 39.5 s."""
+    return "%gs" % ((endpoint_index(h, sampling) + 1) / 100.0)
+
+
+def print_table(split, table, sampling=0):
     print("\n=== ONNX SUMMARY -- model (raw in brackets; ratio = model/raw, <1 is better) ===")
     print("%-9s %-7s %6s | %s" % ("split", "horizon", "wins",
                                  " | ".join("%-22s" % n for n, _, _ in SUMMARY)))
@@ -185,7 +192,7 @@ def print_table(split, table):
     for h, n, m, r in table:
         cells = ["%8.3f (%8.3f) %4.2f" % (m[k], r[k], m[k] / max(r[k], 1e-12))
                  for k, _, _ in SUMMARY]
-        print("%-9s %-7s %6d | %s" % (split, "%gs" % (h / 100.0), n,
+        print("%-9s %-7s %6d | %s" % (split, horizon_label(h, sampling), n,
                                      " | ".join("%-22s" % c for c in cells)))
     print("units: vel m/s, dir deg, pos m.  *_rmse / pos_error are AT the horizon (pos_error")
     print("is the mean); *_max_error is the worst frame anywhere inside [0, T].")
@@ -229,12 +236,23 @@ def run_logs(a, model):
                  % (too_long, W, W / 100.0, max(too_long)))
     sampling = tc.get("sampling", 0)
     idx_of = {h: endpoint_index(h, sampling) for h in horizons}
+    for h in horizons:
+        if idx_of[h] + 1 != h:
+            print("[note] horizon %d frames is measured at frame %d (%s): errors are "
+                  "recorded every sampling = %d frames" % (h, idx_of[h] + 1,
+                                                           horizon_label(h, sampling), sampling))
     collate = collate_fcs[conf.dataset.get("collate", "base")]
     if conf.dataset.get("collate", "base") != "padding9":
         sys.exit("this ONNX pipeline expects the padding9 collate (9 history samples)")
     att_source = str(tc.get("att_source", "gt"))
     gravity = float(tc.get("gravity", 9.81007))
     gtrot = bool(tc.get("gtrot", False))
+    # the attitude that removes gravity -- the same choice model/net.py makes
+    rot_key = "mti_rot" if str(tc.get("rot_source", "gt")) == "mti" else "rot"
+    print("[attitude] network input: %s | gravity removal: %s"
+          % ("MTi (no GPS)" if att_source == "mti" else "GPSNavEul (GPS-aided)",
+             ("MTi (no GPS)" if rot_key == "mti_rot" else "GPSNavEul (GPS-aided)")
+             if gtrot else "integrated gyro"))
 
     ref_net = None
     if a.compare_ckpt:
@@ -285,7 +303,7 @@ def run_logs(a, model):
                     worst_diff = max(worst_diff, float(np.abs(
                         ref["corrected_acc"].numpy() - out["corrected_acc"]).max()))
                 dt = data["dt"].numpy()
-                rot_R = data["rot"].matrix().double().numpy() if gtrot else None
+                rot_R = data[rot_key].matrix().double().numpy() if gtrot else None
                 R0 = init["rot"].matrix().double().numpy()[:, 0]
                 p0 = init["pos"].double().numpy()[:, 0]
                 v0 = init["vel"].double().numpy()[:, 0]
@@ -325,7 +343,7 @@ def run_logs(a, model):
         if ref_net is not None:
             print("[compare] max |corrected_acc ONNX - PyTorch| = %.2e m/s^2 -> %s"
                   % (worst_diff, "PASS" if worst_diff < 1e-3 else "FAIL"))
-        print_table(split, table)
+        print_table(split, table, sampling)
         all_rows[split] = table
         win_rows += rows
 

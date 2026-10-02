@@ -794,6 +794,8 @@ def main_worker(local_rank, device_ids, args):
     ordinal it owns.  Called directly for a single device, or once per GPU by
     torch.multiprocessing.spawn / torchrun.
     """
+    from utils import pypose_compat
+    pypose_compat.apply()      # no-op unless this torch breaks pypose 0.9.5's cumprod
     world_size = len(device_ids) if device_ids else 1
     distributed = world_size > 1
 

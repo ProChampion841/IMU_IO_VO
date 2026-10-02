@@ -7,6 +7,7 @@ synthetic windows.
 import os
 import sys
 
+import numpy as np
 import pypose as pp
 import pytest
 import torch
@@ -284,3 +285,61 @@ def test_smooth_config_is_tilt_rotate_plus_one_key():
     b = dict(_conf("tilt_rotate_smooth").items())
     assert {k for k in set(a) | set(b) if a.get(k) != b.get(k)} == {"dtheta_smooth_weight"}
     assert b["dtheta_smooth_weight"] == 0.1
+
+
+# ---------------------------------------------------------------- GPS-free (MTi attitude)
+def _with_mti(data, init, tilt=0.0, seed=4):
+    """Add an MTi attitude: the nav attitude tilted by a random `tilt` (rad)."""
+    g = torch.Generator().manual_seed(seed)
+    B, Fr = data["rot"].lshape
+    err = torch.zeros(B, Fr, 3)
+    err[..., :2] = torch.randn(B, 1, 2, generator=g) * tilt          # roll / pitch error
+    mti = data["rot"] * pp.so3(err).Exp()
+    return dict(data, mti_rot=mti), dict(init, mti_rot=mti[:, :1])
+
+
+def _run(conf_name, data, init, **over):
+    conf = _conf(conf_name, **over)
+    conf.put("device", "cpu")
+    torch.manual_seed(0)
+    net = net_dict["hybridnet"](conf).eval()
+    _randomise_heads(net)
+    with torch.no_grad():
+        return net(dict(data), init)
+
+
+def test_rot_source_default_is_gpsnaveul_and_unchanged():
+    data, init, _ = _batch()
+    data, init = _with_mti(data, init, tilt=np.radians(1.5))
+    a = _run("tilt_rotate", data, init)
+    b = _run("tilt_rotate", data, init, rot_source="gt")
+    assert torch.equal(a["vel"], b["vel"]) and torch.equal(a["pos"], b["pos"])
+
+
+def test_rot_source_mti_uses_the_mti_attitude():
+    data, init, _ = _batch()
+    same_d, same_i = _with_mti(data, init, tilt=0.0)                 # MTi == nav attitude
+    gt = _run("tilt_rotate", same_d, same_i)
+    mti_same = _run("tilt_rotate", same_d, same_i, rot_source="mti")
+    assert torch.allclose(gt["vel"], mti_same["vel"], atol=1e-6)
+    tilt_d, tilt_i = _with_mti(data, init, tilt=np.radians(1.5))     # MTi tilted 1.5 deg
+    mti = _run("tilt_rotate", tilt_d, tilt_i, rot_source="mti")
+    gt2 = _run("tilt_rotate", tilt_d, tilt_i)
+    # gravity leaks through the 1.5 deg tilt: ~0.26 m/s^2 over 5 s
+    assert (mti["vel"][:, -1] - gt2["vel"][:, -1]).norm(dim=-1).min() > 0.3
+
+
+def test_rot_source_mti_never_falls_back_to_gps():
+    data, init, _ = _batch()                                           # no mti_rot
+    with pytest.raises(RuntimeError, match="GPS-aided"):
+        _run("tilt_rotate", data, init, rot_source="mti")
+    with pytest.raises(RuntimeError, match="GPS-aided"):
+        _run("tilt_rotate", data, init, att_source="mti")
+
+
+def test_gpsfree_config_has_no_gps_aided_input():
+    c = ConfigFactory.parse_file(os.path.join(ROOT, "configs/exp/UAV/gpsfree_rotate_smooth.conf"))
+    assert c.train.att_source == "mti" and c.train.rot_source == "mti" and c.train.gtrot
+    assert c.train.dtheta_smooth_weight == 0.1
+    for split in ("train", "eval", "test", "inference"):
+        assert c.dataset[split].freeze_hist_s == 0.0

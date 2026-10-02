@@ -36,3 +36,44 @@ HOW TO READ IT
     score both runs on the held-out flights (--splits inference --per_flight).
   - Val worse -> weight 0.03.  Gap still wide -> weight 0.3.
 ===============================================================================
+
+===============================================================================
+GPS-FREE MODEL: NO GPS-AIDED INPUT ANYWHERE                    2026-10-02
+===============================================================================
+
+WHY
+  The drone flies with NO GPS from take-off.  Every earlier model used GPS in
+  three places the drone will not have:
+      1. the network's gravity input g_body   <- GPSNavEul (GPS-aided attitude)
+      2. gravity removal in the integrator    <- GPSNavEul
+      3. the 15 s bias freeze                 <- fitted with GPS velocity
+
+WHAT CHANGED
+  model/net.py      new key  rot_source: gt | mti  (default gt = as before).
+                    mti = gravity is removed with the MTi attitude (EulX/Y/Z).
+                    Only TILT matters there, so the MTi's drifting heading does not
+                    enter.  No silent fallback: missing MTi -> error.
+  model/hybrid.py   att_source: mti now ERRORS instead of falling back to GPSNavEul.
+  tools/onnx_inference.py   integrates with the same attitude as the config, prints
+                    which one it uses; horizon labels show the time actually measured
+                    (3991 frames is measured at 39.5 s, now labelled so).
+  train.py, tools/eval_vel_horizons1.py   apply utils/pypose_compat (a no-op on the
+                    torch you train with; fixes a crash on newer torch).
+  configs/exp/UAV/gpsfree_rotate_smooth.conf
+                    = tilt_rotate_smooth + att_source mti + rot_source mti
+                      + freeze_hist_s 0 on every split.  Nothing else.
+  EKF/configs/ekf_gpsfree.json   MTi tilt aid (1.5 deg), heading not aided.
+  cmd.txt           section "GPS-FREE: TRAIN AND EVALUATE" at the top (one-line
+                    commands): train -> held-out eval -> ONNX export + check ->
+                    whole-flight EKF test with no GPS (model vs raw IMU).
+  tests             +4 (32 IMU tests pass; EKF 39 pass).
+
+STILL FROM GPS, ON PURPOSE
+  - labels (training only)
+  - the start state of each training window: on the drone the EKF supplies it.
+    The EKF whole-flight test (--no_gt) uses no GPS at all.
+
+READ THE RESULTS AGAINST GPS-FREE BASELINES ONLY
+  The raw arm changed too (MTi attitude, no freeze), so do not compare these ratios
+  with tilt_rotate.  Compare model vs raw of the SAME run, on --splits inference.
+===============================================================================

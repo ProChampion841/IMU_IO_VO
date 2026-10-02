@@ -254,7 +254,8 @@ def main(argv=None):
     rows_out, first_ev, nis_all, nis_pos, pos_cnt = [], None, [], [], {}
     flights = flight_list(a)
     print("[stream] %d flight(s) | %s | IMU %s | GPS %.0f s then outage | horizons %s"
-          % (len(flights), "NO GT: start from VO + nav attitude, no reset" if a.no_gt
+          % (len(flights), ("NO GT: start from VO + %s attitude, no reset"
+                            % ("MTi" if att == "mti" else "GPSNavEul")) if a.no_gt
              else "start from the GPS/nav state", a.imu, a.gps_s,
              " ".join(HZ.label(h) for h in hs)))
     for root, name in flights:

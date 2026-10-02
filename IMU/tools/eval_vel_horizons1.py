@@ -554,6 +554,8 @@ def report_per_flight(win_rows, channel="pos"):
 
 
 def main():
+    from utils import pypose_compat
+    pypose_compat.apply()      # no-op unless this torch breaks pypose 0.9.5's cumprod
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True,
                     help="the TRAINING config: supplies the network hyper-parameters "
