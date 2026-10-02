@@ -3,6 +3,9 @@
 # Current model: configs/exp/UAV/velnet_v3.conf  (updated 2026-10-02)
 #   input   acc (m/s^2, body FLU), gyro (rad/s, body FLU), 100 Hz.  IMU only.
 #   output  vel_body (m/s, body FLU), vel_cov per-axis variance, (m/s)^2
+# Training only: half of the windows are flown left-right mirrored (aug_mirror 0.5).
+#   Check the [mirror] line at startup: if it WARNS about a sideways offset, set
+#   aug_mirror: 0 in configs/exp/UAV/velnet_v3.conf.
 # Start a fresh run: the CNN normalisation changed on 2026-10-02.
 
 
