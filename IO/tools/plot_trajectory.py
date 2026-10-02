@@ -54,7 +54,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pyhocon import ConfigFactory
 from datasets import SeqeuncesDataset, collate_fcs
 from datasets.UAVdataset import UAV
-from datasets.dataset import mti_or_gt
+from datasets.dataset import airspeed_or_zeros, mti_or_gt
 from model import net_dict
 from utils import move_to
 
@@ -79,6 +79,8 @@ def sample_from_seq(seq, f0, f1):
         "gyro": d["gyro"][f0:f1],
         "rot": d["gt_orientation"][f0:f1],
         "mti_rot": mti[f0:f1],
+        # IMU-rate network input like acc/gyro (needed by use_airspeed models)
+        "airspeed": airspeed_or_zeros(seq)[f0:f1],
         "init_rot": d["gt_orientation"][f0][None, ...],
         "init_mti_rot": mti[f0][None, ...],
         "init_pos": d["gt_translation"][f0][None, ...],
