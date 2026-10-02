@@ -112,6 +112,19 @@ class VelocityNet(Encoder):
                                  "got %r" % (vel_bias_init,))
             with torch.no_grad():
                 self.vel_decoder[-1].bias.copy_(b / self.vel_output_scale)
+        # Optional AIRSPEED BASELINE (default off).  vel_body = (airspeed, 0, 0) + head, so
+        # the head learns only the difference from the pitot (wind, sideslip, angle of
+        # attack, pitot scale) instead of the whole ~22 m/s.  Forward speed in steady
+        # flight is invisible to an IMU, and guessing it per flight is what the model
+        # memorises.  Reads the same pitot channel as the encoder input, so it needs
+        # use_airspeed: True; no new parameter, so the ONNX export carries it as is.
+        self.vel_airspeed_base = bool(conf.get("vel_airspeed_base", False))
+        if self.vel_airspeed_base and not self.use_airspeed:
+            raise ValueError("vel_airspeed_base needs use_airspeed: True")
+        if self.vel_airspeed_base and vel_bias_init is not None and any(
+                float(v) != 0.0 for v in vel_bias_init):
+            raise ValueError("vel_airspeed_base already starts the model at the airspeed; "
+                             "remove vel_bias_init (got %r)" % (vel_bias_init,))
         # Initial variance, (m/s)^2.  HybridNet's heads used exp(h - 5) = 6.7e-3, which
         # is right for a CORRECTION residual and badly wrong here: the model starts at
         # ZERO velocity, so the initial error is ~|v| ~ 25 m/s and err^2/sigma^2 would
@@ -158,9 +171,9 @@ class VelocityNet(Encoder):
         else:
             self.veldir_decoder = None
 
-        print("[velnet] body-frame velocity head, scale %.3g, world frame from %r, "
-              "propcov=%s, sigma^2 init %.3g (m/s)^2, dir_uncert=%s"
-              % (self.vel_output_scale, self.vel_frame_source,
+        print("[velnet] body-frame velocity head, scale %.3g, airspeed baseline %s, "
+              "world frame from %r, propcov=%s, sigma^2 init %.3g (m/s)^2, dir_uncert=%s"
+              % (self.vel_output_scale, self.vel_airspeed_base, self.vel_frame_source,
                  bool(self.conf.propcov), self.vel_cov_init,
                  ("off" if self.veldir_decoder is None
                   else "vMF w=%.3g kappa0=%.3g (~%.1f deg)"
@@ -182,6 +195,10 @@ class VelocityNet(Encoder):
         vel_body = self._update(zero.clone(),
                                 self.vel_decoder(feature) * self.vel_output_scale,
                                 frame_len)
+        if self.vel_airspeed_base:
+            # Airspeed at frame k for the velocity at k+1: causal, same slice as `zero`.
+            va = self._airspeed_channel(data)[:, self.interval:, :]
+            vel_body = vel_body + torch.nn.functional.pad(va, (0, 2))
         vel_cov = None
         if self.conf.propcov:
             # _update ACCUMULATES (+=) into its first argument, so the base must be
