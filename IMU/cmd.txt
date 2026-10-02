@@ -77,6 +77,20 @@ python -m tools.eval_vel_horizons --config configs/exp/UAV/accel_const.conf ^
   --splits inference --nested --horizons 12000 --per_flight
 
 
+:: ---------------------------------------------------------------- 2026-10-02
+:: tilt_rotate_smooth = tilt_rotate + ONE loss term: the tilt correction must change
+:: slowly (dtheta_smooth_weight 0.1).  Same seed, same everything else.
+python train.py --config configs/exp/UAV/tilt_rotate_smooth.conf --device cuda:0
+:: watch it:  tensorboard --logdir experiments/UAV/tilt_rotate_smooth/tensorboard
+::   val/dtheta_step_rms_deg  = how jumpy the correction is (should fall)
+:: then score BOTH on the held-out flights, same command, both checkpoints
+python -m tools.eval_vel_horizons1 --config configs/exp/UAV/tilt_rotate_smooth.conf ^
+  --ckpt experiments/UAV/tilt_rotate_smooth/ckpt/best_model.ckpt ^
+  --splits inference --nested --horizons 3000 6000 12000 --per_flight
+python -m tools.eval_vel_horizons1 --config configs/exp/UAV/tilt_rotate.conf ^
+  --ckpt experiments/UAV/tilt_rotate/ckpt/best_model.ckpt ^
+  --splits inference --nested --horizons 3000 6000 12000 --per_flight
+
 :: ---------------------------------------------------------------- 2026-09-30
 :: tilt_rotate: train, then the 30 s / 1 / 2 / 3 / 4 / 5 min summary table
 :: (vel_rmse, vel_max_error, dir_rmse, dir_max_error, pos_error).

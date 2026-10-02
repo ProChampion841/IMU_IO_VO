@@ -1,0 +1,38 @@
+===============================================================================
+ONE NEW LOSS TERM: THE TILT CORRECTION MUST CHANGE SLOWLY      2026-10-02
+===============================================================================
+
+THE IDEA
+  The rotate model outputs a small tilt correction (dtheta, max 2 deg) every
+  90 ms.  Nothing told it how fast that correction may change, so it could jump
+  +1 deg, -1 deg, +1 deg ...  The real tilt error it fixes changes slowly (tens of
+  seconds).  The extra freedom is used to memorise the training flights:
+      tilt_rotate: train 0.79 of raw, val 0.93 / 0.91 / 0.88 (30 / 60 / 120 s).
+
+THE NEW TERM
+  smooth = average of (dtheta[now] - dtheta[90 ms before])^2      in degrees^2
+  loss   = old loss + dtheta_smooth_weight * smooth
+  - weight 0.1: a jumpy 0.3 deg per step costs ~10% of the loss; slow change ~0.
+  - dtheta is 0 at the start of training, so the term starts at 0.
+  - weight 0 (default) = old loss exactly.  Only rotate mode has dtheta; asking
+    for the term in another mode stops with an error.
+
+FILES
+  model/hybrid.py    forward() also returns "dtheta" (one row per 90 ms).
+                     inference() / ONNX outputs are unchanged.
+  model/losses.py    the term, `dtheta_smooth_weight`.
+  train.py           logs it: TensorBoard train|val/dtheta_step_rms_deg and a
+                     "tilt correction step" console line.  metric.csv unchanged.
+  configs/exp/UAV/tilt_rotate_smooth.conf   = tilt_rotate + weight 0.1, nothing else.
+  tests/test_model_updates.py   +6 tests (19 pass, CPU, no data).
+
+RUN   (commands in cmd.txt)
+  python train.py --config configs/exp/UAV/tilt_rotate_smooth.conf --device cuda:0
+
+HOW TO READ IT
+  - val/dtheta_step_rms_deg should fall well below tilt_rotate's.  The TRAIN value
+    reads higher than val because of the CNN dropout; compare val numbers.
+  - WIN: val beats 0.931 / 0.909 / 0.879 and the train/val gap shrinks.  Then
+    score both runs on the held-out flights (--splits inference --per_flight).
+  - Val worse -> weight 0.03.  Gap still wide -> weight 0.3.
+===============================================================================

@@ -304,6 +304,11 @@ class EpochLogger:
                                ("raw_vel_rel", "raw_vel_rel_error_mps", "m/s")):
                 if d.get(_k) is not None:
                     self.tb.add_scalar("%s/%s" % (tag, _t), d[_k], epoch)
+            # How jumpy the rotate-mode tilt correction is: RMS step between 90 ms
+            # tokens, deg.  `dtheta_smooth_weight` (model/losses.py) penalises it.
+            if d.get("dtheta_smooth") is not None:
+                self.tb.add_scalar("%s/dtheta_step_rms_deg" % tag,
+                                   float(d["dtheta_smooth"]) ** 0.5, epoch)
             # Covariance diagnostics, position/velocity only.
             for k, name in (("pred_cov_pos", "pred_cov_pos"), ("pred_cov_vel", "pred_cov_vel")):
                 if k in d:
@@ -608,6 +613,8 @@ def train(network, loader, confs, epoch, optimizer, ema=None, ema_decay=0.0):
         vel_losses += loss_state['vel'].item()
         acc['pos_rel'] += loss_state['pos_rel'].item()
         acc['vel_rel'] += loss_state['vel_rel'].item()
+        if 'dtheta_smooth' in loss_state:          # rotate mode (see model/losses.py)
+            acc['dtheta_smooth'] = acc.get('dtheta_smooth', 0.0) + loss_state['dtheta_smooth'].item()
         if log_raw:
             for _k, _v in raw_baseline_errors(network, data, init_state, label, confs).items():
                 acc[_k] += _v
@@ -702,6 +709,9 @@ def test(network, loader, confs, epoch=None):
             vel_losses += loss_state['vel'].item() * bs
             acc['pos_rel'] += loss_state['pos_rel'].item() * bs
             acc['vel_rel'] += loss_state['vel_rel'].item() * bs
+            if 'dtheta_smooth' in loss_state:
+                acc['dtheta_smooth'] = (acc.get('dtheta_smooth', 0.0)
+                                        + loss_state['dtheta_smooth'].item() * bs)
             if log_raw:
                 for _k, _v in raw_baseline_errors(network, data, init_state, label, confs).items():
                     acc[_k] += _v * bs
@@ -1077,6 +1087,10 @@ def main_worker(local_rank, device_ids, args):
                       % (epoch_i, lr,
                          train_loss["loss"], train_loss["pos_loss"], train_loss["vel_loss"],
                          test_loss["loss"], test_loss["pos_loss"], test_loss["vel_loss"]))
+                if "dtheta_smooth" in test_loss:
+                    print("          tilt correction step, rms over 90 ms: train %.4f deg"
+                          " | val %.4f deg" % (train_loss.get("dtheta_smooth", 0.0) ** 0.5,
+                                               test_loss["dtheta_smooth"] ** 0.5))
 
             eval_metrics = None
             if epoch_i % conf.train.eval_freq == conf.train.eval_freq - 1:

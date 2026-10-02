@@ -205,3 +205,82 @@ def test_full_forward_backward_rotate():
     loss.backward()
     assert torch.isfinite(loss)
     assert net.accscale_decoder[-1].weight.grad.abs().sum() > 0   # rotation head trains
+
+
+# ---------------------------------------------------------------- dtheta smoothness
+def _smooth_loss(net, weight, name="tilt_rotate"):
+    conf = _conf(name, dtheta_smooth_weight=weight)
+    conf.put("device", "cpu")
+    data, init, label = _batch()
+    st = net(data, init)
+    return st, get_loss(st, label, conf)
+
+
+def test_dtheta_is_per_token_and_zero_at_init():
+    st, out = _smooth_loss(_net("tilt_rotate"), 0.0)
+    dth = st["dtheta"]
+    assert dth.shape[0] == 2 and dth.shape[2] == 3
+    assert abs(dth.shape[1] - (F + 9) / 9) <= 2              # one row per 90 ms token
+    assert torch.equal(dth, torch.zeros_like(dth))           # identity at init
+    assert out["dtheta_smooth"] == 0.0
+
+
+def test_dtheta_smooth_weight_zero_is_bit_identical():
+    net = _net("tilt_rotate")
+    _randomise_heads(net)
+    with torch.no_grad():
+        _, a = _smooth_loss(net, 0.0)
+        conf = _conf("tilt_rotate")                           # key absent altogether
+        conf.put("device", "cpu")
+        data, init, label = _batch()
+        b = get_loss(net(data, init), label, conf)
+    assert torch.equal(a["loss"], b["loss"])
+    assert a["dtheta_smooth"] > 0                             # still reported
+
+
+def test_dtheta_smooth_adds_the_term_and_trains_the_rotation_head():
+    net = _net("tilt_rotate")                 # eval: no dropout; autograd still on
+    _randomise_heads(net)
+    data, init, label = _batch()
+    st = net(data, init)                      # ONE forward pass, scored twice
+    c0, c1 = _conf("tilt_rotate", dtheta_smooth_weight=0.0), _conf("tilt_rotate",
+                                                                    dtheta_smooth_weight=0.1)
+    l0, l1 = get_loss(st, label, c0), get_loss(st, label, c1)
+    dth = st["dtheta"].detach()
+    manual = torch.rad2deg(dth[:, 1:] - dth[:, :-1]).pow(2).sum(-1).mean()
+    assert torch.allclose(l1["dtheta_smooth"], manual)
+    assert torch.allclose(l1["loss"] - l0["loss"], 0.1 * manual)
+    (l1["loss"] - l0["loss"]).backward()      # the smoothness term alone
+    assert net.accscale_decoder[-1].weight.grad.abs().sum() > 0      # rotation head
+    assert net.accdecoder[-1].weight.grad.abs().sum() == 0           # bias head untouched
+
+
+def test_dtheta_smooth_reduces_jumps_when_optimised():
+    """Gradient steps on the term alone make the correction smoother."""
+    net = _net("tilt_rotate").train()
+    _randomise_heads(net)
+    conf = _conf("tilt_rotate", dtheta_smooth_weight=1.0)
+    data, init, label = _batch()
+    opt = torch.optim.Adam(net.accscale_decoder.parameters(), lr=1e-2)
+    first = None
+    for _ in range(30):
+        aux = {}
+        net.inference(dict(data), aux=aux)
+        d = torch.rad2deg(aux["dtheta"][:, 1:] - aux["dtheta"][:, :-1]).pow(2).sum(-1).mean()
+        first = d.item() if first is None else first
+        opt.zero_grad()
+        (conf.dtheta_smooth_weight * d).backward()
+        opt.step()
+    assert d.item() < 0.5 * first
+
+
+def test_dtheta_smooth_needs_rotate_mode():
+    with pytest.raises(RuntimeError, match="rotate"):
+        _smooth_loss(_net("tilt_aware"), 0.1, name="tilt_aware")
+
+
+def test_smooth_config_is_tilt_rotate_plus_one_key():
+    a = dict(_conf("tilt_rotate").items())
+    b = dict(_conf("tilt_rotate_smooth").items())
+    assert {k for k in set(a) | set(b) if a.get(k) != b.get(k)} == {"dtheta_smooth_weight"}
+    assert b["dtheta_smooth_weight"] == 0.1
