@@ -7,7 +7,11 @@ behind. A model can be excellent at the first, poor at the second, and report
 a number that describes neither. This splits the error by the conditions that
 change what the camera sees:
 
-* ``turn_rate_deg_s`` - |yaw rate|: how much rotation had to be removed;
+* ``turn_rate_deg_s`` - |body yaw rate r|: the turn as the body axes see it
+  (heading rate x cos(bank) in a coordinated turn, so it under-reads a steep
+  turn, and is blind to a pull-up);
+* ``rotation_rate_deg_s`` - |body rate| = |(p, q, r)|: ALL the rotation the
+  frontend had to remove between the two images, roll and pitch included;
 * ``bank_deg`` - |roll|: how tilted the ground is under the camera;
 * ``altitude_m`` - the metric scale of every measurement;
 * ``speed_m_s`` - the reference ground speed: how far the ground moves.
@@ -25,6 +29,7 @@ import numpy as np
 #: Fixed edges where the physics has natural breakpoints; quantiles elsewhere.
 DEFAULT_EDGES: Dict[str, Optional[Sequence[float]]] = {
     "turn_rate_deg_s": (0.0, 2.0, 5.0, 10.0, 20.0, float("inf")),
+    "rotation_rate_deg_s": (0.0, 2.0, 5.0, 10.0, 20.0, float("inf")),
     "bank_deg": (0.0, 5.0, 15.0, 30.0, float("inf")),
     "altitude_m": None,
     "speed_m_s": None,
@@ -46,6 +51,7 @@ def flight_conditions(
     roll = np.degrees(np.arctan2(aiding[:, 0], aiding[:, 1]))
     return {
         "turn_rate_deg_s": np.abs(np.degrees(aiding[:, 7])),
+        "rotation_rate_deg_s": np.degrees(np.linalg.norm(aiding[:, 5:8], axis=1)),
         "bank_deg": np.abs(roll),
         "altitude_m": np.exp(np.asarray(log_altitude, dtype=np.float64)),
         "speed_m_s": np.linalg.norm(np.asarray(target_velocity, dtype=np.float64), axis=-1),

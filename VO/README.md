@@ -333,7 +333,8 @@ cannot, whether the recurrent state accumulates error over a long flight.
 held-out number. `--plots` (on by default) writes a dead-reckoned trajectory
 figure, a per-axis velocity-vs-truth figure, an error-growth figure, and a
 summary against horizon length. `--stratify` (on by default) also breaks the
-whole-split error down by turn rate, bank angle, altitude and ground speed,
+whole-split error down by turn (yaw) rate, total rotation rate, bank angle,
+altitude and ground speed,
 so a model that is good in cruise and poor in turns says so.
 
 Run it three ways per checkpoint before trusting a result: on `validation`

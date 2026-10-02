@@ -160,16 +160,23 @@ def masked_velocity_stats(
     flat_mask = mask.reshape(-1) > 0
     prediction = predicted.detach().float().reshape(-1, 3)[flat_mask]
     truth = target.detach().float().reshape(-1, 3)[flat_mask]
-    finite = torch.isfinite(prediction).all(dim=1) & torch.isfinite(truth).all(dim=1)
-    prediction = prediction[finite]
-    truth = truth[finite]
+    # Only an unusable LABEL removes a tick. A non-finite PREDICTION against a
+    # finite label is the model failing there, scored as an infinite error:
+    # dropping it instead would let a model that blows up on its hardest ticks
+    # report a better RMSE - and be picked as best.pt for it.
+    finite_truth = torch.isfinite(truth).all(dim=1)
+    prediction = prediction[finite_truth]
+    truth = truth[finite_truth]
     if prediction.shape[0] == 0:
         return (0.0,) * 12
-    residual = prediction - truth
+    failed = ~torch.isfinite(prediction).all(dim=1)
+    residual = torch.where(
+        failed.unsqueeze(-1), torch.full_like(prediction, float("inf")), prediction - truth
+    )
     magnitude = torch.linalg.vector_norm(residual, dim=-1)
     predicted_norm = torch.linalg.vector_norm(prediction, dim=-1)
     target_norm = torch.linalg.vector_norm(truth, dim=-1)
-    usable = (predicted_norm > eps) & (target_norm > eps)
+    usable = (predicted_norm > eps) & (target_norm > eps) & ~failed
     if bool(usable.any()):
         cosine = (prediction[usable] * truth[usable]).sum(dim=-1) / (
             predicted_norm[usable] * target_norm[usable]
