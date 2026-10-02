@@ -39,6 +39,11 @@ python tools/train_fixedwing_vo.py --dataset data_split/train --validation-datas
 
 python tools/train_fixedwing_vo.py --dataset data_split/train --validation-dataset data_split/validation --test-dataset data_split/test --calibration configs/vo/camera_fixedwing.json --frontend planar --color --image-time-offset <OFFSET> --photometric-augment 0.15 --dropout 0.2 --lr-scaling sqrt --lr-warmup-epochs 5 --epochs 300 --patience 40 --select-on vel_rmse --run-dir runs/vo_planar_s0 --device 0,1,2,3,4,5,6,7,8,9 --num-workers 2 --seed 0 --save-every 25 --keep-last 5
 
+# 3b. same run with --random-pair-phase: 0.5 s pairs, one output per pair, and each training
+#     window draws which frame its pairs start on (10x more distinct pairs; validation/test unchanged).
+#     Compare its best val_vel_rmse against the run without it (same seed, same everything else).
+python tools/train_fixedwing_vo.py --dataset data_split/train --validation-dataset data_split/validation --test-dataset data_split/test --calibration configs/vo/camera_fixedwing.json --frontend planar --color --image-time-offset <OFFSET> --frame-gap 10 --output-on-pairs --random-pair-phase --photometric-augment 0.15 --dropout 0.2 --lr-scaling sqrt --lr-warmup-epochs 5 --epochs 300 --patience 40 --select-on vel_rmse --run-dir runs/vo_planar_phase_s0 --device 0,1,2,3,4,5,6,7,8,9 --num-workers 2 --seed 0 --save-every 25 --keep-last 5
+
 # 4. evaluate (the checkpoint carries frame gap, mounting, colour; --stratify is on by default)
 python tools/evaluate_velocity_horizons.py runs/vo_planar_s0/best.pt --dataset data_split/validation --device cuda:0 --output artifacts/eval_planar.json --plot-dir artifacts/plots_planar
 

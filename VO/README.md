@@ -305,6 +305,17 @@ any flag given explicitly wins. The commands are the "200 m" section of
 camera, and `--photometric-augment 0.15` jitters exposure between the two
 frames of a pair during training, as an auto-exposure camera does.
 
+`--random-pair-phase` (with `--output-on-pairs`) is a training augmentation
+against memorising one flight. Without it the pairs always start on frames
+0, g, 2g, ..., so every epoch shows the model the same image pairs and the
+pairs starting on the other g-1 frames are never used. With it, each
+training window draws which frame its tiling starts on (0 .. g-1): the same
+stretch of flight is seen as g different sets of pairs across epochs, with
+the pair interval and the output cadence unchanged. Validation, test,
+`--eval-train-split`, the horizon pass, the evaluator and the ONNX tools all
+stay on the fixed tiling (phase 0), so their numbers compare directly with a
+run without it. Nothing about the model or its export changes.
+
 ## Evaluating
 
 ```bash

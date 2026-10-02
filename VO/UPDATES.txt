@@ -630,3 +630,40 @@ TBPTT, no new architecture, exactly as the review asked.
       earlier local CPU smoke train/evaluate (small synthetic flight) after
       the fix to confirm the real VOStep/encode_pairs call path still
       trains and evaluates end to end, not just the new unit tests.
+
+
+19. --random-pair-phase: MORE DISTINCT TRAINING PAIRS FROM THE SAME FLIGHT
+--------------------------------------------------------------------------
+19.1  With --output-on-pairs and --frame-gap 10, pairs always started on
+      frames 0, 10, 20, ... Every epoch showed the model the SAME image
+      pairs, and the pairs starting on the other 9 frames were never used.
+19.2  Over ~300 epochs each training pair is seen hundreds of times - enough
+      to memorise its own matching and label noise. The planar run's log fits
+      that: train x/z kept improving (1.07 / 0.52 m/s) while validation stayed
+      flat (1.57 / 0.90).
+19.3  New: --random-pair-phase. Each TRAINING window draws which frame its
+      tiling starts on (0 .. g-1). Same pair interval (0.5 s), same output
+      cadence, same filters (image gaps, telemetry holes, split boundaries);
+      only which frames are paired changes. 10x more distinct pairs.
+19.4  Everything that SCORES stays on phase 0, exactly as before: validation,
+      test, --eval-train-split (a fixed-phase view of the training set), the
+      in-training horizon pass, the evaluator and the ONNX tools. Their
+      numbers compare directly with a run without the flag.
+19.5  VisualPairSource(pair_phases=True) builds one plan per phase; .plan is
+      still phase 0 and bit-identical to the plan built without the option
+      (tested field by field), so no caller that does not ask for a phase
+      can see a difference.
+19.6  The model, the checkpoint layout and the ONNX export are unchanged. The
+      flag is recorded in the checkpoint args. Like --photometric-augment it is
+      training augmentation, not part of the resume fingerprint.
+19.7  Refused without --output-on-pairs and a frame gap above 1: with a pair
+      ending on every frame there is no phase to vary.
+19.8  New tests/test_random_pair_phase.py (8 tests): phase 0 equals the old
+      plan; every phase keeps the 0.5 s interval and cadence; a window's
+      events, offsets and pair geometry all come from the phase it drew; the
+      fixed view and a run without the flag give identical windows; the
+      trainer draws phases for training only and scores train-eval on phase 0.
+19.9  Whole suite green: 322 passed, 1 skipped (the CUDA-only
+      mask_stream_state test; no GPU here). Also run by hand on a rendered
+      20 s flight with 2 loader workers: "10 tiling phases, 383 distinct image
+      pairs (phase 0 alone: 39)", train/val/train-eval all finite.

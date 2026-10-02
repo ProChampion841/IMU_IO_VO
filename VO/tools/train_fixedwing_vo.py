@@ -371,6 +371,17 @@ def build_parser() -> argparse.ArgumentParser:
              "output is scored on every telemetry tick.",
     )
     window.add_argument(
+        "--random-pair-phase", action="store_true",
+        help="Training augmentation for --output-on-pairs: each training window "
+             "draws which frame its pair tiling starts on (0 .. g-1), so the same "
+             "stretch of flight is seen as g different sets of image pairs "
+             "across epochs instead of one. The pair interval and the output "
+             "cadence are unchanged, and validation, test, --eval-train-split, "
+             "the horizon pass and the evaluator all stay on the fixed tiling "
+             "(phase 0), so their numbers remain comparable with runs without "
+             "it. Default off.",
+    )
+    window.add_argument(
         "--planar-baseline-s", type=float, default=1.0,
         help="Time between the two images of a pair that the planar default "
              "--frame-gap aims for (default 1.0 s: about 13 cells of ground "
@@ -2543,6 +2554,12 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             f"{args.window_length}: with --frame-gap {args.frame_gap} the first image "
             "pair of a window arrives that late. Lengthen the window."
         )
+    if args.random_pair_phase and args.pair_stride < 2:
+        raise SystemExit(
+            "--random-pair-phase varies where the pair tiling starts, which only "
+            "exists with --output-on-pairs and a --frame-gap above 1 (pair stride "
+            f"is {args.pair_stride} here: every frame already starts a pair)."
+        )
 
     for phase in ("train", "validation", "test"):
         if phase not in phase_roots:
@@ -2574,11 +2591,25 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             stride=args.stride, warmup=args.warmup,
             max_visual_events=args.max_visual_events,
             grayscale=not args.color,
+            # Training only: every other split, and every pass that scores the
+            # training split, stays on the fixed tiling (phase 0).
+            random_pair_phase=bool(args.random_pair_phase and phase == "train"),
         )
         if normalizer is None:
             normalizer = built
         datasets[phase] = dataset
         world.log(f"  {phase}: {len(dataset)} windows over ticks {span}")
+        if dataset.random_pair_phase:
+            pair_source = dataset.image_source
+            distinct = sum(
+                int(pair_source.plan_for(p).ready_tick.size)
+                for p in range(pair_source.phase_count)
+            )
+            world.log(
+                f"  {phase}: --random-pair-phase, {pair_source.phase_count} tiling "
+                f"phases, {distinct} distinct image pairs (phase 0 alone: "
+                f"{int(pair_source.plan.ready_tick.size)})"
+            )
 
     # Never drop data silently: a gap cap that quietly removes a tenth of the
     # frames reads as "the capture is small" rather than "frames are missing".
@@ -2947,15 +2978,18 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
         # Reusing that one would silently under-report: drop_last discards up
         # to batch_size-1 windows EVERY epoch, a systematic gap whenever the
         # split length is not a multiple of batch_size, not an occasional one.
+        # Phase 0 only, so a --random-pair-phase run scores its training split
+        # on the same fixed tiling as validation, every epoch.
+        train_eval_dataset = datasets["train"].fixed_phase_view()
         train_eval_sampler = None
         if world.enabled:
             train_eval_sampler = DistributedSampler(
-                datasets["train"], num_replicas=world.world_size, rank=world.rank,
+                train_eval_dataset, num_replicas=world.world_size, rank=world.rank,
                 shuffle=False, drop_last=False,
             )
         samplers["train_eval"] = train_eval_sampler
         loaders["train_eval"] = DataLoader(
-            datasets["train"], batch_size=args.batch_size,
+            train_eval_dataset, batch_size=args.batch_size,
             shuffle=False, sampler=train_eval_sampler, num_workers=args.num_workers,
             drop_last=False, pin_memory=(device.type == "cuda"),
         )
