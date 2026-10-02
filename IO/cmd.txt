@@ -1,11 +1,9 @@
 # IO (velnet) -- commands.  Run everything from the IO/ folder.
 #
 # Current model: configs/exp/UAV/velnet_v3.conf  (updated 2026-10-02)
-#   input   acc (m/s^2, body FLU), gyro (rad/s, body FLU), airspeed (m/s, pitot), 100 Hz
-#   output  vel_body (m/s, body FLU) = (airspeed, 0, 0) + learned correction
-#           vel_cov  per-axis variance, (m/s)^2
-# Checkpoints from before 2026-10-02 do NOT load into velnet_v3 (airspeed adds an
-# input channel).  Start a fresh run.  Older runs: use their own config.
+#   input   acc (m/s^2, body FLU), gyro (rad/s, body FLU), 100 Hz.  IMU only.
+#   output  vel_body (m/s, body FLU), vel_cov per-axis variance, (m/s)^2
+# Start a fresh run: the CNN normalisation changed on 2026-10-02.
 
 
 # ===== SETUP (once) =====
@@ -63,10 +61,10 @@ python -m tools.plot_trajectory --config configs/exp/UAV/velnet_v3.conf --ckpt e
 
 
 # ===== ONNX (deployment, no PyTorch needed at run time) =====
-# export; the window length is FIXED (6000 = 60 s); inputs acc, gyro, airspeed
+# export; the window length is FIXED (6000 = 60 s); inputs acc, gyro
 python -m tools.export_onnx --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --out experiments/UAV/velnet_v3/velnet_6000.onnx --frames 6000
 
-# run on a flight CSV (raw log with AirSpeed; GPS columns, if present, are used for scoring)
+# run on a flight CSV (GPS columns, if present, are used only for scoring)
 python -m tools.onnx_inference --onnx experiments/UAV/velnet_v3/velnet_6000.onnx --csv /path/to/flight_sensor_data.csv --out pred.csv
 
 # check the ONNX path against the PyTorch pipeline (synthetic flight if no --csv)
