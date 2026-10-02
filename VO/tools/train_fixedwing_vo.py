@@ -362,13 +362,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     window.add_argument(
         "--output-on-pairs", action="store_true",
-        help="One velocity output per image pair, at the pair interval: pairs "
-             "no longer overlap - (0, g), (g, 2g), ... for --frame-gap g - so a "
-             "new measurement arrives every g frames (every 0.5 s for g = 10 at "
-             "20 Hz), and the model's velocity is scored (and, in the "
+        help="One velocity output per image pair, at the pair interval: by "
+             "default pairs no longer overlap - (0, g), (g, 2g), ... for "
+             "--frame-gap g - so a new measurement arrives every g frames (every "
+             "0.5 s for g = 10 at 20 Hz; --pair-stride changes how often), and "
+             "the model's velocity is scored (and, in the "
              "evaluator, reported) only on the tick each pair is delivered, "
              "held in between. Default off: a pair ends on every frame and the "
              "output is scored on every telemetry tick.",
+    )
+    window.add_argument(
+        "--pair-stride", type=int, default=None, metavar="FRAMES",
+        help="With --output-on-pairs: frames between the starts of consecutive "
+             "pairs, i.e. how often a pair - and an output - arrives. Default: "
+             "--frame-gap, so pairs tile the capture end to end. Smaller than "
+             "--frame-gap makes pairs OVERLAP: --frame-gap 20 --pair-stride 10 "
+             "at 20 Hz is a 1 s pair every 0.5 s - twice the ground motion per "
+             "measurement, at the same output rate as 0.5 s pairs. Neighbouring "
+             "outputs then share an image, so their errors are partly shared.",
     )
     window.add_argument(
         "--random-pair-phase", action="store_true",
@@ -1018,16 +1029,44 @@ def resolve_frontend_defaults(
     if args.max_frame_gap_s is None and planar and usable_clock:
         args.max_frame_gap_s = round(1.5 * args.frame_gap * frame_interval_s, 3)
         chosen.append(f"--max-frame-gap-s {args.max_frame_gap_s:g}")
-    args.pair_stride = int(args.frame_gap) if getattr(args, "output_on_pairs", False) else 1
-    if args.pair_stride > 1:
-        chosen.append(
-            f"--output-on-pairs: one pair and one output every {args.pair_stride} frames"
-            + (f" ({args.pair_stride * frame_interval_s:.2f} s)" if usable_clock else "")
+    on_pairs = bool(getattr(args, "output_on_pairs", False))
+    requested_stride = getattr(args, "pair_stride", None)
+    if requested_stride is not None:
+        if not on_pairs:
+            raise SystemExit(
+                "--pair-stride sets how often a pair and its output arrive, which "
+                "only exists with --output-on-pairs (without it a pair ends on "
+                "every frame and every tick is an output)."
+            )
+        if int(requested_stride) < 1:
+            raise SystemExit("--pair-stride must be at least 1 frame")
+    args.pair_stride = (
+        int(requested_stride) if requested_stride is not None
+        else int(args.frame_gap) if on_pairs else 1
+    )
+    if on_pairs:
+        seconds = lambda frames: (  # noqa: E731
+            f" ({frames * frame_interval_s:.2f} s)" if usable_clock else ""
         )
+        line = (
+            f"--output-on-pairs: one pair and one output every {args.pair_stride} "
+            f"frames{seconds(args.pair_stride)}"
+        )
+        if args.pair_stride < args.frame_gap:
+            line += (
+                f", each pair spanning {args.frame_gap} frames"
+                f"{seconds(args.frame_gap)}: consecutive pairs overlap"
+            )
+        elif args.pair_stride > args.frame_gap:
+            line += (
+                f"; the {args.pair_stride - args.frame_gap} frame(s) between one "
+                "pair's end and the next one's start are never used"
+            )
+        chosen.append(line)
     if args.warmup is None:
         if planar and usable_clock and tick_interval_s > 0:
-            # Non-overlapping pairs can leave a window waiting up to one more
-            # pair interval for its first one. The epsilon keeps
+            # A window can wait up to one more pair stride for its first pair
+            # to start, then a whole pair, then the latency. The epsilon keeps
             # 135.00000000000003 ticks from rounding up to 136.
             blind = math.ceil(
                 (

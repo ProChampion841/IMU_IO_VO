@@ -747,3 +747,35 @@ NOT changed - decisions for the user:
       (6). Whole suite: 333 passed, 1 skipped (CUDA-only). Also run as a real
       2-rank CPU DDP job (gloo): 3 epochs with --random-pair-phase and
       --eval-train-split, then a resume from epoch 2 with a new learning rate.
+
+
+21. --pair-stride: A ONE-SECOND PAIR EVERY HALF SECOND
+-------------------------------------------------------
+21.1  With --output-on-pairs the time between outputs was forced to equal the
+      pair length: 0.5 s pairs every 0.5 s. At 200 m a 0.5 s pair moves the
+      ground only a little in the image, so matching error is large relative
+      to the motion (untrained, rendered 200 m flight: 0.33 m/s per pair at
+      0.5 s, 0.20 m/s at 1 s).
+21.2  New --pair-stride FRAMES: how often a pair (and an output) starts,
+      separate from --frame-gap (how long a pair is). --frame-gap 20
+      --pair-stride 10 at 20 Hz is a 1 s pair every 0.5 s - pairs (0,20),
+      (10,30), (20,40), ... - twice the ground motion per measurement at the
+      EKF's 0.5 s output rate. Default: --pair-stride = --frame-gap, exactly as
+      before, so existing commands, checkpoints and resumes are unchanged.
+21.3  Everything downstream already handled stride != gap: the pair plan, the
+      dataset, --random-pair-phase, the evaluator, the ONNX export and the
+      standalone runtime. Only the trainer forced them equal. The resolved
+      stride is in the checkpoint args and the resume fingerprint.
+21.4  The automatic warm-up follows: latency + (gap + stride - 1) frames
+      (185 ticks for 20/10, was 135 for 10/10). --max-frame-gap-s follows the
+      pair length (1.5 s for 1 s pairs).
+21.5  Costs, stated rather than hidden: each output averages the motion over
+      1 s instead of 0.5 s, so it reacts more slowly to turns and speed
+      changes; neighbouring outputs share an image, so their errors are partly
+      shared (vo.var_scale in the EKF is there for that).
+21.6  Refused without --output-on-pairs, or below 1 frame.
+21.7  New tests/test_pair_stride.py (6 tests), including an ONNX export and a
+      standalone-runtime replay of a rendered flight with 1 s pairs every
+      0.5 s: delivery ticks identical to PyTorch, max velocity difference
+      4.6e-5 m/s. commands.txt 3c is the run to compare against the 0.5 s
+      baseline.

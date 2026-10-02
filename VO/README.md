@@ -305,6 +305,18 @@ any flag given explicitly wins. The commands are the "200 m" section of
 camera, and `--photometric-augment 0.15` jitters exposure between the two
 frames of a pair during training, as an auto-exposure camera does.
 
+`--pair-stride` (with `--output-on-pairs`) sets how often a pair - and an
+output - starts, independently of how long the pair is. By default it equals
+`--frame-gap`, so pairs tile the capture end to end. `--frame-gap 20
+--pair-stride 10` at 20 Hz is a one-second pair every half second: the ground
+moves twice as far between the two images as in a 0.5 s pair, so the same
+matching error is half as large in m/s (untrained, on a rendered 200 m flight:
+0.20 m/s at a 1 s baseline vs 0.33 m/s at 0.5 s), while the EKF still gets a
+new velocity every 0.5 s. The cost: each output averages over a longer
+interval, and neighbouring outputs share an image, so their errors are partly
+shared (the EKF's `vo.var_scale` exists for that). The ONNX export and runtime
+handle overlapping pairs unchanged.
+
 `--random-pair-phase` (with `--output-on-pairs`) is a training augmentation
 against memorising one flight. Without it the pairs always start on frames
 0, g, 2g, ..., so every epoch shows the model the same image pairs and the
