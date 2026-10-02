@@ -77,3 +77,37 @@ READ THE RESULTS AGAINST GPS-FREE BASELINES ONLY
   The raw arm changed too (MTi attitude, no freeze), so do not compare these ratios
   with tilt_rotate.  Compare model vs raw of the SAME run, on --splits inference.
 ===============================================================================
+
+===============================================================================
+MIRROR FLIGHTS: TWICE THE TRAINING DATA FOR FREE               2026-10-02
+===============================================================================
+
+THE IDEA
+  A fixed-wing flight flipped left <-> right is still a real, physically correct
+  flight: a left turn becomes a right turn, the ground track is mirrored.  So each
+  training window can be flown a second time, mirrored.  The model has ~440
+  independent windows and memorises them; this roughly doubles them and stops
+  "this flight turns left here" from being learnable.
+
+HOW  (train.py, mirror_augment; setting aug_mirror_prob, default 0 = off)
+  Each training window is mirrored with probability p (0.5 in the new config).
+      acc, position, velocity   ( x, -y,  z)
+      gyro                      (-x,  y, -z)
+      attitude (GPSNavEul, MTi, labels)   R -> M R M   (quaternion x, z flip sign)
+  Only training is affected.  Validation, test, ONNX and the drone are unchanged.
+  An unknown channel in a batch stops training with an error instead of being left
+  un-mirrored.
+
+THE SELF-CHECK  (tests/test_model_updates.py)
+  Integrating a mirrored window gives EXACTLY the mirrored trajectory, with GPSNavEul
+  and with MTi attitude, and the errors have exactly the same size.  So a mirrored
+  window is as physically consistent, and as hard, as the original.
+
+CONFIG
+  configs/exp/UAV/tilt_rotate_smooth_mirror.conf = tilt_rotate_smooth + aug_mirror_prob 0.5
+
+READ IT
+  WIN: held-out flights better than tilt_rotate_smooth, and a smaller train/val gap.
+  Known limit: the real aircraft is not perfectly symmetric (propeller turns one
+  way).  If held-out gets worse, try aug_mirror_prob 0.25.
+===============================================================================

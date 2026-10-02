@@ -343,3 +343,92 @@ def test_gpsfree_config_has_no_gps_aided_input():
     assert c.train.dtheta_smooth_weight == 0.1
     for split in ("train", "eval", "test", "inference"):
         assert c.dataset[split].freeze_hist_s == 0.0
+
+
+# ---------------------------------------------------------------- mirror augmentation
+M = torch.tensor([1.0, -1.0, 1.0])
+
+
+def _mirror(data, init, label, p=1.0):
+    from train import mirror_augment                       # train.py, not a package
+    c = _conf("tilt_rotate", aug_mirror_prob=p)
+    return mirror_augment(data, init, label, c)
+
+
+def _full_batch(B=2, seed=1):
+    data, init, label = _batch(B=B, seed=seed)
+    data, init = _with_mti(data, init, tilt=0.02)
+    data["airspeed"] = torch.full((B, F + 9, 1), 22.0)
+    return data, init, label
+
+
+def test_mirror_off_is_an_exact_noop():
+    data, init, label = _full_batch()
+    d, i, l = _mirror(data, init, label, p=0.0)
+    assert d is data and i is init and l is label
+
+
+def test_mirror_signs_and_twice_is_identity():
+    data, init, label = _full_batch()
+    d, i, l = _mirror(data, init, label)
+    assert torch.equal(d["acc"], data["acc"] * M)                       # ( x, -y,  z)
+    assert torch.equal(d["gyro"], data["gyro"] * -M)                    # (-x,  y, -z)
+    assert torch.equal(d["airspeed"], data["airspeed"]) and torch.equal(d["dt"], data["dt"])
+    Rm = d["rot"].matrix()
+    assert torch.allclose(Rm, M.diag() @ data["rot"].matrix() @ M.diag(), atol=1e-6)
+    assert torch.allclose(l["gt_vel"], label["gt_vel"] * M)
+    d2, i2, l2 = _mirror(d, i, l)
+    for a, b in ((d2, data), (i2, init), (l2, label)):
+        for k in b:
+            x, y = a[k], b[k]
+            x = x.tensor() if hasattr(x, "ltype") else x
+            y = y.tensor() if hasattr(y, "ltype") else y
+            assert torch.equal(x, y), k
+
+
+def test_mirrored_window_integrates_to_the_mirrored_trajectory():
+    """The self-check: the integrator commutes with the mirror, so a mirrored window
+    is a physically consistent flight and its error is the mirror of the original's."""
+    data, init, label = _full_batch()
+    dm, im, lm = _mirror(data, init, label)
+    for rot_source in ("gt", "mti"):
+        # zero-initialised heads: the network adds no correction, so this is the raw
+        # integration -- the physics being checked, not a learned (non-mirrored) map
+        net = _net("tilt_rotate", rot_source=rot_source)
+        with torch.no_grad():
+            a = net(dict(data), init)
+            b = net(dict(dm), im)
+        assert torch.equal(a["corrected_acc"], data["acc"][:, 9:])
+        assert torch.allclose(b["vel"], a["vel"] * M, atol=1e-4)
+        assert torch.allclose(b["pos"], a["pos"] * M, atol=1e-4)
+        assert torch.allclose(b["rot"].matrix(), M.diag() @ a["rot"].matrix() @ M.diag(),
+                              atol=1e-5)
+        # same error size, so the window is exactly as hard as the original
+        conf = _conf("tilt_rotate")
+        la, lb = get_loss(a, label, conf), get_loss(b, lm, conf)
+        for k in ("pos", "vel", "rot", "pos_rel", "vel_rel"):
+            assert torch.allclose(la[k], lb[k], rtol=1e-4), k
+
+
+def test_mirror_is_per_window():
+    torch.manual_seed(0)
+    data, init, label = _full_batch(B=16)
+    d, _, _ = _mirror(data, init, label, p=0.5)
+    same = (d["acc"] == data["acc"]).all(-1).all(-1)
+    flipped = (d["acc"] == data["acc"] * M).all(-1).all(-1)
+    assert bool((same | flipped).all())                 # every window: one or the other
+    assert 0 < int(flipped.sum()) < 16                  # and both kinds happen
+
+
+def test_mirror_refuses_an_unknown_channel():
+    data, init, label = _full_batch()
+    data["magnetometer"] = torch.zeros(2, F, 3)
+    with pytest.raises(KeyError, match="magnetometer"):
+        _mirror(data, init, label)
+
+
+def test_mirror_config_is_smooth_plus_one_key():
+    a = dict(_conf("tilt_rotate_smooth").items())
+    b = dict(_conf("tilt_rotate_smooth_mirror").items())
+    assert {k for k in set(a) | set(b) if a.get(k) != b.get(k)} == {"aug_mirror_prob"}
+    assert b["aug_mirror_prob"] == 0.5
