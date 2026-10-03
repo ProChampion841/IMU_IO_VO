@@ -29,6 +29,7 @@ think to look for.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Dict, List, Optional, Sequence, Tuple, Union
@@ -253,6 +254,7 @@ class FixedWingVODataset(Dataset):
         stride: int = 200,
         warmup: int = 20,
         max_visual_events: int = 32,
+        random_pair_phase: bool = False,
     ) -> None:
         ranges = normalize_index_ranges(index_range)
         total = attitude.times_s.size
@@ -265,6 +267,20 @@ class FixedWingVODataset(Dataset):
             raise ValueError("Invalid VO window settings")
         if max_visual_events <= 0:
             raise ValueError("max_visual_events must be positive")
+        # Training-only augmentation: every window draws which tiling phase its
+        # pairs come from, so the same stretch of flight is shown as different
+        # image pairs from epoch to epoch while the pair interval and the
+        # output cadence stay exactly what deployment has. Needs a source built
+        # with pair_phases=True; validation and test never set it.
+        if random_pair_phase and (
+            image_source is None or getattr(image_source, "phase_count", 1) < 2
+        ):
+            raise ValueError(
+                "random_pair_phase needs an image source with more than one pair "
+                "phase (pair_phases=True and pair_stride > 1, i.e. --output-on-pairs "
+                "with --frame-gap above 1)"
+            )
+        self.random_pair_phase = bool(random_pair_phase)
 
         self.attitude = attitude
         self.velocity_body = velocity_body.astype(np.float32)
@@ -315,6 +331,29 @@ class FixedWingVODataset(Dataset):
     def __len__(self) -> int:
         return int(self.starts.size)
 
+    def _draw_phase(self) -> int:
+        """Phase 0, or a uniformly random phase when ``random_pair_phase``.
+
+        torch's global generator, which DataLoader seeds per worker (and per
+        epoch for non-persistent workers), so loader workers do not all draw
+        the same sequence.
+        """
+
+        if not self.random_pair_phase:
+            return 0
+        return int(torch.randint(self.image_source.phase_count, (1,)).item())
+
+    def fixed_phase_view(self) -> "FixedWingVODataset":
+        """The same windows with phase 0 only: a deterministic copy for
+        scoring the training split (``--eval-train-split``). Shares every
+        array with ``self``; nothing is recomputed."""
+
+        if not self.random_pair_phase:
+            return self
+        view = copy.copy(self)
+        view.random_pair_phase = False
+        return view
+
     def _range_start(self, start: int) -> int:
         """The start of whichever assigned range contains window ``start``.
 
@@ -338,23 +377,32 @@ class FixedWingVODataset(Dataset):
 
         Each event's attitude-derived inputs are fixed, so computing them per
         window per epoch inside the loader workers - as the per-event loop
-        this replaces did - repeats identical work every epoch.
+        this replaces did - repeats identical work every epoch. One set per
+        pair phase this dataset can draw (only phase 0 unless
+        ``random_pair_phase``), indexed ``[phase][event]``.
         """
 
-        plan = self.image_source.plan
-        count = int(plan.ready_tick.size)
-        rates = np.zeros((count, 3), dtype=np.float32)
-        for event in range(count):
-            rates[event] = self.image_source.rate_over_exposure(
-                self.attitude.body_rate_rad_s, self.attitude.times_s, event
-            )
-        geometry = pair_geometry_batch(self.attitude, plan.exposure_t0_s, plan.exposure_t1_s)
-        self._event_rate = torch.from_numpy(rates)
-        self._event_rotation = torch.from_numpy(geometry["relative_rotation"])
-        self._event_down = torch.from_numpy(geometry["down_body"])
-        self._event_altitude = torch.from_numpy(geometry["altitude_m"])
+        source = self.image_source
+        phases = range(source.phase_count) if self.random_pair_phase else range(1)
+        self._event_rate: List[torch.Tensor] = []
+        self._event_rotation: List[torch.Tensor] = []
+        self._event_down: List[torch.Tensor] = []
+        self._event_altitude: List[torch.Tensor] = []
+        for phase in phases:
+            plan = source.plan_for(phase)
+            count = int(plan.ready_tick.size)
+            rates = np.zeros((count, 3), dtype=np.float32)
+            for event in range(count):
+                rates[event] = source.rate_over_exposure(
+                    self.attitude.body_rate_rad_s, self.attitude.times_s, event, phase
+                )
+            geometry = pair_geometry_batch(self.attitude, plan.exposure_t0_s, plan.exposure_t1_s)
+            self._event_rate.append(torch.from_numpy(rates))
+            self._event_rotation.append(torch.from_numpy(geometry["relative_rotation"]))
+            self._event_down.append(torch.from_numpy(geometry["down_body"]))
+            self._event_altitude.append(torch.from_numpy(geometry["altitude_m"]))
 
-    def _event_inputs(self, events: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _event_inputs(self, events: torch.Tensor, phase: int = 0) -> Dict[str, torch.Tensor]:
         """Attitude-derived inputs for a window's event slots.
 
         ``events`` is ``visual_event_index`` from
@@ -379,10 +427,10 @@ class FixedWingVODataset(Dataset):
         down[:, 2] = 1.0
         altitude = torch.ones(slots, 2)
         if bool(real.any()):
-            rates[real] = self._event_rate[picked[real]]
-            rotation[real] = self._event_rotation[picked[real]]
-            down[real] = self._event_down[picked[real]]
-            altitude[real] = self._event_altitude[picked[real]]
+            rates[real] = self._event_rate[phase][picked[real]]
+            rotation[real] = self._event_rotation[phase][picked[real]]
+            down[real] = self._event_down[phase][picked[real]]
+            altitude[real] = self._event_altitude[phase][picked[real]]
         return {
             "visual_event_body_rate": rates,
             "visual_event_rotation": rotation,
@@ -414,11 +462,14 @@ class FixedWingVODataset(Dataset):
         # they would silently select different events for one window - see
         # VisualPairSource.events_in_window for why the bound exists at all.
         range_start = self._range_start(start)
+        phase = self._draw_phase()
         pairs = self.image_source.window_pairs(
-            start, end, self.max_visual_events, min_capture_tick=range_start
+            start, end, self.max_visual_events, min_capture_tick=range_start,
+            phase=phase,
         )
         item.update(pairs)
-        item.update(self._event_inputs(pairs["visual_event_index"]))
+        item.update(self._event_inputs(pairs["visual_event_index"], phase))
+        item["visual_pair_phase"] = torch.tensor(phase, dtype=torch.long)
         # A window whose visual events all land before its first usable tick
         # would train the fusion on presence bits that never fire.
         item["visual_event_valid"] = pairs["visual_event_valid"]
@@ -582,6 +633,7 @@ def build_vo_dataset(
     distortion: Optional[Sequence[float]] = None,
     normalizer: Optional[VONormalizer] = None,
     grayscale: bool = True,
+    random_pair_phase: bool = False,
     **window_kwargs,
 ) -> Tuple[FixedWingVODataset, VONormalizer, AttitudeAltitude]:
     """Assemble a VO dataset from one flight directory.
@@ -595,6 +647,11 @@ def build_vo_dataset(
 
     ``grayscale=False`` loads the frames as RGB (three channels). It must
     agree with the frontend's ``input_channels``: 1 for grayscale, 3 for RGB.
+
+    ``random_pair_phase=True`` builds every tiling phase of the pairs and has
+    each window draw one (training only; see
+    :class:`~vio.data.image_pairs.VisualPairSource`). Off, the dataset is
+    exactly what it was before the option existed.
     """
 
     root = Path(dataset_root).expanduser().resolve()
@@ -633,6 +690,7 @@ def build_vo_dataset(
         images_rectified=images_rectified,
         distortion=distortion,
         grayscale=bool(grayscale),
+        pair_phases=bool(random_pair_phase),
     )
     if normalizer is None:
         normalizer = VONormalizer.from_range(attitude, index_range)
@@ -642,6 +700,7 @@ def build_vo_dataset(
         index_range,
         normalizer,
         image_source=image_source,
+        random_pair_phase=bool(random_pair_phase),
         **window_kwargs,
     )
     return dataset, normalizer, attitude

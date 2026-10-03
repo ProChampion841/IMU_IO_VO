@@ -267,7 +267,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "cannot be rebuilt. It is not a train_fixedwing_vo.py checkpoint."
         )
 
-    dataset_root = Path(args.dataset if args.dataset is not None else saved["dataset"])
+    # A PRE-SPLIT run's recorded "dataset" is its TRAINING folder, so it is
+    # never the default to score: the held-out default is its validation
+    # folder. And whatever folder is scored, if it is the training one the
+    # report must not call the result held out.
+    pre_split = bool(saved.get("validation_dataset"))
+    if args.dataset is not None:
+        dataset_root = Path(args.dataset)
+    elif pre_split:
+        dataset_root = Path(saved["validation_dataset"])
+        print(f"no --dataset: scoring the run's validation folder {dataset_root}")
+    else:
+        dataset_root = Path(saved["dataset"])
+    scoring_training_folder = (
+        pre_split and dataset_root.resolve() == Path(saved["dataset"]).resolve()
+    )
     if not dataset_root.is_dir():
         raise SystemExit(f"Dataset directory not found: {dataset_root}")
     horizons = parse_horizon_minutes(args.horizons)
@@ -351,16 +365,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     frame_interval = float(np.median(pair_dt)) if pair_dt.size else 0.0
     tick_interval = float(np.median(np.diff(attitude.times_s))) if total > 1 else 0.0
     deployment_latency_s = float(saved.get("deployment_latency_s", 0.35))
+    # With non-overlapping pairs (--output-on-pairs) a cold start can wait up
+    # to pair_stride - 1 more frames for the tiling's next first frame - the
+    # same worst case the trainer's own --warmup default is built from.
+    pair_stride = int(saved.get("pair_stride", 1) or 1)
+    frame_gap = max(int(saved.get("frame_gap", 1) or 1), 1)
+    frame_interval += (pair_stride - 1) * frame_interval / frame_gap
     if tick_interval > 0:
         min_cold_start_warmup = int(
-            np.ceil((deployment_latency_s + frame_interval) / tick_interval)
+            np.ceil((deployment_latency_s + frame_interval) / tick_interval - 1e-6)
         )
         if warmup < min_cold_start_warmup:
             print(
                 f"  WARNING --warmup {warmup} ticks is shorter than the "
-                f"guaranteed cold-start blind period (~{min_cold_start_warmup} "
-                f"ticks = deployment latency {deployment_latency_s:.3f}s + one "
-                f"frame interval {frame_interval:.3f}s, at a measured tick "
+                f"worst-case cold-start blind period (~{min_cold_start_warmup} "
+                f"ticks = deployment latency {deployment_latency_s:.3f}s + the "
+                f"wait for a first pair {frame_interval:.3f}s, at a measured tick "
                 f"interval of {tick_interval:.4f}s). The first "
                 f"{min_cold_start_warmup - warmup} tick(s) of every horizon "
                 "below have no visual event yet but are scored as if live."
@@ -485,6 +505,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.disable_visual_input or saved.get("disable_visual_input", False)
     )
     if disable_visual:
+        if bool(saved.get("output_on_pairs", False)):
+            # One output per DELIVERED pair: with no pairs there is no tick to
+            # score, and every horizon would come back NaN rather than a floor.
+            raise SystemExit(
+                "--disable-visual-input has no floor to report for an "
+                "--output-on-pairs checkpoint: it scores only the ticks where a "
+                "pair is delivered, and with visual input disabled none is."
+            )
         print("visual input DISABLED: this is the attitude-and-altitude-only floor")
 
     # The same constant-velocity floor the trainer uses, from the same ticks.
@@ -590,7 +618,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             continue
         minutes = float(attitude.times_s[span[1] - 1] - attitude.times_s[span[0]]) / 60.0
         print(f"\n=== {name} ===  ticks {span[0]}-{span[1]} ({minutes:.1f} min)")
-        if name in ("train", "full"):
+        if name in ("train", "full") or scoring_training_folder:
             print("    NOT held out - a drift diagnostic, not an accuracy claim")
         tokens = encode_span_tokens(
             frontend,
@@ -671,7 +699,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report["splits"][name] = {
             "range": [int(span[0]), int(span[1])],
             "minutes": minutes,
-            "held_out": name in ("validation", "test"),
+            "held_out": name in ("validation", "test") and not scoring_training_folder,
             "visual_events": len(tokens),
             "horizons": results,
         }

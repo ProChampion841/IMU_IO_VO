@@ -608,7 +608,10 @@ class _LegStats:
         finite = torch.isfinite(predicted).all(-1) & torch.isfinite(target).all(-1)
         valid = (mask > 0) & finite
         weight = valid.double()
-        residual = predicted - target
+        # Zeroed, not merely weighted: NaN * 0 is NaN, so one non-finite tick
+        # anywhere in the block - scored or not - would otherwise poison every
+        # sum below and hide the block's maximum.
+        residual = torch.where(valid.unsqueeze(-1), predicted - target, 0.0)
         magnitude = torch.linalg.vector_norm(residual, dim=-1)
         self.sq_sum += (magnitude.square() * weight).sum(dim=1)
         self.count += weight.sum(dim=1)
@@ -627,7 +630,9 @@ class _LegStats:
         cosine = (predicted * target).sum(-1) / (predicted_norm * target_norm).clamp_min(
             _EPS
         )
-        angles = torch.rad2deg(torch.arccos(cosine.clamp(-1.0, 1.0)))
+        angles = torch.where(
+            usable, torch.rad2deg(torch.arccos(cosine.clamp(-1.0, 1.0))), 0.0
+        )
         angle_weight = usable.double()
         self.dir_sq_sum += (angles.square() * angle_weight).sum(dim=1)
         self.dir_count += angle_weight.sum(dim=1)
@@ -1302,7 +1307,9 @@ def run_span_horizons(
         for stem, tick_value in timed:
             within = int(tick_value)
             entry[f"{stem}_tick"] = within
-            entry[f"{stem}_time_s"] = within * interval
+            # The real clock, not tick x median interval: after a telemetry
+            # gap the latter is early by the whole gap.
+            entry[f"{stem}_time_s"] = float(times[start + within] - times[start])
             entry[f"{stem}_flight_tick"] = int(start + within)
             entry[f"{stem}_flight_time_s"] = float(times[start + within])
         if reference is not None:
@@ -1311,7 +1318,7 @@ def run_span_horizons(
             entry["baseline_vel_dir_rmse"] = float(floor["vel_dir_rmse"][0])
         if series:
             entry["series"] = {
-                "time_since_start_s": np.arange(ticks, dtype=np.float64) * interval,
+                "time_since_start_s": times[start:start + ticks] - times[start],
                 **stats.series(),
                 **({} if drift is None else drift.series()),
             }

@@ -630,3 +630,153 @@ TBPTT, no new architecture, exactly as the review asked.
       earlier local CPU smoke train/evaluate (small synthetic flight) after
       the fix to confirm the real VOStep/encode_pairs call path still
       trains and evaluates end to end, not just the new unit tests.
+
+
+19. --random-pair-phase: MORE DISTINCT TRAINING PAIRS FROM THE SAME FLIGHT
+--------------------------------------------------------------------------
+19.1  With --output-on-pairs and --frame-gap 10, pairs always started on
+      frames 0, 10, 20, ... Every epoch showed the model the SAME image
+      pairs, and the pairs starting on the other 9 frames were never used.
+19.2  Over ~300 epochs each training pair is seen hundreds of times - enough
+      to memorise its own matching and label noise. The planar run's log fits
+      that: train x/z kept improving (1.07 / 0.52 m/s) while validation stayed
+      flat (1.57 / 0.90).
+19.3  New: --random-pair-phase. Each TRAINING window draws which frame its
+      tiling starts on (0 .. g-1). Same pair interval (0.5 s), same output
+      cadence, same filters (image gaps, telemetry holes, split boundaries);
+      only which frames are paired changes. 10x more distinct pairs.
+19.4  Everything that SCORES stays on phase 0, exactly as before: validation,
+      test, --eval-train-split (a fixed-phase view of the training set), the
+      in-training horizon pass, the evaluator and the ONNX tools. Their
+      numbers compare directly with a run without the flag.
+19.5  VisualPairSource(pair_phases=True) builds one plan per phase; .plan is
+      still phase 0 and bit-identical to the plan built without the option
+      (tested field by field), so no caller that does not ask for a phase
+      can see a difference.
+19.6  The model, the checkpoint layout and the ONNX export are unchanged. The
+      flag is recorded in the checkpoint args. Like --photometric-augment it is
+      training augmentation, not part of the resume fingerprint.
+19.7  Refused without --output-on-pairs and a frame gap above 1: with a pair
+      ending on every frame there is no phase to vary.
+19.8  New tests/test_random_pair_phase.py (8 tests): phase 0 equals the old
+      plan; every phase keeps the 0.5 s interval and cadence; a window's
+      events, offsets and pair geometry all come from the phase it drew; the
+      fixed view and a run without the flag give identical windows; the
+      trainer draws phases for training only and scores train-eval on phase 0.
+19.9  Whole suite green: 322 passed, 1 skipped (the CUDA-only
+      mask_stream_state test; no GPU here). Also run by hand on a rendered
+      20 s flight with 2 loader workers: "10 tiling phases, 383 distinct image
+      pairs (phase 0 alone: 39)", train/val/train-eval all finite.
+
+
+20. REVIEW OF THE TRAINER AND THE EVALUATOR (planar, --output-on-pairs, DDP)
+-----------------------------------------------------------------------------
+Both scripts were re-read end to end against the configuration actually
+trained. The core is sound: the streamed evaluator feeds the model exactly
+what training does and scores the same ticks (checked numerically, 6e-8);
+the LR schedule, DDP metric reduction, early stopping, splits and baseline
+are right. What was wrong, and is fixed:
+
+20.1  Every DDP rank was seeded identically and never re-seeded, so all ten
+      GPUs drew the SAME dropout masks, photometric jitter and loader-worker
+      seeds: the extra ranks added no augmentation diversity. Ranks are now
+      re-seeded with seed + rank after DDP has synchronised the weights.
+      Checked with a real 2-rank run: rank 0 and 1 jitter now differ.
+20.2  A non-finite prediction was silently DROPPED from the metrics, so a
+      model that blew up on its hardest ticks scored better and could become
+      best.pt. It now counts as an infinite error (an epoch with one is never
+      selected). A non-finite LABEL still just removes its tick.
+20.3  The evaluator's per-leg sums had the same hole the other way round:
+      NaN * 0 is NaN, so one non-finite tick anywhere in a block - even an
+      unscored one - turned vel_rmse into NaN and hid the block's maximum.
+20.4  Checkpoints are written atomically (temp file + rename): a job killed
+      mid-save no longer leaves a truncated last.pt that --resume cannot read.
+20.5  A resume from an older checkpoint (epochs/epoch_0100.pt while best.pt
+      is epoch 120) restored a worse "best" and the next epoch to beat it
+      overwrote the better best.pt. The better of the two is now kept.
+20.6  A resume silently kept the checkpoint's learning rate and weight decay
+      when the command asked for different ones (a new --learning-rate, or
+      --lr-scaling on a different GPU count) while logging the new value. The
+      change is now applied, like a changed --epochs: rebuilt, fast-forwarded,
+      and logged.
+20.7  --velocity-loss simple never trains the variance and direction-
+      confidence heads; they are now frozen. Nothing changes numerically, but
+      newer PyTorch (2.14 here) crashed DDP at the start of epoch 2 with
+      "Expected to have finished reduction in the prior iteration" because of
+      them - the ORIGINAL code did too, in this environment. A server upgrade
+      would have hit it.
+20.8  Evaluator, max-error times: "t@max" and the plots' time axis were tick
+      index x median interval, early by the whole length of any telemetry gap
+      before them. Now read off the telemetry clock.
+20.9  Evaluator, pre-split runs: with no --dataset it scored the run's TRAINING
+      folder and labelled it held-out validation. It now defaults to the run's
+      validation folder, and scoring the training folder is reported as NOT
+      held out.
+20.10 Stratification: turn_rate_deg_s is |yaw rate r|, which under-reads a
+      steep turn (heading rate x cos bank) and is blind to a pull-up. Kept as
+      it was, and rotation_rate_deg_s (|p, q, r|, all the rotation the frontend
+      removes) added beside it.
+20.11 --disable-visual-input with --output-on-pairs is refused in both tools:
+      outputs exist only on delivered pairs, so it scored nothing (loss 0,
+      NaN metrics, no best.pt) instead of giving a floor.
+20.12 The evaluator's cold-start warm-up warning left out the extra wait for
+      a non-overlapping tiling's first pair (130 ticks, not 85, here).
+20.13 New startup NOTE when --max-visual-events is far above the pairs a window
+      actually holds. With --output-on-pairs a 6 s window has ~12 pairs, so the
+      default 120 pushes ~108 zero-padding slots per window through the
+      frontend and the loaders: same result, several times the compute.
+      commands.txt 3b now passes --max-visual-events 14.
+
+NOT changed - decisions for the user:
+20.14 With --output-on-pairs the scored ticks are the DELIVERED pairs, and
+      delivery depends on learned quantities (fit weight vs --min-fit-cells,
+      the speed cap). An epoch that refuses its hardest pairs scores better on
+      fewer ticks. val_visual_kept_fraction was 1.0 throughout the planar run,
+      so no effect yet - but read it next to val_vel_rmse once any reliability
+      gate is turned on.
+20.15 The automatic --warmup (135 ticks) masks the first ~2 of a window's ~12
+      pair outputs, because a pair captured just before a window starts is
+      delivered inside it. Kept: it is also the recurrent state's warm-up. A
+      shorter --warmup buys ~15% more supervision if wanted.
+20.16 DistributedSampler pads validation by repeating up to world_size - 1
+      windows, so validation numbers shift slightly with the GPU count.
+20.17 metrics.csv's fixed 6-decimal format prints a learning rate below 1e-6
+      as 0.000000. The format is pinned by a test, so it was left alone.
+
+20.18 Tests: tests/test_evaluation_fixes.py (5), tests/test_training_fixes.py
+      (6). Whole suite: 333 passed, 1 skipped (CUDA-only). Also run as a real
+      2-rank CPU DDP job (gloo): 3 epochs with --random-pair-phase and
+      --eval-train-split, then a resume from epoch 2 with a new learning rate.
+
+
+21. --pair-stride: A ONE-SECOND PAIR EVERY HALF SECOND
+-------------------------------------------------------
+21.1  With --output-on-pairs the time between outputs was forced to equal the
+      pair length: 0.5 s pairs every 0.5 s. At 200 m a 0.5 s pair moves the
+      ground only a little in the image, so matching error is large relative
+      to the motion (untrained, rendered 200 m flight: 0.33 m/s per pair at
+      0.5 s, 0.20 m/s at 1 s).
+21.2  New --pair-stride FRAMES: how often a pair (and an output) starts,
+      separate from --frame-gap (how long a pair is). --frame-gap 20
+      --pair-stride 10 at 20 Hz is a 1 s pair every 0.5 s - pairs (0,20),
+      (10,30), (20,40), ... - twice the ground motion per measurement at the
+      EKF's 0.5 s output rate. Default: --pair-stride = --frame-gap, exactly as
+      before, so existing commands, checkpoints and resumes are unchanged.
+21.3  Everything downstream already handled stride != gap: the pair plan, the
+      dataset, --random-pair-phase, the evaluator, the ONNX export and the
+      standalone runtime. Only the trainer forced them equal. The resolved
+      stride is in the checkpoint args and the resume fingerprint.
+21.4  The automatic warm-up follows: latency + (gap + stride - 1) frames
+      (185 ticks for 20/10, was 135 for 10/10). --max-frame-gap-s follows the
+      pair length (1.5 s for 1 s pairs).
+21.5  Costs, stated rather than hidden: each output averages the motion over
+      1 s instead of 0.5 s, so it reacts more slowly to turns and speed
+      changes; neighbouring outputs share an image, so their errors are partly
+      shared (vo.var_scale in the EKF is there for that).
+21.6  Refused without --output-on-pairs, or below 1 frame.
+21.7  New tests/test_pair_stride.py (7 tests), including an ONNX export and a
+      standalone-runtime replay of a rendered flight with 1 s pairs every
+      0.5 s: delivery ticks identical to PyTorch, max velocity difference
+      4.6e-5 m/s; and the evaluator against training on the same span with
+      overlapping pairs: same pairs, same scored ticks, velocities equal. commands.txt 3c is the run to compare against the 0.5 s
+      baseline.

@@ -108,6 +108,14 @@ class VisualPairSource:
     that exists only between colour channels. If the JPEGs on disk are
     themselves mode "L" there is nothing to gain: the three channels would be
     identical copies and only the transport cost would triple.
+
+    ``pair_phases=True`` (only meaningful with ``pair_stride > 1``) also builds
+    the tilings that start on frames ``1 .. pair_stride - 1``: phase ``p``
+    pairs ``(p, p + g), (p + s, p + s + g), ...``. :attr:`plan` is always
+    phase 0, exactly the plan built without the flag, so every caller that
+    does not ask for a phase sees the schedule it always did; the other
+    phases exist only for :class:`~vio.data.fixedwing_vo.FixedWingVODataset`
+    to draw from in training (``--random-pair-phase``).
     """
 
     def __init__(
@@ -130,6 +138,7 @@ class VisualPairSource:
         distortion: Optional[np.ndarray] = None,
         calibration_image_size: Optional[Tuple[int, int]] = None,
         images_rectified: bool = False,
+        pair_phases: bool = False,
     ) -> None:
         if frame_gap < 1:
             raise ValueError("frame_gap must be at least one")
@@ -214,12 +223,50 @@ class VisualPairSource:
         count = len(self.paths) - frame_gap
         if count <= 0:
             raise ValueError("Not enough images for the requested frame gap")
-        first = np.arange(0, count, self.pair_stride, dtype=np.int64)
+        self.max_frame_gap_s = None if max_frame_gap_s is None else float(max_frame_gap_s)
+        step = float(np.median(np.diff(telemetry_times_s))) if telemetry_times_s.size > 1 else 0.0
+        if max_telemetry_gap_s is None:
+            # Wide enough never to fire on a healthy clock, including a jittered
+            # one; narrow enough that a real dropout always trips it.
+            max_telemetry_gap_s = 8.0 * step if step > 0 else None
+        self.max_telemetry_gap_s = (
+            None if max_telemetry_gap_s is None else float(max_telemetry_gap_s)
+        )
+        # One plan per tiling phase. Phase 0 is the schedule this class has
+        # always built; the others start the same tiling 1 .. stride-1 frames
+        # later and go through exactly the same filters.
+        self.phase_count = self.pair_stride if pair_phases and self.pair_stride > 1 else 1
+        self.phase_plans: List[VisualPairPlan] = []
+        for phase in range(self.phase_count):
+            plan, rejected_gap, rejected_telemetry = self._build_plan(
+                np.arange(phase, count, self.pair_stride, dtype=np.int64),
+                capture, telemetry_times_s, frame_gap, float(deployment_latency_s),
+            )
+            self.phase_plans.append(plan)
+            if phase == 0:
+                # Counted for the phase every caller sees, so the trainer's
+                # "rejected N pairs" log means what it always meant.
+                self.rejected_gap_pairs = rejected_gap
+                self.rejected_telemetry_gap_pairs = rejected_telemetry
+        self.plan = self.phase_plans[0]
+
+    def _build_plan(
+        self,
+        first: np.ndarray,
+        capture: np.ndarray,
+        telemetry_times_s: np.ndarray,
+        frame_gap: int,
+        deployment_latency_s: float,
+    ) -> Tuple[VisualPairPlan, int, int]:
+        """The plan for pairs ``(first, first + frame_gap)``, filtered; returns
+        ``(plan, pairs rejected for an image gap, pairs rejected for a
+        telemetry gap)``."""
+
         second = first + frame_gap
         exposure_t0 = capture[first]
         exposure_t1 = capture[second]
         # An event is available once the frontend has had time to produce it.
-        ready = exposure_t1 + float(deployment_latency_s)
+        ready = exposure_t1 + deployment_latency_s
         tick = np.searchsorted(telemetry_times_s, ready, side="left")
         # Both bounds matter. searchsorted returns 0 for anything before the
         # first telemetry tick, so without the lower bound every image captured
@@ -233,11 +280,10 @@ class VisualPairSource:
         # true displacement leaves it: what comes back is not a small motion but
         # a confident wrong match. Reject the pair instead of scoring it.
         interval = exposure_t1 - exposure_t0
-        self.rejected_gap_pairs = 0
-        self.max_frame_gap_s = None if max_frame_gap_s is None else float(max_frame_gap_s)
+        rejected_gap = 0
         if self.max_frame_gap_s is not None:
             too_long = interval > self.max_frame_gap_s
-            self.rejected_gap_pairs = int(np.count_nonzero(too_long & inside))
+            rejected_gap = int(np.count_nonzero(too_long & inside))
             inside = inside & ~too_long
         # A TELEMETRY dropout is the mirror image of an image dropout and is not
         # caught by any of the checks above. An exposure landing inside a hole in
@@ -253,15 +299,7 @@ class VisualPairSource:
         # correlating image motion against telemetry rotation finds that, which
         # is what tools/estimate_time_offset.py is for and why
         # --image-time-offset exists.
-        step = float(np.median(np.diff(telemetry_times_s))) if telemetry_times_s.size > 1 else 0.0
-        if max_telemetry_gap_s is None:
-            # Wide enough never to fire on a healthy clock, including a jittered
-            # one; narrow enough that a real dropout always trips it.
-            max_telemetry_gap_s = 8.0 * step if step > 0 else None
-        self.max_telemetry_gap_s = (
-            None if max_telemetry_gap_s is None else float(max_telemetry_gap_s)
-        )
-        self.rejected_telemetry_gap_pairs = 0
+        rejected_telemetry = 0
         if self.max_telemetry_gap_s is not None and telemetry_times_s.size > 1:
             def bracket_span(query: np.ndarray) -> np.ndarray:
                 upper = np.clip(
@@ -274,7 +312,7 @@ class VisualPairSource:
                 (bracket_span(exposure_t0) > self.max_telemetry_gap_s)
                 | (bracket_span(exposure_t1) > self.max_telemetry_gap_s)
             )
-            self.rejected_telemetry_gap_pairs = int(np.count_nonzero(straddles & inside))
+            rejected_telemetry = int(np.count_nonzero(straddles & inside))
             inside = inside & ~straddles
         # Where the exposures themselves sit on the telemetry clock. These are
         # nearest matches, not left-side insertions: an exposure is an instant,
@@ -283,7 +321,7 @@ class VisualPairSource:
         # every VALUE read at an exposure instant is interpolated, never snapped.
         index0, _ = nearest_indices(telemetry_times_s, exposure_t0)
         index1, _ = nearest_indices(telemetry_times_s, exposure_t1)
-        self.plan = VisualPairPlan(
+        plan = VisualPairPlan(
             first_index=first[inside],
             second_index=second[inside],
             ready_tick=tick[inside].astype(np.int64),
@@ -294,9 +332,27 @@ class VisualPairSource:
             telemetry_index1=index1[inside].astype(np.int64),
             ready_time_s=ready[inside].astype(np.float64),
         )
+        return plan, rejected_gap, rejected_telemetry
+
+    def plan_for(self, phase: int = 0) -> VisualPairPlan:
+        """The pair plan of tiling ``phase`` (0 is :attr:`plan`)."""
+
+        phase = int(phase)
+        if not 0 <= phase < self.phase_count:
+            raise ValueError(
+                f"pair phase {phase} does not exist: this source has "
+                f"{self.phase_count} phase(s) (build it with pair_phases=True "
+                "and pair_stride > 1 for more)"
+            )
+        return self.phase_plans[phase]
 
     def events_in_window(
-        self, start: int, end: int, *, min_capture_tick: Optional[int] = None
+        self,
+        start: int,
+        end: int,
+        *,
+        min_capture_tick: Optional[int] = None,
+        phase: int = 0,
     ) -> np.ndarray:
         """Indices of the events whose ready tick lands inside ``[start, end)``.
 
@@ -316,12 +372,15 @@ class VisualPairSource:
         phase-range's own start closes that off with no effect anywhere else,
         since every OTHER window's reach-back stays comfortably inside its own
         range.
+
+        The indices are into the plan of tiling ``phase`` (:meth:`plan_for`).
         """
 
-        tick = self.plan.ready_tick
+        plan = self.plan_for(phase)
+        tick = plan.ready_tick
         inside = (tick >= start) & (tick < end)
         if min_capture_tick is not None:
-            inside &= self.plan.telemetry_index0 >= int(min_capture_tick)
+            inside &= plan.telemetry_index0 >= int(min_capture_tick)
         return np.flatnonzero(inside)
 
     def rate_over_exposure(
@@ -329,6 +388,7 @@ class VisualPairSource:
         angular_rate_rad_s: np.ndarray,
         telemetry_times_s: np.ndarray,
         index: int,
+        phase: int = 0,
     ) -> np.ndarray:
         """Mean angular rate over the pair's own exposure interval.
 
@@ -364,14 +424,15 @@ class VisualPairSource:
                 "angular_rate_rad_s must be (samples, axes) aligned with the "
                 f"{times.size} telemetry times; got shape {rates.shape}"
             )
+        plan = self.plan_for(phase)
         event = int(index)
-        total = int(self.plan.ready_tick.size)
+        total = int(plan.ready_tick.size)
         if not 0 <= event < total:
             raise IndexError(
                 f"Visual event {event} is outside this flight's {total} pairs"
             )
-        start = float(self.plan.exposure_t0_s[event])
-        finish = float(self.plan.exposure_t1_s[event])
+        start = float(plan.exposure_t0_s[event])
+        finish = float(plan.exposure_t1_s[event])
         # Hold at the telemetry ends rather than extrapolating past them: a
         # linear extrapolation of body rate beyond the recorded window is not a
         # measurement, and an exposure can legitimately sit just outside it.
@@ -442,23 +503,25 @@ class VisualPairSource:
             array = array.transpose(2, 0, 1)
         return torch.from_numpy(np.ascontiguousarray(array))
 
-    def load_pair(self, event: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def load_pair(self, event: int, phase: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         """Both frames of one visual event, as uint8 CHW tensors.
 
-        The event index is into :attr:`plan`, not into the image folder: the
-        plan has already dropped the images whose ready time falls outside the
-        telemetry range, so the two numberings differ wherever that happened.
+        The event index is into the plan of tiling ``phase`` (:attr:`plan`
+        for phase 0), not into the image folder: the plan has already dropped
+        the images whose ready time falls outside the telemetry range, so the
+        two numberings differ wherever that happened.
         """
 
+        plan = self.plan_for(phase)
         index = int(event)
-        total = int(self.plan.ready_tick.size)
+        total = int(plan.ready_tick.size)
         if not 0 <= index < total:
             raise IndexError(
                 f"Visual event {index} is outside this flight's {total} pairs"
             )
         return (
-            self._load(int(self.plan.first_index[index])),
-            self._load(int(self.plan.second_index[index])),
+            self._load(int(plan.first_index[index])),
+            self._load(int(plan.second_index[index])),
         )
 
     def window_pairs(
@@ -468,6 +531,7 @@ class VisualPairSource:
         max_events: int,
         *,
         min_capture_tick: Optional[int] = None,
+        phase: int = 0,
     ) -> dict:
         """Padded image pairs for one window, with their tick positions.
 
@@ -477,12 +541,16 @@ class VisualPairSource:
         it exists; the caller must pass the same value here as to any other
         selection for this window (:class:`~vio.data.fixedwing_vo.
         FixedWingVODataset` does), or the two would silently select different
-        events for what is supposed to be one window.
+        events for what is supposed to be one window. ``phase`` picks the
+        tiling (:meth:`plan_for`); ``visual_event_index`` indexes that plan.
         """
 
         if max_events <= 0:
             raise ValueError("max_events must be positive")
-        selected = self.events_in_window(start, end, min_capture_tick=min_capture_tick)
+        plan = self.plan_for(phase)
+        selected = self.events_in_window(
+            start, end, min_capture_tick=min_capture_tick, phase=phase
+        )
         if selected.size > max_events:
             # An evenly spaced subset keeps visual input across the whole
             # window; keeping only the earliest events would leave everything
@@ -508,9 +576,9 @@ class VisualPairSource:
         # events instead of repeating the selection above.
         index = torch.full((max_events,), -1, dtype=torch.long)
         for slot, event in enumerate(selected):
-            first[slot], second[slot] = self.load_pair(int(event))
-            offset[slot] = int(self.plan.ready_tick[event]) - start
-            interval[slot] = float(self.plan.pair_dt_s[event])
+            first[slot], second[slot] = self.load_pair(int(event), phase)
+            offset[slot] = int(plan.ready_tick[event]) - start
+            interval[slot] = float(plan.pair_dt_s[event])
             valid[slot] = 1.0
             index[slot] = int(event)
         return {

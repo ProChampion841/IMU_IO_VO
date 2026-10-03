@@ -362,13 +362,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     window.add_argument(
         "--output-on-pairs", action="store_true",
-        help="One velocity output per image pair, at the pair interval: pairs "
-             "no longer overlap - (0, g), (g, 2g), ... for --frame-gap g - so a "
-             "new measurement arrives every g frames (every 0.5 s for g = 10 at "
-             "20 Hz), and the model's velocity is scored (and, in the "
+        help="One velocity output per image pair, at the pair interval: by "
+             "default pairs no longer overlap - (0, g), (g, 2g), ... for "
+             "--frame-gap g - so a new measurement arrives every g frames (every "
+             "0.5 s for g = 10 at 20 Hz; --pair-stride changes how often), and "
+             "the model's velocity is scored (and, in the "
              "evaluator, reported) only on the tick each pair is delivered, "
              "held in between. Default off: a pair ends on every frame and the "
              "output is scored on every telemetry tick.",
+    )
+    window.add_argument(
+        "--pair-stride", type=int, default=None, metavar="FRAMES",
+        help="With --output-on-pairs: frames between the starts of consecutive "
+             "pairs, i.e. how often a pair - and an output - arrives. Default: "
+             "--frame-gap, so pairs tile the capture end to end. Smaller than "
+             "--frame-gap makes pairs OVERLAP: --frame-gap 20 --pair-stride 10 "
+             "at 20 Hz is a 1 s pair every 0.5 s - twice the ground motion per "
+             "measurement, at the same output rate as 0.5 s pairs. Neighbouring "
+             "outputs then share an image, so their errors are partly shared.",
+    )
+    window.add_argument(
+        "--random-pair-phase", action="store_true",
+        help="Training augmentation for --output-on-pairs: each training window "
+             "draws which frame its pair tiling starts on (0 .. g-1), so the same "
+             "stretch of flight is seen as g different sets of image pairs "
+             "across epochs instead of one. The pair interval and the output "
+             "cadence are unchanged, and validation, test, --eval-train-split, "
+             "the horizon pass and the evaluator all stay on the fixed tiling "
+             "(phase 0), so their numbers remain comparable with runs without "
+             "it. Default off.",
     )
     window.add_argument(
         "--planar-baseline-s", type=float, default=1.0,
@@ -1007,16 +1029,44 @@ def resolve_frontend_defaults(
     if args.max_frame_gap_s is None and planar and usable_clock:
         args.max_frame_gap_s = round(1.5 * args.frame_gap * frame_interval_s, 3)
         chosen.append(f"--max-frame-gap-s {args.max_frame_gap_s:g}")
-    args.pair_stride = int(args.frame_gap) if getattr(args, "output_on_pairs", False) else 1
-    if args.pair_stride > 1:
-        chosen.append(
-            f"--output-on-pairs: one pair and one output every {args.pair_stride} frames"
-            + (f" ({args.pair_stride * frame_interval_s:.2f} s)" if usable_clock else "")
+    on_pairs = bool(getattr(args, "output_on_pairs", False))
+    requested_stride = getattr(args, "pair_stride", None)
+    if requested_stride is not None:
+        if not on_pairs:
+            raise SystemExit(
+                "--pair-stride sets how often a pair and its output arrive, which "
+                "only exists with --output-on-pairs (without it a pair ends on "
+                "every frame and every tick is an output)."
+            )
+        if int(requested_stride) < 1:
+            raise SystemExit("--pair-stride must be at least 1 frame")
+    args.pair_stride = (
+        int(requested_stride) if requested_stride is not None
+        else int(args.frame_gap) if on_pairs else 1
+    )
+    if on_pairs:
+        seconds = lambda frames: (  # noqa: E731
+            f" ({frames * frame_interval_s:.2f} s)" if usable_clock else ""
         )
+        line = (
+            f"--output-on-pairs: one pair and one output every {args.pair_stride} "
+            f"frames{seconds(args.pair_stride)}"
+        )
+        if args.pair_stride < args.frame_gap:
+            line += (
+                f", each pair spanning {args.frame_gap} frames"
+                f"{seconds(args.frame_gap)}: consecutive pairs overlap"
+            )
+        elif args.pair_stride > args.frame_gap:
+            line += (
+                f"; the {args.pair_stride - args.frame_gap} frame(s) between one "
+                "pair's end and the next one's start are never used"
+            )
+        chosen.append(line)
     if args.warmup is None:
         if planar and usable_clock and tick_interval_s > 0:
-            # Non-overlapping pairs can leave a window waiting up to one more
-            # pair interval for its first one. The epsilon keeps
+            # A window can wait up to one more pair stride for its first pair
+            # to start, then a whole pair, then the latency. The epsilon keeps
             # 135.00000000000003 ticks from rounding up to 136.
             blind = math.ceil(
                 (
@@ -1384,6 +1434,20 @@ def prune_epoch_checkpoints(directory: Path, keep_last: int) -> None:
     existing = epoch_checkpoints(directory)
     for path in existing[: max(len(existing) - keep_last, 0)]:
         path.unlink(missing_ok=True)
+
+
+def save_checkpoint_atomic(payload: Mapping[str, Any], path: Path) -> None:
+    """``torch.save`` to a temporary file beside ``path``, then rename over it.
+
+    Written in place, a job killed mid-save leaves a truncated last.pt that
+    ``--resume auto`` cannot load (or a truncated best.pt). ``os.replace`` is
+    atomic on one filesystem, so ``path`` is always either the old checkpoint
+    or the complete new one.
+    """
+
+    temporary = path.with_name(path.name + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
 
 
 def announce_epoch_checkpoint_cost(
@@ -2543,6 +2607,19 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             f"{args.window_length}: with --frame-gap {args.frame_gap} the first image "
             "pair of a window arrives that late. Lengthen the window."
         )
+    if args.disable_visual_input and args.output_on_pairs:
+        raise SystemExit(
+            "--disable-visual-input with --output-on-pairs scores nothing: outputs "
+            "exist only on ticks where a pair is delivered, and with visual input "
+            "disabled none is - the loss is zero, val_vel_rmse NaN, and best.pt is "
+            "never written. Drop --output-on-pairs for the visual-blind floor."
+        )
+    if args.random_pair_phase and args.pair_stride < 2:
+        raise SystemExit(
+            "--random-pair-phase varies where the pair tiling starts, which only "
+            "exists with --output-on-pairs and a --frame-gap above 1 (pair stride "
+            f"is {args.pair_stride} here: every frame already starts a pair)."
+        )
 
     for phase in ("train", "validation", "test"):
         if phase not in phase_roots:
@@ -2574,11 +2651,25 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             stride=args.stride, warmup=args.warmup,
             max_visual_events=args.max_visual_events,
             grayscale=not args.color,
+            # Training only: every other split, and every pass that scores the
+            # training split, stays on the fixed tiling (phase 0).
+            random_pair_phase=bool(args.random_pair_phase and phase == "train"),
         )
         if normalizer is None:
             normalizer = built
         datasets[phase] = dataset
         world.log(f"  {phase}: {len(dataset)} windows over ticks {span}")
+        if dataset.random_pair_phase:
+            pair_source = dataset.image_source
+            distinct = sum(
+                int(pair_source.plan_for(p).ready_tick.size)
+                for p in range(pair_source.phase_count)
+            )
+            world.log(
+                f"  {phase}: --random-pair-phase, {pair_source.phase_count} tiling "
+                f"phases, {distinct} distinct image pairs (phase 0 alone: "
+                f"{int(pair_source.plan.ready_tick.size)})"
+            )
 
     # Never drop data silently: a gap cap that quietly removes a tenth of the
     # frames reads as "the capture is small" rather than "frames are missing".
@@ -2598,6 +2689,31 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
 
     if "train" not in datasets:
         raise SystemExit("The training split is shorter than one window.")
+
+    # Every one of --max-visual-events slots goes through the frontend, real
+    # pair or zero padding. With --output-on-pairs a 6 s window holds ~12
+    # pairs, so the default 120 sends ~10x the real work through the
+    # correlator and the loaders - same result, a fraction of the speed.
+    train_plan = datasets["train"].image_source.plan
+    train_starts = datasets["train"].starts
+    per_window = np.searchsorted(
+        train_plan.ready_tick, train_starts + args.window_length, side="left"
+    ) - np.searchsorted(train_plan.ready_tick, train_starts, side="left")
+    most_events = int(per_window.max()) if per_window.size else 0
+    if most_events > args.max_visual_events:
+        world.log(
+            f"  NOTE up to {most_events} image pairs land in one window but "
+            f"--max-visual-events is {args.max_visual_events}: windows keep an "
+            "evenly spaced subset"
+        )
+    elif not args.disable_visual_input and args.max_visual_events > 2 * most_events + 2:
+        world.log(
+            f"  NOTE at most {most_events} image pairs land in one training window, "
+            f"but --max-visual-events {args.max_visual_events} sends "
+            f"{args.max_visual_events} slots per window through the frontend "
+            f"(the rest is zero padding). --max-visual-events {most_events + 2} "
+            "gives the same result for a fraction of the compute."
+        )
 
     # Every window is a cold start: nothing is delivered before one pair
     # interval plus the deployment latency has passed since the window began.
@@ -2824,6 +2940,15 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
         fusion_dim=args.fusion_dim, dropout=args.dropout, frontend=frontend,
         velocity_mode=velocity_mode,
     ).to(device)
+    if args.velocity_loss == "simple":
+        # Not in the simple loss, so these two heads never receive a gradient
+        # (they stay at their initialisation either way - AdamW skips a
+        # parameter with no grad, weight decay included). Frozen so DDP never
+        # has to account for them: newer PyTorch rejects a static graph whose
+        # parameters never get a gradient ("Expected to have finished
+        # reduction in the prior iteration") at the second epoch.
+        for head in (model.log_variance_head, model.log_concentration_head):
+            head.requires_grad_(False)
     # The frontend is a submodule of the model, so model.parameters()
     # already covers it. Listing both hands the optimizer a duplicate
     # group, which double-counts weight decay on every frontend weight.
@@ -2890,6 +3015,13 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             # bucket layout, so it copies anyway - losing the memory saving and
             # printing a stride-mismatch warning on every backward.
         )
+        # Every rank was seeded identically so the weights start equal (and
+        # DDP has just broadcast rank 0's anyway). From here on an identical
+        # seed only makes every rank draw the SAME dropout masks, photometric
+        # jitter and loader-worker seeds, so the extra ranks add no
+        # augmentation diversity. Single-process runs are left untouched.
+        torch.manual_seed(args.seed + world.rank)
+        np.random.seed(args.seed + world.rank)
 
     scale = {"none": 1.0, "linear": float(world.world_size),
              "sqrt": math.sqrt(world.world_size)}[args.lr_scaling]
@@ -2947,15 +3079,18 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
         # Reusing that one would silently under-report: drop_last discards up
         # to batch_size-1 windows EVERY epoch, a systematic gap whenever the
         # split length is not a multiple of batch_size, not an occasional one.
+        # Phase 0 only, so a --random-pair-phase run scores its training split
+        # on the same fixed tiling as validation, every epoch.
+        train_eval_dataset = datasets["train"].fixed_phase_view()
         train_eval_sampler = None
         if world.enabled:
             train_eval_sampler = DistributedSampler(
-                datasets["train"], num_replicas=world.world_size, rank=world.rank,
+                train_eval_dataset, num_replicas=world.world_size, rank=world.rank,
                 shuffle=False, drop_last=False,
             )
         samplers["train_eval"] = train_eval_sampler
         loaders["train_eval"] = DataLoader(
-            datasets["train"], batch_size=args.batch_size,
+            train_eval_dataset, batch_size=args.batch_size,
             shuffle=False, sampler=train_eval_sampler, num_workers=args.num_workers,
             drop_last=False, pin_memory=(device.type == "cuda"),
         )
@@ -3210,8 +3345,31 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
         saved_warmup = int(saved.get("args", {}).get("lr_warmup_epochs", 0) or 0)
         # A schedule saved under a different shape (another --epochs, or a
         # warm-up added/removed - which also changes the scheduler CLASS) is
-        # not loaded but rebuilt and fast-forwarded below.
-        reshaped = saved_epochs != args.epochs or saved_warmup != args.lr_warmup_epochs
+        # not loaded but rebuilt and fast-forwarded below. So is one whose
+        # optimiser settings changed: the restored param groups and scheduler
+        # carry the OLD base rate and weight decay, so a new --learning-rate,
+        # --lr-scaling on a different GPU count, --weight-decay or
+        # --mounting-lr-scale would otherwise be silently ignored.
+        optimiser_changes = []
+        for group in optimizer.param_groups:
+            mounting_group = "lr_scale" in group
+            scale = float(args.mounting_lr_scale) if mounting_group else 1.0
+            wanted_rate = learning_rate * scale
+            had_rate = float(group.get("initial_lr", group["lr"]))
+            if not math.isclose(had_rate, wanted_rate, rel_tol=1e-9, abs_tol=0.0):
+                optimiser_changes.append(
+                    f"{'mounting ' if mounting_group else ''}base lr {had_rate:g} -> {wanted_rate:g}"
+                )
+            wanted_decay = 0.0 if mounting_group else float(args.weight_decay)
+            if not math.isclose(float(group["weight_decay"]), wanted_decay, rel_tol=1e-9, abs_tol=0.0):
+                optimiser_changes.append(
+                    f"weight decay {float(group['weight_decay']):g} -> {wanted_decay:g}"
+                )
+        reshaped = (
+            saved_epochs != args.epochs
+            or saved_warmup != args.lr_warmup_epochs
+            or bool(optimiser_changes)
+        )
         if not reshaped:
             schedule.load_state_dict(saved["scheduler"])
         # The metric best.pt was chosen on is recorded, so a resume that
@@ -3224,6 +3382,30 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             )
             stale_epochs = int(saved.get("stale_epochs", 0))
             patience_reference = float(saved.get("patience_reference", best))
+            # Resuming from an older checkpoint (epochs/epoch_0100.pt while
+            # best.pt holds epoch 120), or after a kill between writing best.pt
+            # and last.pt, restores a `best` WORSE than the best.pt on disk -
+            # and the first epoch to beat it would overwrite the better model.
+            # Only the writer (rank 0) needs the corrected value.
+            kept_path = args.run_dir / "best.pt"
+            if (
+                world.is_main
+                and kept_path.is_file()
+                and kept_path.resolve() != resume_path.resolve()
+            ):
+                kept = load_checkpoint(kept_path, map_location="cpu")
+                kept_score = float(kept.get("best_val_score", float("inf")))
+                if (
+                    kept.get("select_on") == args.select_on
+                    and not fingerprint_differences(kept.get("fingerprint"), fingerprint)
+                    and kept_score < best
+                ):
+                    world.log(
+                        f"  {kept_path} already holds val_{args.select_on} "
+                        f"{kept_score:.4f} (epoch {kept.get('epoch', '?')}), better "
+                        f"than the resumed checkpoint's {best:.4f}: kept as the bar to beat"
+                    )
+                    best = kept_score
         else:
             world.log(
                 f"selection metric changed ({saved_metric} -> {args.select_on}), "
@@ -3240,7 +3422,12 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             # should be, which is what extending a run has to mean.
             for group in optimizer.param_groups:
                 # Each group keeps its own multiple of the base rate (the
-                # mounting correction runs at --mounting-lr-scale of it).
+                # mounting correction runs at --mounting-lr-scale of it, with
+                # no weight decay).
+                if "lr_scale" in group:
+                    group["lr_scale"] = float(args.mounting_lr_scale)
+                else:
+                    group["weight_decay"] = float(args.weight_decay)
                 rate = learning_rate * float(group.get("lr_scale", 1.0))
                 group["lr"] = rate
                 group["initial_lr"] = rate
@@ -3255,8 +3442,9 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
                     schedule.step()
             world.log(
                 f"  schedule changed (--epochs {saved_epochs} -> {args.epochs}, "
-                f"--lr-warmup-epochs {saved_warmup} -> {args.lr_warmup_epochs}): "
-                f"rebuilt and fast-forwarded, resuming at lr "
+                f"--lr-warmup-epochs {saved_warmup} -> {args.lr_warmup_epochs}"
+                + "".join(f", {change}" for change in optimiser_changes)
+                + "): rebuilt and fast-forwarded, resuming at lr "
                 f"{optimizer.param_groups[0]['lr']:g}"
             )
         world.log(
@@ -3516,7 +3704,7 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             if score < best:
                 best = score
                 if world.is_main:
-                    torch.save(checkpoint_payload(epoch, score), best_path)
+                    save_checkpoint_atomic(checkpoint_payload(epoch, score), best_path)
             skill = validation["skill_vs_mean_y"]
             skill_text = "n/a" if math.isnan(skill) else f"{skill:+.3f}"
             world.log(
@@ -3612,12 +3800,12 @@ def _train(args: argparse.Namespace, world: Distributed, device: torch.device) -
             payload = checkpoint_payload(
                 epoch, row.get(f"val_{args.select_on}", float("nan"))
             )
-            torch.save(payload, last_path)
+            save_checkpoint_atomic(payload, last_path)
             if args.save_every > 0 and (
                 epoch % args.save_every == 0 or epoch == args.epochs
             ):
                 written = epochs_dir / f"epoch_{epoch:04d}.pt"
-                torch.save(payload, written)
+                save_checkpoint_atomic(payload, written)
                 if not announced_disk:
                     announce_epoch_checkpoint_cost(written, args, world)
                     announced_disk = True
