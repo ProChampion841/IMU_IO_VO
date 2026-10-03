@@ -1,55 +1,74 @@
+# IO (velnet) -- commands.  Run everything from the IO/ folder.
+#
+# Current model: configs/exp/UAV/velnet_v3.conf  (updated 2026-10-02)
+#   input   acc (m/s^2, body FLU), gyro (rad/s, body FLU), 100 Hz.  IMU only.
+#   output  vel_body (m/s, body FLU), vel_cov per-axis variance, (m/s)^2
+# Training only: half of the windows are flown left-right mirrored (aug_mirror 0.5).
+#   Check the [mirror] line at startup: if it WARNS about a sideways offset, set
+#   aug_mirror: 0 in configs/exp/UAV/velnet_v3.conf.
+# Start a fresh run: the CNN normalisation changed on 2026-10-02.
+
+
+# ===== SETUP (once) =====
+pip install torch pypose pyhocon pandas scipy tqdm matplotlib tensorboard onnx onnxruntime
+
+
 # ===== TRAIN =====
+python train.py --config configs/exp/UAV/velnet_v3.conf --device cuda:0
 
-# train baseline (A)
-python train.py --config configs/exp/UAV/velnet_v1.conf --device cuda:0
+# resume after a stop
+python train.py --config configs/exp/UAV/velnet_v3.conf --device cuda:0 --load_ckpt
 
-# train smaller model (G)
-python train.py --config configs/exp/UAV/velnet_v2g_smaller.conf --device cuda:0
-
-# train with dropout (H)
-python train.py --config configs/exp/UAV/velnet_v2h_dropout.conf --device cuda:0
-
-# train with attitude input (C)
-python train.py --config configs/exp/UAV/velnet_v2c_attitude.conf --device cuda:0
-
-# train with airspeed input (E)
-python train.py --config configs/exp/UAV/velnet_v2e_airspeed.conf --device cuda:0
-
-# train with mamba_stride 32 (D)
-python train.py --config configs/exp/UAV/velnet_v2d_stride32.conf --device cuda:0
-
-# train with direction uncertainty head (F)
-python train.py --config configs/exp/UAV/velnet_v2f_dirweight.conf --device cuda:0
-
-# resume training
-python train.py --config configs/exp/UAV/velnet_v1.conf --device cuda:0 --load_ckpt
-
-
-# ===== EVALUATE =====
-
-# check which horizons have data (no checkpoint needed)
-python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --check
-
-# evaluate (30s 1min 5min 10min 15min 30min 40min)
-python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt --out experiments/UAV/velnet_v1/horizons.csv
-
-# evaluate with first-frame offset removed
-python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt --v0_offset --out experiments/UAV/velnet_v1/horizons_v0.csv
-
-# evaluate with offset averaged over first 10 s
-python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt --v0_offset --v0_frames 1000 --out experiments/UAV/velnet_v1/horizons_v0_10s.csv
-
-# evaluate one flight
-python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt --flights 178_47 --out experiments/UAV/velnet_v1/horizons_178_47.csv
-
-# evaluate a chosen epoch
-python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v1.conf --ckpt experiments/UAV/velnet_v1/ckpt/0035.ckpt --out experiments/UAV/velnet_v1/horizons_ep35.csv
-
-
-# ===== VIEW =====
-
-# plot trajectories
-python -m tools.plot_trajectory --config configs/exp/UAV/velnet_v1.conf --ckpt experiments/UAV/velnet_v1/ckpt/best_model.ckpt
-
-# tensorboard
+# watch training (all runs side by side)
 tensorboard --logdir experiments/UAV --host 0.0.0.0
+
+# results: experiments/UAV/velnet_v3/metric.csv, parameters.yaml,
+#          ckpt/best_model.ckpt (selected on val_vel_error_60s), ckpt/0000.ckpt ... (every epoch)
+# There is no early stopping: stop the run by hand once val_vel_error_60s stops improving.
+
+
+# ===== EVALUATE: 30s 1min 2min 5min 10min 15min 20min 30min 40min =====
+# eval      = validation flights (12)
+# inference = held-out test flights (11), never used in training or selection
+# vel/dir errors pooled over every frame; pos_error = drift at the END of each window.
+# No GPU: add  --device cpu
+
+# 1) which flights are long enough for each horizon (no checkpoint needed)
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v3.conf --splits eval inference --check
+
+# 2) all horizons, validation + test flights
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --splits eval inference --out experiments/UAV/velnet_v3/horizons.csv
+
+# 3) same, with the first-frame velocity offset removed (world frame)
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --splits eval inference --v0_offset --out experiments/UAV/velnet_v3/horizons_v0.csv
+
+# 4) one flight (any unique part of the file name)
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --splits eval --flights 178_47 --out experiments/UAV/velnet_v3/horizons_178_47.csv
+
+# 5) a chosen epoch
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/0003.ckpt --splits eval inference --out experiments/UAV/velnet_v3/horizons_ep3.csv
+
+# 6) your own horizons, in FRAMES at 100 Hz (here 30 s, 1, 2, 3, 4 min)
+python -m tools.eval_vel_horizons --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --splits eval inference --horizons 3000 6000 12000 18000 24000 --out experiments/UAV/velnet_v3/horizons_short.csv
+
+
+# ===== PLOT =====
+# window mode: every 60 s window starts from the true state (as in training)
+python -m tools.plot_trajectory --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --split eval --seq 178_47 --length 6000
+
+# continuous mode: one unbroken trajectory, true state used only at the start
+python -m tools.plot_trajectory --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --split eval --seq 178_47 --length 6000 --mode continuous
+
+# any CSV file directly (add --no_raw to skip the raw-IMU comparison line)
+python -m tools.plot_trajectory --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --csv /path/to/flight_sensor_data.csv --length 6000
+
+
+# ===== ONNX (deployment, no PyTorch needed at run time) =====
+# export; the window length is FIXED (6000 = 60 s); inputs acc, gyro
+python -m tools.export_onnx --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --out experiments/UAV/velnet_v3/velnet_6000.onnx --frames 6000
+
+# run on a flight CSV (GPS columns, if present, are used only for scoring)
+python -m tools.onnx_inference --onnx experiments/UAV/velnet_v3/velnet_6000.onnx --csv /path/to/flight_sensor_data.csv --out pred.csv
+
+# check the ONNX path against the PyTorch pipeline (synthetic flight if no --csv)
+python -m tools.check_onnx_inference --config configs/exp/UAV/velnet_v3.conf --ckpt experiments/UAV/velnet_v3/ckpt/best_model.ckpt --onnx experiments/UAV/velnet_v3/velnet_6000.onnx

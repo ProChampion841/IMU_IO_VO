@@ -15,12 +15,27 @@ def _norm1d(kind, ch):
     time and then frozen for eval, where every validation flight has its own sensor
     offsets -- a train/eval mismatch GroupNorm does not have.  Up to 8 groups,
     fewer when the channel count does not divide.
+    BUT GroupNorm's statistics span the WHOLE window (all time steps), so every token
+    depends on frames up to the end of the window, and on the window length: a model
+    trained on 60 s behaves differently on the 30 s .. 38 min evaluation windows.
+
+    "layer" normalises each TIME STEP over its channels only.  No statistics across
+    time or batch: causal, independent of window length, identical in train and eval.
     """
     if kind == "batch":
         return nn.BatchNorm1d(ch)
     if kind == "group":
         return nn.GroupNorm(math.gcd(8, ch), ch)
-    raise ValueError("cnn_norm must be batch|group, got %r" % (kind,))
+    if kind == "layer":
+        return _TokenLayerNorm(ch)
+    raise ValueError("cnn_norm must be batch|group|layer, got %r" % (kind,))
+
+
+class _TokenLayerNorm(nn.LayerNorm):
+    """LayerNorm over the channels of each time step of a (B, C, L) conv output."""
+
+    def forward(self, x):
+        return super().forward(x.transpose(1, 2)).transpose(1, 2)
 
 
 class CNNEncoder(nn.Module):

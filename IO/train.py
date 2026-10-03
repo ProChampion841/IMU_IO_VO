@@ -3,6 +3,7 @@ import csv
 import copy
 import torch
 import numpy as np
+import pypose as pp
 import random
 
 import torch.utils.data as Data
@@ -481,6 +482,65 @@ def bias_augment(data, confs, correct_gyro):
     return out
 
 
+# Left-right mirror M = diag(1, -1, 1), applied to body FLU and world NWU together.
+# Polar vectors (acc, velocity, position) flip y.  Angular rate is an axial vector,
+# w' = det(M) M w, so it flips x and z.  Rotations become M R M, which for a
+# quaternion (x, y, z, w) flips x and z.  Gravity lies on world z, which M keeps, so
+# the mirrored window obeys the same physics as the recorded one.
+_MIRROR_VEC = (1.0, -1.0, 1.0)
+_MIRROR_RATE = (-1.0, 1.0, -1.0)
+_MIRROR_QUAT = (-1.0, 1.0, -1.0, 1.0)
+
+
+def mirror_augment(data, init_state, label, confs):
+    """Fly a window in a mirror: left turns become right turns (`aug_mirror` = chance).
+
+    A fixed wing is left-right symmetric, so a mirrored window is a realistic flight
+    that never happened -- 55 training flights act like 110, and the network cannot
+    key on "this flight turned left a lot".  Not exact for one thing: the propeller
+    spins one way only.  Inputs AND labels are mirrored, before both the model and the
+    raw baseline.  Training split only; 0.0 (default) is an exact no-op.
+    """
+    p = float(confs.get("aug_mirror", 0.0))
+    if p <= 0.0:
+        return data, init_state, label
+    flip = torch.rand(data["acc"].shape[0], device=data["acc"].device) < p   # per window
+
+    def mirror(x, signs):
+        lie = isinstance(x, pp.LieTensor)
+        t = x.tensor() if lie else x
+        m = flip.view(-1, *([1] * (t.dim() - 1)))
+        t = torch.where(m, t * t.new_tensor(signs), t)
+        return pp.SO3(t) if lie else t
+
+    kinds = {"acc": _MIRROR_VEC, "pos": _MIRROR_VEC, "vel": _MIRROR_VEC,
+             "gt_pos": _MIRROR_VEC, "gt_vel": _MIRROR_VEC, "gyro": _MIRROR_RATE,
+             "rot": _MIRROR_QUAT, "mti_rot": _MIRROR_QUAT, "gt_rot": _MIRROR_QUAT}
+    out = []
+    for d in (data, init_state, label):
+        d = dict(d)
+        for k in d:
+            if k in kinds and d[k] is not None:
+                d[k] = mirror(d[k], kinds[k])
+        out.append(d)
+    return tuple(out)
+
+
+def mean_body_lateral_velocity(dataset):
+    """Mean body-frame sideways velocity (m/s) over a dataset's flights.
+
+    Mirroring teaches the model that left and right are equally likely, i.e. a mean
+    sideways velocity of 0.  If the real aircraft holds a steady sideways offset,
+    mirroring hides it -- this number says whether that matters.
+    """
+    total, n = 0.0, 0
+    for rot, vel in zip(dataset.gt_ori, dataset.gt_velo):
+        vb_y = (rot.Inv() @ vel)[..., 1]
+        total += float(vb_y.double().sum())
+        n += vb_y.numel()
+    return total / max(n, 1)
+
+
 # ---------------------------------------------------------------------------
 # EMA WEIGHTS and SMOOTHED BEST-CHECKPOINT SELECTION -- both opt-in, conf.train
 # ---------------------------------------------------------------------------
@@ -596,6 +656,7 @@ def train(network, loader, confs, epoch, optimizer, ema=None, ema_decay=0.0):
         data, init_state, label = move_to([data, init_state, label], confs.device)
         # Augment BEFORE both arms so the model and the raw baseline see the same
         # signal and stay a paired comparison.  No-op unless aug_*_bias_std is set.
+        data, init_state, label = mirror_augment(data, init_state, label, confs)
         data = bias_augment(data, confs, confs.get("correct_gyro", True))
         inte_state = network(data, init_state)
         loss_state = get_loss(inte_state, label, confs)
@@ -941,6 +1002,17 @@ def main_worker(local_rank, device_ids, args):
                   % (_f(_sa, 1.0), _f(_sg, 180.0 / np.pi)))
         else:
             print("[bias_augment] off (set aug_acc_bias_std / aug_gyro_bias_std to enable)")
+        _pm = float(conf.train.get("aug_mirror", 0.0))
+        if _pm > 0.0:
+            _vy = mean_body_lateral_velocity(train_dataset)
+            print("[mirror] ACTIVE on the training split only: %.0f%% of windows flown "
+                  "left-right mirrored.  Mean body sideways velocity over the training "
+                  "flights = %+.3f m/s%s"
+                  % (100 * _pm, _vy, "" if abs(_vy) < 0.5 else
+                     "  <-- WARNING: a steady sideways offset this large is hidden by "
+                     "mirroring; consider aug_mirror: 0"))
+        else:
+            print("[mirror] off (set aug_mirror to enable)")
 
     if distributed:
         if conf.train.get("sync_bn", False):
