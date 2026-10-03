@@ -525,6 +525,39 @@ def get_loss(inte_state, data, confs):
             rel = rel + confs.pos_weight * state_losses['pos_rel']
         loss = loss + rel_weight * rel
 
+    # ---- TILT-CORRECTION SMOOTHNESS -- `dtheta_smooth_weight: w` -------------
+    # correction_mode "rotate" emits a small rotation dtheta every 90 ms token, and
+    # nothing else in the objective says how fast it may change: it can be +1 deg on
+    # one token and -1 deg on the next.  The error it removes -- the tilt error of
+    # the attitude handed to the integrator -- changes over tens of seconds, so a
+    # jumpy dtheta is freedom the physics does not need, and with ~440 independent
+    # training windows that freedom goes into memorising flights (tilt_rotate: train
+    # 0.79 vs val 0.91 of raw).  This charges each token-to-token step:
+    #
+    #     smooth = mean over steps of |dtheta[k+1] - dtheta[k]|^2     (deg^2)
+    #     loss  += w * smooth
+    #
+    # Degrees, so the weight reads directly: w = 0.1 makes a jumpy correction of
+    # 0.3 deg per step cost 0.009 (~10% of a tilt_rotate train loss of ~0.08), while
+    # a slow drift of 0.5 deg over 10 s costs ~2e-6.  dtheta is exactly 0 at
+    # initialisation (zero-initialised head), so the term starts at 0.
+    #
+    # Reported as `dtheta_smooth` whenever the model emits dtheta, weight 0 included,
+    # so a baseline run shows how jumpy its correction is.  Default 0.0: the loss is
+    # bit-for-bit unchanged.
+    dth_w = float(confs.get("dtheta_smooth_weight", 0.0))
+    dth = inte_state.get("dtheta", None)
+    if dth_w and dth is None:
+        raise RuntimeError(
+            "dtheta_smooth_weight=%g needs correction_mode: rotate (only that mode "
+            "emits a tilt correction dtheta)" % dth_w)
+    if dth is not None and dth.shape[1] > 1:
+        step = torch.rad2deg(dth[:, 1:] - dth[:, :-1])
+        smooth = step.pow(2).sum(-1).mean()
+        state_losses["dtheta_smooth"] = smooth.detach()
+        if dth_w:
+            loss = loss + dth_w * smooth
+
     # ---- AIRSPEED CONSISTENCY -------------------------------------------------
     # Defaults to 0.0, so every existing config produces a bit-for-bit identical
     # loss and this cannot change a run that does not ask for it.  See

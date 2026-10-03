@@ -180,6 +180,29 @@ Mat3 attitudeFromNavEuler(double roll, double pitch, double yaw) {
 Vec3 velocityFromNed(const Vec3& v) { return {v[0], -v[1], -v[2]}; }
 Vec3 frdToFlu(const Vec3& v) { return {v[0], -v[1], -v[2]}; }
 
+namespace {
+Vec3 ecef(double lat_deg, double lon_deg, double alt) {
+    constexpr double a = 6378137.0, f = 1.0 / 298.257223563, e2 = f * (2.0 - f);
+    const double lat = deg2rad(lat_deg), lon = deg2rad(lon_deg);
+    const double n = a / std::sqrt(1.0 - e2 * std::sin(lat) * std::sin(lat));
+    return {(n + alt) * std::cos(lat) * std::cos(lon), (n + alt) * std::cos(lat) * std::sin(lon),
+            (n * (1.0 - e2) + alt) * std::sin(lat)};
+}
+}  // namespace
+
+Vec3 geodeticToNwu(double lat_deg, double lon_deg, double alt_m, double lat0_deg,
+                   double lon0_deg, double alt0_m) {
+    const Vec3 e = ecef(lat_deg, lon_deg, alt_m), o = ecef(lat0_deg, lon0_deg, alt0_m);
+    const Vec3 d{e[0] - o[0], e[1] - o[1], e[2] - o[2]};
+    const double la = deg2rad(lat0_deg), lo = deg2rad(lon0_deg);
+    const double east = -std::sin(lo) * d[0] + std::cos(lo) * d[1];
+    const double north = -std::sin(la) * std::cos(lo) * d[0] - std::sin(la) * std::sin(lo) * d[1] +
+                         std::cos(la) * d[2];
+    const double up = std::cos(la) * std::cos(lo) * d[0] + std::cos(la) * std::sin(lo) * d[1] +
+                      std::sin(la) * d[2];
+    return {north, -east, up};
+}
+
 // ---------------------------------------------------------------- ESKF
 ESKF::ESKF(const Params& prm_, const Vec3& p_, const Vec3& v_, const Mat3& R_, const Vec3& ba_,
            const Vec3& bg_)
@@ -346,8 +369,122 @@ bool ESKF::updateWorldVelocity(const Vec3& z, const Vec3& var, double* nis) {
     return update(3, r, H, Rm, nis);
 }
 
+void ESKF::positionResidual(const Vec3& z, bool vertical, const Vec3* lever, double* r,
+                            double* H, int& m) const {
+    m = vertical ? 3 : 2;
+    Vec3 h = p;
+    Mat3 RS{};
+    const bool lev = lever && ((*lever)[0] != 0.0 || (*lever)[1] != 0.0 || (*lever)[2] != 0.0);
+    if (lev) {
+        const Vec3 Rl = mul(R, *lever);
+        for (int i = 0; i < 3; ++i) h[i] += Rl[i];
+        RS = mul(R, skew(*lever));
+    }
+    for (int i = 0; i < m; ++i) {
+        r[i] = z[i] - h[i];
+        for (int j = 0; j < N; ++j) H[i * N + j] = 0.0;
+        H[i * N + i] = 1.0;
+        if (lev)
+            for (int j = 0; j < 3; ++j) H[i * N + 6 + j] = -RS[i * 3 + j];
+    }
+}
+
+bool ESKF::updatePosition(const Vec3& z, const Vec3& var, bool vertical, const Vec3* lever,
+                          double* nis) {
+    double r[3], H[3 * N], Rm[9] = {};
+    int m = 0;
+    positionResidual(z, vertical, lever, r, H, m);
+    for (int i = 0; i < m; ++i) Rm[i * m + i] = var[i];
+    return update(m, r, H, Rm, nis);
+}
+
+void ESKF::resetPosition(const Vec3& z, const Vec3& var, bool vertical, const Vec3* lever) {
+    const int m = vertical ? 3 : 2;
+    Vec3 off{0.0, 0.0, 0.0};
+    if (lever) off = mul(R, *lever);
+    for (int i = 0; i < m; ++i) {
+        p[i] = z[i] - off[i];
+        for (int j = 0; j < N; ++j) P[i * N + j] = P[j * N + i] = 0.0;
+        P[i * N + i] = var[i];
+    }
+}
+
 // ---------------------------------------------------------------- stream
 StreamEKF::StreamEKF(const Params& prm, const AidParams& aid) : prm_(prm), aid_(aid) {}
+
+const Vec3* StreamEKF::posLever() const {
+    const Vec3& l = aid_.pos_lever_arm_m;
+    return (l[0] != 0.0 || l[1] != 0.0 || l[2] != 0.0) ? &aid_.pos_lever_arm_m : nullptr;
+}
+
+void StreamEKF::restartHistory() {
+    rejects_.clear();
+    cps_.clear();
+    ops_.clear();
+    op_base_ = 0;
+    floor_ = -1e300;
+    checkpoint();
+}
+
+void StreamEKF::checkpoint() {
+    if (aid_.pos_replay_s <= 0) return;
+    cps_.push_back({t_, f_, op_base_ + static_cast<long>(ops_.size())});
+    // keep the newest checkpoint at or before t - replay_s (see ekf/stream.py)
+    while (cps_.size() > 1 && cps_[1].t <= t_ - aid_.pos_replay_s) {
+        floor_ = cps_.front().t;
+        cps_.pop_front();
+    }
+    while (!ops_.empty() && op_base_ < cps_.front().op_index) {
+        ops_.pop_front();
+        ++op_base_;
+    }
+}
+
+bool StreamEKF::exec(const Op& op) {
+    bool ok = true;
+    switch (op.type) {
+        case OP_PREDICT:
+            f_.predict(op.a, op.b, op.dt);
+            t_ = op.t;
+            break;
+        case OP_ADVANCE: {
+            const double dt = op.t - t_;
+            if (dt > 0) {
+                const double a2 = aid_.gap_acc_std * aid_.gap_acc_std;
+                for (int i = 0; i < 3; ++i) {
+                    f_.P[i * N + i] += a2 * dt * dt * dt * dt / 4.0;
+                    f_.P[(3 + i) * N + 3 + i] += a2 * dt * dt;
+                    f_.P[(6 + i) * N + 6 + i] += prm_.gyro_noise * prm_.gyro_noise * dt;
+                    f_.p[i] += f_.v[i] * dt;
+                }
+            }
+            t_ = op.t;
+            break;
+        }
+        case OP_VO: {
+            const bool lev = aid_.lever_arm_m[0] != 0.0 || aid_.lever_arm_m[1] != 0.0 ||
+                             aid_.lever_arm_m[2] != 0.0;
+            ok = f_.updateBodyVelocity(op.a, op.b, lev ? &aid_.lever_arm_m : nullptr);
+            break;
+        }
+        case OP_ATT:
+            ok = f_.updateAttitude(op.R, aid_.use_tilt, aid_.std_tilt_deg, aid_.use_yaw,
+                                   aid_.std_yaw_deg);
+            break;
+        case OP_GPS:
+            ok = f_.updateWorldVelocity(op.a, op.b);
+            break;
+        case OP_POS:
+            if (op.reset) f_.resetPosition(op.a, op.b, aid_.pos_use_vertical, posLever());
+            else ok = f_.updatePosition(op.a, op.b, aid_.pos_use_vertical, posLever());
+            break;
+    }
+    if (aid_.pos_replay_s > 0) {
+        ops_.push_back(op);
+        if (op.type == OP_PREDICT || op.type == OP_ADVANCE) checkpoint();
+    }
+    return ok;
+}
 
 void StreamEKF::initialize(double t, const Vec3& p, const Vec3& v, const Mat3& R, const Vec3& ba,
                            const Vec3& bg) {
@@ -356,6 +493,7 @@ void StreamEKF::initialize(double t, const Vec3& p, const Vec3& v, const Mat3& R
     have_last_ = false;
     pending_.clear();
     ready_ = true;
+    restartHistory();
 }
 
 void StreamEKF::initialize(double t, const Vec3& p, const Vec3& v, const Mat3& R, double pos_std,
@@ -367,6 +505,7 @@ void StreamEKF::initialize(double t, const Vec3& p, const Vec3& v, const Mat3& R
         f_.P[(3 + i) * N + 3 + i] = vel_std * vel_std;
         f_.P[(6 + i) * N + 6 + i] = att * att;
     }
+    restartHistory();                     // the start checkpoint must carry these P
 }
 
 void StreamEKF::onImu(double t, const Vec3& acc, const Vec3& gyro) {
@@ -384,8 +523,9 @@ void StreamEKF::onImu(double t, const Vec3& acc, const Vec3& gyro) {
         ++cnt_.imu_gap;
         advanceTo(t);
     } else {
-        f_.predict(last_acc_, last_gyro_, dt);
-        t_ = t;
+        Op op{};
+        op.type = OP_PREDICT; op.t = t; op.dt = dt; op.a = last_acc_; op.b = last_gyro_;
+        exec(op);
         ++cnt_.imu;
     }
     last_t_ = t; last_acc_ = acc; last_gyro_ = gyro;
@@ -393,17 +533,10 @@ void StreamEKF::onImu(double t, const Vec3& acc, const Vec3& gyro) {
 }
 
 void StreamEKF::advanceTo(double t) {
-    const double dt = t - t_;
-    if (dt > 0) {
-        const double a2 = aid_.gap_acc_std * aid_.gap_acc_std;
-        for (int i = 0; i < 3; ++i) {
-            f_.P[i * N + i] += a2 * dt * dt * dt * dt / 4.0;
-            f_.P[(3 + i) * N + 3 + i] += a2 * dt * dt;
-            f_.P[(6 + i) * N + 6 + i] += prm_.gyro_noise * prm_.gyro_noise * dt;
-            f_.p[i] += f_.v[i] * dt;
-        }
-    }
-    t_ = t;
+    // no IMU over [state time, t]: coast, grow the uncertainty (see exec)
+    Op op{};
+    op.type = OP_ADVANCE; op.t = t;
+    exec(op);
 }
 
 void StreamEKF::onVo(double t, const Vec3& v, const Vec3& var) {
@@ -413,12 +546,17 @@ void StreamEKF::onAttitude(double t, const Mat3& R) { measure({t, ATT, {}, {}, R
 void StreamEKF::onGpsVelocity(double t, const Vec3& v, const Vec3& var) {
     measure({t, GPS, v, var, {}});
 }
+void StreamEKF::onPosition(double t, const Vec3& p, const Vec3& var) {
+    measure({t, POS, p, var, {}});
+}
 
 void StreamEKF::measure(const Meas& m) {
     if (!ready_) return;
     if (m.t > t_) { pending_.push_back(m); return; }
+    if (m.kind == POS && aid_.pos_replay_s > 0) { latePosition(m); return; }
     if (t_ - m.t > aid_.max_meas_age_s) {
         if (m.kind == VO) ++cnt_.vo_dropped;
+        else if (m.kind == POS) ++cnt_.pos_dropped;
         return;
     }
     if (m.kind == VO && have_last_ && m.t < last_t_ - 1e-9) ++cnt_.vo_late;
@@ -437,22 +575,74 @@ void StreamEKF::flush() {
 }
 
 void StreamEKF::apply(const Meas& m) {
+    // the first (live) application: counters here, the filter work in exec()
+    Op op{};
+    op.a = m.a; op.b = m.b; op.R = m.R;
     if (m.kind == VO) {
-        const bool lev = aid_.lever_arm_m[0] != 0.0 || aid_.lever_arm_m[1] != 0.0 ||
-                         aid_.lever_arm_m[2] != 0.0;
-        if (!f_.updateBodyVelocity(m.a, m.b, lev ? &aid_.lever_arm_m : nullptr)) ++cnt_.vo_gated;
+        op.type = OP_VO;
+        if (!exec(op)) ++cnt_.vo_gated;
         ++cnt_.vo;
     } else if (m.kind == ATT) {
         if (++n_att_ % aid_.attitude_every == 0) {
-            if (!f_.updateAttitude(m.R, aid_.use_tilt, aid_.std_tilt_deg, aid_.use_yaw,
-                                   aid_.std_yaw_deg))
-                ++cnt_.att_gated;
+            op.type = OP_ATT;
+            if (!exec(op)) ++cnt_.att_gated;
             ++cnt_.att;
         }
-    } else {
-        if (!f_.updateWorldVelocity(m.a, m.b)) ++cnt_.gps_gated;
+    } else if (m.kind == GPS) {
+        op.type = OP_GPS;
+        if (!exec(op)) ++cnt_.gps_gated;
         ++cnt_.gps;
+    } else {
+        applyPosition(m.a, m.b);
     }
+}
+
+void StreamEKF::applyPosition(const Vec3& z, const Vec3& var) {
+    ++cnt_.pos;
+    Op op{};
+    op.type = OP_POS; op.a = z; op.b = var; op.reset = false;
+    if (exec(op)) { rejects_.clear(); return; }
+    ++cnt_.pos_gated;
+    double r[3] = {}, H[3 * N];
+    int m = 0;
+    f_.positionResidual(z, aid_.pos_use_vertical, posLever(), r, H, m);
+    rejects_.push_back({r[0], r[1], m > 2 ? r[2] : 0.0});
+    const size_t keep = static_cast<size_t>(std::max(1, aid_.pos_reset_after));
+    while (rejects_.size() > keep) rejects_.erase(rejects_.begin());
+    if (aid_.pos_reset_after <= 0 || rejects_.size() < static_cast<size_t>(aid_.pos_reset_after))
+        return;                                               // 0 = never reset
+    bool agree = true;
+    for (int i = 0; i < m; ++i) {
+        double mean = 0.0;
+        for (const Vec3& e : rejects_) mean += e[i];
+        mean /= static_cast<double>(rejects_.size());
+        const double tol = aid_.pos_reset_agree_sigma * std::sqrt(var[i]);
+        for (const Vec3& e : rejects_) agree = agree && std::fabs(e[i] - mean) <= tol;
+    }
+    if (!agree) return;
+    if (aid_.pos_replay_s > 0) ops_.back().reset = true;    // a replay redoes the reset
+    f_.resetPosition(z, var, aid_.pos_use_vertical, posLever());
+    ++cnt_.pos_reset;
+    rejects_.clear();
+}
+
+void StreamEKF::latePosition(const Meas& m) {
+    // rewind to the first state at/after the fix's image time, apply it, re-run the rest
+    if (m.t < t_ - aid_.pos_replay_s || m.t <= floor_) { ++cnt_.pos_dropped; return; }
+    const double key = m.t - 1e-9;
+    const auto it = std::lower_bound(cps_.begin(), cps_.end(), key,
+                                     [](const Checkpoint& c, double v) { return c.t < v; });
+    const size_t i = static_cast<size_t>(it - cps_.begin());
+    const Checkpoint cp = cps_[i];
+    const size_t first = static_cast<size_t>(cp.op_index - op_base_);
+    const std::vector<Op> redo(ops_.begin() + static_cast<long>(first), ops_.end());
+    cps_.resize(i + 1);
+    ops_.resize(first);
+    f_ = cp.f;
+    t_ = cp.t;
+    if (!redo.empty()) ++cnt_.pos_late;                     // a real rewind
+    applyPosition(m.a, m.b);
+    for (const Op& op : redo) exec(op);
 }
 
 State StreamEKF::state() const {
@@ -521,14 +711,24 @@ bool loadConfig(const std::string& path, Params& p, AidParams& a) {
     num(js, "max_meas_age_s", a.max_meas_age_s);
     num(js, "max_imu_gap_s", a.max_imu_gap_s);
     num(js, "gap_acc_std", a.gap_acc_std);
-    if (findValue(js, "lever_arm_m", v)) {
-        std::string s = v;
-        std::replace(s.begin(), s.end(), '[', ' ');
-        std::replace(s.begin(), s.end(), ']', ' ');
-        std::replace(s.begin(), s.end(), ',', ' ');
-        std::istringstream is(s);
-        is >> a.lever_arm_m[0] >> a.lever_arm_m[1] >> a.lever_arm_m[2];
-    }
+    auto vec3 = [&](const char* key, Vec3& out) {
+        std::string w;
+        if (!findValue(js, key, w)) return;
+        std::replace(w.begin(), w.end(), '[', ' ');
+        std::replace(w.begin(), w.end(), ']', ' ');
+        std::replace(w.begin(), w.end(), ',', ' ');
+        std::istringstream is(w);
+        is >> out[0] >> out[1] >> out[2];
+    };
+    vec3("lever_arm_m", a.lever_arm_m);
+    // position_aid (keys are unique: findValue matches the first "key" anywhere)
+    if (findValue(js, "pos_use_vertical", v)) a.pos_use_vertical = v.rfind("true", 0) == 0;
+    vec3("pos_lever_arm_m", a.pos_lever_arm_m);
+    num(js, "pos_replay_s", a.pos_replay_s);
+    double reset_after = a.pos_reset_after;
+    num(js, "pos_reset_after", reset_after);
+    a.pos_reset_after = static_cast<int>(reset_after);
+    num(js, "pos_reset_agree_sigma", a.pos_reset_agree_sigma);
     return true;
 }
 

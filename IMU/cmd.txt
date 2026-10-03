@@ -8,6 +8,52 @@
 :: ============================================================================
 
 
+:: ############################################################################
+:: GPS-FREE: TRAIN AND EVALUATE  (2026-10-02)  -- START HERE
+:: Model: configs/exp/UAV/gpsfree_rotate_smooth.conf
+::   = tilt_rotate + smooth tilt-correction loss, with NO GPS-aided input:
+::     MTi attitude for the network input AND for gravity removal, no GPS bias freeze.
+:: Every command is ONE line (works in Windows cmd and in a Linux shell).
+:: ############################################################################
+
+:: ---- 1. TRAIN  (IMU folder)
+python train.py --config configs/exp/UAV/gpsfree_rotate_smooth.conf --device cuda:0
+
+:: resume a stopped run from its newest checkpoint
+python train.py --config configs/exp/UAV/gpsfree_rotate_smooth.conf --device cuda:0 --load_ckpt
+
+:: second seed, to check the result is not luck
+python train.py --config configs/exp/UAV/gpsfree_rotate_smooth.conf --device cuda:0 --seed 1
+
+:: watch live (http://localhost:6006): val_60s/pos_error_m vs val_60s/raw_pos_error_m,
+:: and val/dtheta_step_rms_deg (how jumpy the tilt correction is)
+tensorboard --logdir experiments/UAV/gpsfree_rotate_smooth/tensorboard --host 0.0.0.0
+
+:: ---- 2. EVALUATE on the HELD-OUT flights (PyTorch checkpoint)
+:: per flight, 30 / 60 / 120 s, model vs raw IMU (raw = same MTi attitude, no freeze)
+python -m tools.eval_vel_horizons1 --config configs/exp/UAV/gpsfree_rotate_smooth.conf --ckpt experiments/UAV/gpsfree_rotate_smooth/ckpt/best_model.ckpt --splits inference --nested --horizons 3000 6000 12000 --per_flight --out gpsfree_heldout.csv
+
+:: ---- 3. EXPORT TO ONNX and check it on the held-out flights
+:: inputs acc, gyro, g_body (B, 4009, 3); on the drone g_body comes from the MTi attitude
+python -m tools.export_onnx --config configs/exp/UAV/gpsfree_rotate_smooth.conf --ckpt experiments/UAV/gpsfree_rotate_smooth/ckpt/best_model.ckpt --frames 4000 --out gpsfree_40s.onnx
+
+:: same numbers from the ONNX file (should match step 2 at 30 / 40 s), and ONNX = PyTorch check
+python -m tools.onnx_inference --onnx gpsfree_40s.onnx --config configs/exp/UAV/gpsfree_rotate_smooth.conf --splits inference --horizons 3000 4000 --compare_ckpt experiments/UAV/gpsfree_rotate_smooth/ckpt/best_model.ckpt --out_csv gpsfree_onnx_windows.csv
+
+:: ---- 4. WHOLE-FLIGHT TEST WITHOUT ANY GPS  (EKF folder: cd ..\EKF)
+:: no GPS at all: start from VO + MTi attitude at position 0, one run per flight, GPS only
+:: scores it.  EKF uses the MTi tilt (configs/ekf_gpsfree.json) and simulated land-matching
+:: fixes (--pos_sim; replace with --pos_dir landmatch --pos_origin LAT LON ALT for real ones).
+:: (a) learned IMU model
+python run_stream.py --imu_config ../IMU/configs/exp/UAV/gpsfree_rotate_smooth.conf --splits inference --vo_dir vo_cache --ekf_config configs/ekf_gpsfree.json --no_gt --pos_sim --imu model --imu_onnx ../IMU/gpsfree_40s.onnx --horizons 30s 1m 2m 5m 10m --out_csv gpsfree_stream_model.csv
+:: (b) same, raw IMU -- the model must beat this
+python run_stream.py --imu_config ../IMU/configs/exp/UAV/gpsfree_rotate_smooth.conf --splits inference --vo_dir vo_cache --ekf_config configs/ekf_gpsfree.json --no_gt --pos_sim --imu raw --horizons 30s 1m 2m 5m 10m --out_csv gpsfree_stream_raw.csv
+
+:: NOTE  compare GPS-free results only with GPS-free results: the raw baseline also
+:: changed (MTi attitude, no freeze), so ratios are not comparable with tilt_rotate.
+:: ############################################################################
+
+
 :: ---------------------------------------------------------------- TRAIN
 :: Train the tilt_aware model (40 epochs, seed 0)
 python train.py --config configs/exp/UAV/tilt_aware.conf --device cuda:0
@@ -76,6 +122,32 @@ python -m tools.eval_vel_horizons --config configs/exp/UAV/accel_const.conf ^
   --ckpt experiments/UAV/accel_const/ckpt/best_model.ckpt ^
   --splits inference --nested --horizons 12000 --per_flight
 
+
+:: ---------------------------------------------------------------- 2026-10-02  MIRROR
+:: tilt_rotate_smooth_mirror = tilt_rotate_smooth + ONE change: every training window is
+:: flown left<->right mirrored with probability 0.5 (about 2x the training data).
+:: Uses GPSNavEul.  Compare it with tilt_rotate_smooth (below): same seed, same everything.
+python train.py --config configs/exp/UAV/tilt_rotate_smooth_mirror.conf --device cuda:0
+tensorboard --logdir experiments/UAV/tilt_rotate_smooth_mirror/tensorboard --host 0.0.0.0
+:: held-out flights: run BOTH and compare the pooled ratios at 30 / 60 / 120 s
+python -m tools.eval_vel_horizons1 --config configs/exp/UAV/tilt_rotate_smooth_mirror.conf --ckpt experiments/UAV/tilt_rotate_smooth_mirror/ckpt/best_model.ckpt --splits inference --nested --horizons 3000 6000 12000 --per_flight --out mirror_heldout.csv
+python -m tools.eval_vel_horizons1 --config configs/exp/UAV/tilt_rotate_smooth.conf --ckpt experiments/UAV/tilt_rotate_smooth/ckpt/best_model.ckpt --splits inference --nested --horizons 3000 6000 12000 --per_flight --out smooth_heldout.csv
+:: export the winner to ONNX (inputs / outputs unchanged)
+python -m tools.export_onnx --config configs/exp/UAV/tilt_rotate_smooth_mirror.conf --ckpt experiments/UAV/tilt_rotate_smooth_mirror/ckpt/best_model.ckpt --frames 4000 --out mirror_40s.onnx
+
+:: ---------------------------------------------------------------- 2026-10-02
+:: tilt_rotate_smooth = tilt_rotate + ONE loss term: the tilt correction must change
+:: slowly (dtheta_smooth_weight 0.1).  Same seed, same everything else.
+python train.py --config configs/exp/UAV/tilt_rotate_smooth.conf --device cuda:0
+:: watch it:  tensorboard --logdir experiments/UAV/tilt_rotate_smooth/tensorboard
+::   val/dtheta_step_rms_deg  = how jumpy the correction is (should fall)
+:: then score BOTH on the held-out flights, same command, both checkpoints
+python -m tools.eval_vel_horizons1 --config configs/exp/UAV/tilt_rotate_smooth.conf ^
+  --ckpt experiments/UAV/tilt_rotate_smooth/ckpt/best_model.ckpt ^
+  --splits inference --nested --horizons 3000 6000 12000 --per_flight
+python -m tools.eval_vel_horizons1 --config configs/exp/UAV/tilt_rotate.conf ^
+  --ckpt experiments/UAV/tilt_rotate/ckpt/best_model.ckpt ^
+  --splits inference --nested --horizons 3000 6000 12000 --per_flight
 
 :: ---------------------------------------------------------------- 2026-09-30
 :: tilt_rotate: train, then the 30 s / 1 / 2 / 3 / 4 / 5 min summary table

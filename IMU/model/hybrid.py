@@ -478,6 +478,11 @@ class HybridNet(ModelBase):
         if self.att_input == "none":
             return None
         rot, _src = select_attitude(data, source=self.att_source)
+        if self.att_source == "mti" and _src != "mti":
+            # select_attitude fell back to data['rot'], the GPS-aided attitude.  For a
+            # GPS-free config that is leakage, so stop instead of warning.
+            raise RuntimeError("att_source: mti but the batch has no 'mti_rot'; refusing "
+                               "to fall back to the GPS-aided attitude")
         pad_len = data["acc"].shape[1] - rot.lshape[1]
         if pad_len < 0:
             raise RuntimeError(
@@ -655,8 +660,12 @@ class HybridNet(ModelBase):
         return v + a * c1 + b * c2
 
     def _correct(self, raw, feature, frame_len, bias_head, scale_head, std,
-                 channel="acc"):
-        """raw (B, F', 3) -> corrected (B, F', 3) under the configured mode."""
+                 channel="acc", aux=None):
+        """raw (B, F', 3) -> corrected (B, F', 3) under the configured mode.
+
+        aux: optional dict.  In rotate mode it receives "dtheta", the PER-TOKEN
+        rotation (B, T, 3) in rad, one row per 90 ms token -- what the
+        `dtheta_smooth_weight` loss term reads (model/losses.py)."""
         zero = torch.zeros_like(raw)
         if self.correction_mode == "direct":
             # Regress the corrected signal itself -- no skip from `raw`.  The head's
@@ -699,9 +708,10 @@ class HybridNet(ModelBase):
             # as n -> 0, so this is smooth and exactly 0 at a zero head output.
             h = scale_head(f)
             n = h.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            dtheta = self._update(zero.clone(),
-                                  self.rotate_max * torch.tanh(n) / n * h,
-                                  frame_len)
+            dtheta_tok = self.rotate_max * torch.tanh(n) / n * h      # (B, T, 3) rad
+            if aux is not None:
+                aux["dtheta"] = dtheta_tok
+            dtheta = self._update(zero.clone(), dtheta_tok, frame_len)
             return self._rotate_small(dtheta, raw) + bias
         # affine: bounded diagonal scale, exactly 0 at init (tanh(0) = 0)
         scale = self._update(zero.clone(),
@@ -726,15 +736,19 @@ class HybridNet(ModelBase):
                 state_dict[key] = getattr(self, name).detach().clone()
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
-    def inference(self, data):
+    def inference(self, data, aux=None):
         """Pure network output.  Consumed by inference.py, which passes `data` only."""
-        return self.inference_from_input(self._net_input(data), data["acc"], data["gyro"])
+        return self.inference_from_input(self._net_input(data), data["acc"], data["gyro"],
+                                         aux=aux)
 
-    def inference_from_input(self, net_in, acc, gyro):
+    def inference_from_input(self, net_in, acc, gyro, aux=None):
         """Everything after input assembly, on plain tensors.
 
         net_in    (B, F+interval, in_dim)  the output of _net_input()
         acc, gyro (B, F+interval, 3)       the padded raw signals
+        aux       optional dict for training-only extras (see _correct); the
+                  returned dict, and so inference.py and the ONNX graph, are
+                  unchanged by it
 
         Split out of inference() so tools/export_onnx.py traces THIS function: the
         exported graph and the trained network are one code path, not two copies.
@@ -748,7 +762,7 @@ class HybridNet(ModelBase):
 
         corrected_acc = self._correct(raw_acc, feature, frame_len,
                                       self.accdecoder, self.accscale_decoder, self.acc_std,
-                                      channel="acc")
+                                      channel="acc", aux=aux)
         if self.correct_gyro:
             corrected_gyro = self._correct(raw_gyro, feature, frame_len,
                                            self.gyrodecoder, self.gyroscale_decoder, self.gyro_std,
@@ -775,7 +789,8 @@ class HybridNet(ModelBase):
                 "correction_acc": correction_acc, "correction_gyro": correction_gyro}
 
     def forward(self, data, init_state):
-        inference_state = self.inference(data)
+        aux = {}                       # "dtheta" in rotate mode, for the smoothness loss
+        inference_state = self.inference(data, aux=aux)
 
         data["corrected_acc"] = inference_state["corrected_acc"]
         data["corrected_gyro"] = inference_state["corrected_gyro"]
@@ -787,4 +802,5 @@ class HybridNet(ModelBase):
                 "correction_acc": inference_state["correction_acc"],
                 "correction_gyro": inference_state["correction_gyro"],
                 "corrected_acc": inference_state["corrected_acc"],
-                "corrected_gyro": inference_state["corrected_gyro"]}
+                "corrected_gyro": inference_state["corrected_gyro"],
+                **aux}

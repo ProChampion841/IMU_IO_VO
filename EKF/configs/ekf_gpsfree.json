@@ -1,40 +1,40 @@
 {
-  "_comment": "Error-state EKF, IMU + VO.  Units: SI, angles in degrees where named _deg.  See EKF/README.md.",
-
+  "_comment": "GPS-FREE EKF: ekf_default.json with the attitude aid from the MTi (no GPSNavEul) and heading NOT aided by it (its heading drifts tens of degrees). Heading and position come from land matching / VO. Use with run_stream.py --no_gt, and --imu model with a model trained on configs/exp/UAV/gpsfree_rotate_smooth.conf.",
   "eskf": {
     "gravity": 9.81007,
     "acc_noise": 0.05,
     "gyro_noise": 0.005,
-    "acc_bias_rw": 1e-4,
-    "gyro_bias_rw": 1e-5,
+    "acc_bias_rw": 0.0001,
+    "gyro_bias_rw": 1e-05,
     "init_pos_std": 0.1,
     "init_vel_std": 0.1,
     "init_att_std_deg": 0.5,
     "init_acc_bias_std": 0.03,
-    "init_gyro_bias_std": 2e-4,
+    "init_gyro_bias_std": 0.0002,
     "gate": true
   },
-
   "attitude_aid": {
-    "_comment": "source: gt = GPSNavEul (the attitude the IMU model is trained with, gtrot), mti = EulX/Y/Z, null = no aid.  Set a std to null to drop that part (mti: std_yaw_deg null -- its heading drifts).",
-    "source": "gt",
-    "std_tilt_deg": 0.2,
-    "std_yaw_deg": 0.5,
+    "_comment": "MTi AHRS attitude, tilt only. std_tilt_deg 1.5 = its measured roll/pitch RMS vs the nav solution on this corpus (1.4 / 1.8 deg). std_yaw_deg null: heading is not used.",
+    "source": "mti",
+    "std_tilt_deg": 1.5,
+    "std_yaw_deg": null,
     "every": 10
   },
-
   "vo": {
     "_comment": "frame of the VO file: frd (VO contract) or flu.  var_scale inflates the VO variance (VO error is time-correlated).  lever_arm_m: IMU -> camera, body FLU.",
     "frame": "frd",
     "time_offset_s": 0.0,
     "var_scale": 4.0,
     "min_std": 0.05,
-    "lever_arm_m": [0.0, 0.0, 0.0],
+    "lever_arm_m": [
+      0.0,
+      0.0,
+      0.0
+    ],
     "_cadence": "VO gives one new image pair per 500 ms (frame_gap 10) but writes a row every telemetry tick. fresh_only keeps one row per pair: visual_age == 0 / visual_present == 1 if the CSV has it, else one row per min_interval_s.",
     "fresh_only": true,
     "min_interval_s": 0.5
   },
-
   "vo_sim": {
     "_comment": "Only for --vo_sim.  null stds = split the measured VO RMSE [3.5, 2.7, 0.95] m/s between white noise and a slow Gauss-Markov error.",
     "rate_hz": 2.0,
@@ -43,18 +43,20 @@
     "tau_s": 20.0,
     "seed": 0
   },
-
   "position_aid": {
     "_comment": "Absolute position fixes (land matching), world NWU m.  Key names are unique (pos_*) because the C++ reader looks keys up by name.  pos_use_vertical false = north/west only (matchers rarely give a usable height).  pos_lever_arm_m: IMU -> the point the fix refers to (camera), body FLU.  pos_replay_s: history kept so a LATE fix is applied at its own image time (rewind + re-run); fixes older than that are dropped.  Lock-out: after pos_reset_after rejected fixes in a row that agree within pos_reset_agree_sigma, the position is reset to the fix.  pos_std_m / pos_var_scale: for a CSV without its own uncertainty, and an inflation of whatever it has (matching errors are correlated).",
     "pos_use_vertical": false,
-    "pos_lever_arm_m": [0.0, 0.0, 0.0],
+    "pos_lever_arm_m": [
+      0.0,
+      0.0,
+      0.0
+    ],
     "pos_replay_s": 3.0,
     "pos_reset_after": 3,
     "pos_reset_agree_sigma": 3.0,
     "pos_std_m": 10.0,
     "pos_var_scale": 1.0
   },
-
   "pos_sim": {
     "_comment": "Only for --pos_sim: SIMULATED fixes from GPS truth.  std_m white + bias_std_m slow (Gauss-Markov, tau_s) error per axis, latency_s late, outlier_rate wrong matches off by outlier_m.",
     "rate_hz": 1.0,
@@ -66,7 +68,6 @@
     "outlier_m": 200.0,
     "seed": 0
   },
-
   "stream": {
     "_comment": "Stream (real-time) mode only.  A measurement older than max_meas_age_s is dropped; an IMU gap longer than max_imu_gap_s is not integrated (the state coasts and its covariance grows by gap_acc_std).",
     "max_meas_age_s": 1.0,

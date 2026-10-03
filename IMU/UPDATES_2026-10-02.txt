@@ -1,0 +1,113 @@
+===============================================================================
+ONE NEW LOSS TERM: THE TILT CORRECTION MUST CHANGE SLOWLY      2026-10-02
+===============================================================================
+
+THE IDEA
+  The rotate model outputs a small tilt correction (dtheta, max 2 deg) every
+  90 ms.  Nothing told it how fast that correction may change, so it could jump
+  +1 deg, -1 deg, +1 deg ...  The real tilt error it fixes changes slowly (tens of
+  seconds).  The extra freedom is used to memorise the training flights:
+      tilt_rotate: train 0.79 of raw, val 0.93 / 0.91 / 0.88 (30 / 60 / 120 s).
+
+THE NEW TERM
+  smooth = average of (dtheta[now] - dtheta[90 ms before])^2      in degrees^2
+  loss   = old loss + dtheta_smooth_weight * smooth
+  - weight 0.1: a jumpy 0.3 deg per step costs ~10% of the loss; slow change ~0.
+  - dtheta is 0 at the start of training, so the term starts at 0.
+  - weight 0 (default) = old loss exactly.  Only rotate mode has dtheta; asking
+    for the term in another mode stops with an error.
+
+FILES
+  model/hybrid.py    forward() also returns "dtheta" (one row per 90 ms).
+                     inference() / ONNX outputs are unchanged.
+  model/losses.py    the term, `dtheta_smooth_weight`.
+  train.py           logs it: TensorBoard train|val/dtheta_step_rms_deg and a
+                     "tilt correction step" console line.  metric.csv unchanged.
+  configs/exp/UAV/tilt_rotate_smooth.conf   = tilt_rotate + weight 0.1, nothing else.
+  tests/test_model_updates.py   +6 tests (19 pass, CPU, no data).
+
+RUN   (commands in cmd.txt)
+  python train.py --config configs/exp/UAV/tilt_rotate_smooth.conf --device cuda:0
+
+HOW TO READ IT
+  - val/dtheta_step_rms_deg should fall well below tilt_rotate's.  The TRAIN value
+    reads higher than val because of the CNN dropout; compare val numbers.
+  - WIN: val beats 0.931 / 0.909 / 0.879 and the train/val gap shrinks.  Then
+    score both runs on the held-out flights (--splits inference --per_flight).
+  - Val worse -> weight 0.03.  Gap still wide -> weight 0.3.
+===============================================================================
+
+===============================================================================
+GPS-FREE MODEL: NO GPS-AIDED INPUT ANYWHERE                    2026-10-02
+===============================================================================
+
+WHY
+  The drone flies with NO GPS from take-off.  Every earlier model used GPS in
+  three places the drone will not have:
+      1. the network's gravity input g_body   <- GPSNavEul (GPS-aided attitude)
+      2. gravity removal in the integrator    <- GPSNavEul
+      3. the 15 s bias freeze                 <- fitted with GPS velocity
+
+WHAT CHANGED
+  model/net.py      new key  rot_source: gt | mti  (default gt = as before).
+                    mti = gravity is removed with the MTi attitude (EulX/Y/Z).
+                    Only TILT matters there, so the MTi's drifting heading does not
+                    enter.  No silent fallback: missing MTi -> error.
+  model/hybrid.py   att_source: mti now ERRORS instead of falling back to GPSNavEul.
+  tools/onnx_inference.py   integrates with the same attitude as the config, prints
+                    which one it uses; horizon labels show the time actually measured
+                    (3991 frames is measured at 39.5 s, now labelled so).
+  train.py, tools/eval_vel_horizons1.py   apply utils/pypose_compat (a no-op on the
+                    torch you train with; fixes a crash on newer torch).
+  configs/exp/UAV/gpsfree_rotate_smooth.conf
+                    = tilt_rotate_smooth + att_source mti + rot_source mti
+                      + freeze_hist_s 0 on every split.  Nothing else.
+  EKF/configs/ekf_gpsfree.json   MTi tilt aid (1.5 deg), heading not aided.
+  cmd.txt           section "GPS-FREE: TRAIN AND EVALUATE" at the top (one-line
+                    commands): train -> held-out eval -> ONNX export + check ->
+                    whole-flight EKF test with no GPS (model vs raw IMU).
+  tests             +4 (32 IMU tests pass; EKF 39 pass).
+
+STILL FROM GPS, ON PURPOSE
+  - labels (training only)
+  - the start state of each training window: on the drone the EKF supplies it.
+    The EKF whole-flight test (--no_gt) uses no GPS at all.
+
+READ THE RESULTS AGAINST GPS-FREE BASELINES ONLY
+  The raw arm changed too (MTi attitude, no freeze), so do not compare these ratios
+  with tilt_rotate.  Compare model vs raw of the SAME run, on --splits inference.
+===============================================================================
+
+===============================================================================
+MIRROR FLIGHTS: TWICE THE TRAINING DATA FOR FREE               2026-10-02
+===============================================================================
+
+THE IDEA
+  A fixed-wing flight flipped left <-> right is still a real, physically correct
+  flight: a left turn becomes a right turn, the ground track is mirrored.  So each
+  training window can be flown a second time, mirrored.  The model has ~440
+  independent windows and memorises them; this roughly doubles them and stops
+  "this flight turns left here" from being learnable.
+
+HOW  (train.py, mirror_augment; setting aug_mirror_prob, default 0 = off)
+  Each training window is mirrored with probability p (0.5 in the new config).
+      acc, position, velocity   ( x, -y,  z)
+      gyro                      (-x,  y, -z)
+      attitude (GPSNavEul, MTi, labels)   R -> M R M   (quaternion x, z flip sign)
+  Only training is affected.  Validation, test, ONNX and the drone are unchanged.
+  An unknown channel in a batch stops training with an error instead of being left
+  un-mirrored.
+
+THE SELF-CHECK  (tests/test_model_updates.py)
+  Integrating a mirrored window gives EXACTLY the mirrored trajectory, with GPSNavEul
+  and with MTi attitude, and the errors have exactly the same size.  So a mirrored
+  window is as physically consistent, and as hard, as the original.
+
+CONFIG
+  configs/exp/UAV/tilt_rotate_smooth_mirror.conf = tilt_rotate_smooth + aug_mirror_prob 0.5
+
+READ IT
+  WIN: held-out flights better than tilt_rotate_smooth, and a smaller train/val gap.
+  Known limit: the real aircraft is not perfectly symmetric (propeller turns one
+  way).  If held-out gets worse, try aug_mirror_prob 0.25.
+===============================================================================

@@ -3,6 +3,7 @@ import csv
 import copy
 import torch
 import numpy as np
+import pypose as pp
 
 import torch.utils.data as Data
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -304,6 +305,11 @@ class EpochLogger:
                                ("raw_vel_rel", "raw_vel_rel_error_mps", "m/s")):
                 if d.get(_k) is not None:
                     self.tb.add_scalar("%s/%s" % (tag, _t), d[_k], epoch)
+            # How jumpy the rotate-mode tilt correction is: RMS step between 90 ms
+            # tokens, deg.  `dtheta_smooth_weight` (model/losses.py) penalises it.
+            if d.get("dtheta_smooth") is not None:
+                self.tb.add_scalar("%s/dtheta_step_rms_deg" % tag,
+                                   float(d["dtheta_smooth"]) ** 0.5, epoch)
             # Covariance diagnostics, position/velocity only.
             for k, name in (("pred_cov_pos", "pred_cov_pos"), ("pred_cov_vel", "pred_cov_vel")):
                 if k in d:
@@ -390,6 +396,80 @@ def _aug_std(v):
     else:
         t = torch.full((3,), float(v), dtype=torch.float64)
     return None if float(t.abs().max()) <= 0.0 else t.reshape(1, 1, 3)
+
+
+# Keys mirror_augment knows how to flip, by kind.  Anything else in a batch is an
+# error: a new channel that is not mirrored would silently contradict the others.
+_MIRROR_VEC = ("acc", "pos", "vel", "gt_pos", "gt_vel")          # polar vectors
+_MIRROR_AXIAL = ("gyro",)                                         # angular rates
+_MIRROR_ROT = ("rot", "mti_rot", "gt_rot")                        # SO3 attitudes
+_MIRROR_KEEP = ("dt", "airspeed")                                 # scalars
+
+
+def mirror_augment(data, init_state, label, confs):
+    """Fly a window in a MIRROR: flip it left <-> right, redrawn per window.
+
+    WHY.  The model memorises flights (tilt_rotate: train 0.79 of raw vs val 0.91),
+    because there are only ~440 independent training windows.  A fixed-wing flight
+    mirrored left-to-right is still a physically valid flight -- a left turn becomes
+    a right turn, the ground track is mirrored -- so every window yields a second,
+    new one for free.  It also stops the network keying on "this flight turns left
+    here".
+
+    THE MIRROR.  M = diag(1, -1, 1) flips body y (left) and world y (west).  Then
+        polar vectors  (acc, pos, vel)   v -> M v          = ( x, -y,  z)
+        angular rates  (gyro)            w -> -M w         = (-x,  y, -z)
+        attitudes      (body -> world)   R -> M R M,  quaternion (x, y, z, w)
+                                                       -> (-x, y, -z, w)
+    Gravity is along world z, so M g = g and the gravity terms are unchanged.  With
+    these the integrator commutes with the mirror EXACTLY: integrating the mirrored
+    IMU gives the mirrored trajectory, and every error is the mirror image of the
+    original one (tests/test_model_updates.py checks it to float precision).  The
+    padding9 history frames (init_rot^T g) are mirrored consistently too.
+
+    `aug_mirror_prob: p` mirrors each window with probability p (0.5 = half).
+    Applied in train() only, BEFORE both arms, so the model and the raw baseline see
+    the same window.  Default 0.0: an exact no-op, nothing is drawn.
+
+    KNOWN LIMIT.  A real aircraft is not perfectly symmetric (the propeller turns one
+    way), so a mirrored window has the propeller effects mirrored as well.  Small; if
+    it matters it shows up as worse held-out results -- then lower p.
+    """
+    p = float(confs.get("aug_mirror_prob", 0.0))
+    if p <= 0.0:
+        return data, init_state, label
+    ref = data["acc"]
+    B = ref.shape[0]
+    flip = torch.rand(B, device=ref.device) < p
+    if not bool(flip.any()):
+        return data, init_state, label
+    s = torch.where(flip, -1.0, 1.0).to(ref.dtype)                     # (B,)
+    one = torch.ones_like(s)
+    f_vec = torch.stack([one, s, one], -1)                             # ( x, -y,  z)
+    f_axial = torch.stack([s, one, s], -1)                             # (-x,  y, -z)
+    f_quat = torch.stack([s, one, s, one], -1)                         # (-x, y, -z, w)
+
+    def shaped(f, x):
+        return f.to(dtype=x.dtype, device=x.device).view(B, *([1] * (x.dim() - 2)), -1)
+
+    def mirror(d):
+        out = {}
+        for k, v in d.items():
+            if v is None or k in _MIRROR_KEEP:
+                out[k] = v
+            elif k in _MIRROR_VEC:
+                out[k] = v * shaped(f_vec, v)
+            elif k in _MIRROR_AXIAL:
+                out[k] = v * shaped(f_axial, v)
+            elif k in _MIRROR_ROT:
+                t = v.tensor()
+                out[k] = pp.LieTensor(t * shaped(f_quat, t), ltype=v.ltype)
+            else:
+                raise KeyError("mirror_augment does not know how to mirror %r; add it to "
+                               "one of the _MIRROR_* lists" % (k,))
+        return out
+
+    return mirror(data), mirror(init_state), mirror(label)
 
 
 def bias_augment(data, confs, correct_gyro):
@@ -592,6 +672,7 @@ def train(network, loader, confs, epoch, optimizer, ema=None, ema_decay=0.0):
         data, init_state, label = move_to([data, init_state, label], confs.device)
         # Augment BEFORE both arms so the model and the raw baseline see the same
         # signal and stay a paired comparison.  No-op unless aug_*_bias_std is set.
+        data, init_state, label = mirror_augment(data, init_state, label, confs)
         data = bias_augment(data, confs, confs.get("correct_gyro", True))
         inte_state = network(data, init_state)
         loss_state = get_loss(inte_state, label, confs)
@@ -608,6 +689,8 @@ def train(network, loader, confs, epoch, optimizer, ema=None, ema_decay=0.0):
         vel_losses += loss_state['vel'].item()
         acc['pos_rel'] += loss_state['pos_rel'].item()
         acc['vel_rel'] += loss_state['vel_rel'].item()
+        if 'dtheta_smooth' in loss_state:          # rotate mode (see model/losses.py)
+            acc['dtheta_smooth'] = acc.get('dtheta_smooth', 0.0) + loss_state['dtheta_smooth'].item()
         if log_raw:
             for _k, _v in raw_baseline_errors(network, data, init_state, label, confs).items():
                 acc[_k] += _v
@@ -702,6 +785,9 @@ def test(network, loader, confs, epoch=None):
             vel_losses += loss_state['vel'].item() * bs
             acc['pos_rel'] += loss_state['pos_rel'].item() * bs
             acc['vel_rel'] += loss_state['vel_rel'].item() * bs
+            if 'dtheta_smooth' in loss_state:
+                acc['dtheta_smooth'] = (acc.get('dtheta_smooth', 0.0)
+                                        + loss_state['dtheta_smooth'].item() * bs)
             if log_raw:
                 for _k, _v in raw_baseline_errors(network, data, init_state, label, confs).items():
                     acc[_k] += _v * bs
@@ -784,6 +870,8 @@ def main_worker(local_rank, device_ids, args):
     ordinal it owns.  Called directly for a single device, or once per GPU by
     torch.multiprocessing.spawn / torchrun.
     """
+    from utils import pypose_compat
+    pypose_compat.apply()      # no-op unless this torch breaks pypose 0.9.5's cumprod
     world_size = len(device_ids) if device_ids else 1
     distributed = world_size > 1
 
@@ -927,6 +1015,12 @@ def main_worker(local_rank, device_ids, args):
                   % (_f(_sa, 1.0), _f(_sg, 180.0 / np.pi)))
         else:
             print("[bias_augment] off (set aug_acc_bias_std / aug_gyro_bias_std to enable)")
+        _pm = float(conf.train.get("aug_mirror_prob", 0.0))
+        if _pm > 0.0:
+            print("[mirror_augment] ACTIVE on the training split only: each window is "
+                  "flown left<->right mirrored with probability %.2f" % _pm)
+        else:
+            print("[mirror_augment] off (set aug_mirror_prob to enable)")
 
     if distributed:
         if conf.train.get("sync_bn", False):
@@ -1077,6 +1171,10 @@ def main_worker(local_rank, device_ids, args):
                       % (epoch_i, lr,
                          train_loss["loss"], train_loss["pos_loss"], train_loss["vel_loss"],
                          test_loss["loss"], test_loss["pos_loss"], test_loss["vel_loss"]))
+                if "dtheta_smooth" in test_loss:
+                    print("          tilt correction step, rms over 90 ms: train %.4f deg"
+                          " | val %.4f deg" % (train_loss.get("dtheta_smooth", 0.0) ** 0.5,
+                                               test_loss["dtheta_smooth"] ** 0.5))
 
             eval_metrics = None
             if epoch_i % conf.train.eval_freq == conf.train.eval_freq - 1:

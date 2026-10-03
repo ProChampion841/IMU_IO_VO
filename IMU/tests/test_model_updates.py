@@ -7,6 +7,7 @@ synthetic windows.
 import os
 import sys
 
+import numpy as np
 import pypose as pp
 import pytest
 import torch
@@ -205,3 +206,229 @@ def test_full_forward_backward_rotate():
     loss.backward()
     assert torch.isfinite(loss)
     assert net.accscale_decoder[-1].weight.grad.abs().sum() > 0   # rotation head trains
+
+
+# ---------------------------------------------------------------- dtheta smoothness
+def _smooth_loss(net, weight, name="tilt_rotate"):
+    conf = _conf(name, dtheta_smooth_weight=weight)
+    conf.put("device", "cpu")
+    data, init, label = _batch()
+    st = net(data, init)
+    return st, get_loss(st, label, conf)
+
+
+def test_dtheta_is_per_token_and_zero_at_init():
+    st, out = _smooth_loss(_net("tilt_rotate"), 0.0)
+    dth = st["dtheta"]
+    assert dth.shape[0] == 2 and dth.shape[2] == 3
+    assert abs(dth.shape[1] - (F + 9) / 9) <= 2              # one row per 90 ms token
+    assert torch.equal(dth, torch.zeros_like(dth))           # identity at init
+    assert out["dtheta_smooth"] == 0.0
+
+
+def test_dtheta_smooth_weight_zero_is_bit_identical():
+    net = _net("tilt_rotate")
+    _randomise_heads(net)
+    with torch.no_grad():
+        _, a = _smooth_loss(net, 0.0)
+        conf = _conf("tilt_rotate")                           # key absent altogether
+        conf.put("device", "cpu")
+        data, init, label = _batch()
+        b = get_loss(net(data, init), label, conf)
+    assert torch.equal(a["loss"], b["loss"])
+    assert a["dtheta_smooth"] > 0                             # still reported
+
+
+def test_dtheta_smooth_adds_the_term_and_trains_the_rotation_head():
+    net = _net("tilt_rotate")                 # eval: no dropout; autograd still on
+    _randomise_heads(net)
+    data, init, label = _batch()
+    st = net(data, init)                      # ONE forward pass, scored twice
+    c0, c1 = _conf("tilt_rotate", dtheta_smooth_weight=0.0), _conf("tilt_rotate",
+                                                                    dtheta_smooth_weight=0.1)
+    l0, l1 = get_loss(st, label, c0), get_loss(st, label, c1)
+    dth = st["dtheta"].detach()
+    manual = torch.rad2deg(dth[:, 1:] - dth[:, :-1]).pow(2).sum(-1).mean()
+    assert torch.allclose(l1["dtheta_smooth"], manual)
+    assert torch.allclose(l1["loss"] - l0["loss"], 0.1 * manual)
+    (l1["loss"] - l0["loss"]).backward()      # the smoothness term alone
+    assert net.accscale_decoder[-1].weight.grad.abs().sum() > 0      # rotation head
+    assert net.accdecoder[-1].weight.grad.abs().sum() == 0           # bias head untouched
+
+
+def test_dtheta_smooth_reduces_jumps_when_optimised():
+    """Gradient steps on the term alone make the correction smoother."""
+    net = _net("tilt_rotate").train()
+    _randomise_heads(net)
+    conf = _conf("tilt_rotate", dtheta_smooth_weight=1.0)
+    data, init, label = _batch()
+    opt = torch.optim.Adam(net.accscale_decoder.parameters(), lr=1e-2)
+    first = None
+    for _ in range(30):
+        aux = {}
+        net.inference(dict(data), aux=aux)
+        d = torch.rad2deg(aux["dtheta"][:, 1:] - aux["dtheta"][:, :-1]).pow(2).sum(-1).mean()
+        first = d.item() if first is None else first
+        opt.zero_grad()
+        (conf.dtheta_smooth_weight * d).backward()
+        opt.step()
+    assert d.item() < 0.5 * first
+
+
+def test_dtheta_smooth_needs_rotate_mode():
+    with pytest.raises(RuntimeError, match="rotate"):
+        _smooth_loss(_net("tilt_aware"), 0.1, name="tilt_aware")
+
+
+def test_smooth_config_is_tilt_rotate_plus_one_key():
+    a = dict(_conf("tilt_rotate").items())
+    b = dict(_conf("tilt_rotate_smooth").items())
+    assert {k for k in set(a) | set(b) if a.get(k) != b.get(k)} == {"dtheta_smooth_weight"}
+    assert b["dtheta_smooth_weight"] == 0.1
+
+
+# ---------------------------------------------------------------- GPS-free (MTi attitude)
+def _with_mti(data, init, tilt=0.0, seed=4):
+    """Add an MTi attitude: the nav attitude tilted by a random `tilt` (rad)."""
+    g = torch.Generator().manual_seed(seed)
+    B, Fr = data["rot"].lshape
+    err = torch.zeros(B, Fr, 3)
+    err[..., :2] = torch.randn(B, 1, 2, generator=g) * tilt          # roll / pitch error
+    mti = data["rot"] * pp.so3(err).Exp()
+    return dict(data, mti_rot=mti), dict(init, mti_rot=mti[:, :1])
+
+
+def _run(conf_name, data, init, **over):
+    conf = _conf(conf_name, **over)
+    conf.put("device", "cpu")
+    torch.manual_seed(0)
+    net = net_dict["hybridnet"](conf).eval()
+    _randomise_heads(net)
+    with torch.no_grad():
+        return net(dict(data), init)
+
+
+def test_rot_source_default_is_gpsnaveul_and_unchanged():
+    data, init, _ = _batch()
+    data, init = _with_mti(data, init, tilt=np.radians(1.5))
+    a = _run("tilt_rotate", data, init)
+    b = _run("tilt_rotate", data, init, rot_source="gt")
+    assert torch.equal(a["vel"], b["vel"]) and torch.equal(a["pos"], b["pos"])
+
+
+def test_rot_source_mti_uses_the_mti_attitude():
+    data, init, _ = _batch()
+    same_d, same_i = _with_mti(data, init, tilt=0.0)                 # MTi == nav attitude
+    gt = _run("tilt_rotate", same_d, same_i)
+    mti_same = _run("tilt_rotate", same_d, same_i, rot_source="mti")
+    assert torch.allclose(gt["vel"], mti_same["vel"], atol=1e-6)
+    tilt_d, tilt_i = _with_mti(data, init, tilt=np.radians(1.5))     # MTi tilted 1.5 deg
+    mti = _run("tilt_rotate", tilt_d, tilt_i, rot_source="mti")
+    gt2 = _run("tilt_rotate", tilt_d, tilt_i)
+    # gravity leaks through the 1.5 deg tilt: ~0.26 m/s^2 over 5 s
+    assert (mti["vel"][:, -1] - gt2["vel"][:, -1]).norm(dim=-1).min() > 0.3
+
+
+def test_rot_source_mti_never_falls_back_to_gps():
+    data, init, _ = _batch()                                           # no mti_rot
+    with pytest.raises(RuntimeError, match="GPS-aided"):
+        _run("tilt_rotate", data, init, rot_source="mti")
+    with pytest.raises(RuntimeError, match="GPS-aided"):
+        _run("tilt_rotate", data, init, att_source="mti")
+
+
+def test_gpsfree_config_has_no_gps_aided_input():
+    c = ConfigFactory.parse_file(os.path.join(ROOT, "configs/exp/UAV/gpsfree_rotate_smooth.conf"))
+    assert c.train.att_source == "mti" and c.train.rot_source == "mti" and c.train.gtrot
+    assert c.train.dtheta_smooth_weight == 0.1
+    for split in ("train", "eval", "test", "inference"):
+        assert c.dataset[split].freeze_hist_s == 0.0
+
+
+# ---------------------------------------------------------------- mirror augmentation
+M = torch.tensor([1.0, -1.0, 1.0])
+
+
+def _mirror(data, init, label, p=1.0):
+    from train import mirror_augment                       # train.py, not a package
+    c = _conf("tilt_rotate", aug_mirror_prob=p)
+    return mirror_augment(data, init, label, c)
+
+
+def _full_batch(B=2, seed=1):
+    data, init, label = _batch(B=B, seed=seed)
+    data, init = _with_mti(data, init, tilt=0.02)
+    data["airspeed"] = torch.full((B, F + 9, 1), 22.0)
+    return data, init, label
+
+
+def test_mirror_off_is_an_exact_noop():
+    data, init, label = _full_batch()
+    d, i, l = _mirror(data, init, label, p=0.0)
+    assert d is data and i is init and l is label
+
+
+def test_mirror_signs_and_twice_is_identity():
+    data, init, label = _full_batch()
+    d, i, l = _mirror(data, init, label)
+    assert torch.equal(d["acc"], data["acc"] * M)                       # ( x, -y,  z)
+    assert torch.equal(d["gyro"], data["gyro"] * -M)                    # (-x,  y, -z)
+    assert torch.equal(d["airspeed"], data["airspeed"]) and torch.equal(d["dt"], data["dt"])
+    Rm = d["rot"].matrix()
+    assert torch.allclose(Rm, M.diag() @ data["rot"].matrix() @ M.diag(), atol=1e-6)
+    assert torch.allclose(l["gt_vel"], label["gt_vel"] * M)
+    d2, i2, l2 = _mirror(d, i, l)
+    for a, b in ((d2, data), (i2, init), (l2, label)):
+        for k in b:
+            x, y = a[k], b[k]
+            x = x.tensor() if hasattr(x, "ltype") else x
+            y = y.tensor() if hasattr(y, "ltype") else y
+            assert torch.equal(x, y), k
+
+
+def test_mirrored_window_integrates_to_the_mirrored_trajectory():
+    """The self-check: the integrator commutes with the mirror, so a mirrored window
+    is a physically consistent flight and its error is the mirror of the original's."""
+    data, init, label = _full_batch()
+    dm, im, lm = _mirror(data, init, label)
+    for rot_source in ("gt", "mti"):
+        # zero-initialised heads: the network adds no correction, so this is the raw
+        # integration -- the physics being checked, not a learned (non-mirrored) map
+        net = _net("tilt_rotate", rot_source=rot_source)
+        with torch.no_grad():
+            a = net(dict(data), init)
+            b = net(dict(dm), im)
+        assert torch.equal(a["corrected_acc"], data["acc"][:, 9:])
+        assert torch.allclose(b["vel"], a["vel"] * M, atol=1e-4)
+        assert torch.allclose(b["pos"], a["pos"] * M, atol=1e-4)
+        assert torch.allclose(b["rot"].matrix(), M.diag() @ a["rot"].matrix() @ M.diag(),
+                              atol=1e-5)
+        # same error size, so the window is exactly as hard as the original
+        conf = _conf("tilt_rotate")
+        la, lb = get_loss(a, label, conf), get_loss(b, lm, conf)
+        for k in ("pos", "vel", "rot", "pos_rel", "vel_rel"):
+            assert torch.allclose(la[k], lb[k], rtol=1e-4), k
+
+
+def test_mirror_is_per_window():
+    torch.manual_seed(0)
+    data, init, label = _full_batch(B=16)
+    d, _, _ = _mirror(data, init, label, p=0.5)
+    same = (d["acc"] == data["acc"]).all(-1).all(-1)
+    flipped = (d["acc"] == data["acc"] * M).all(-1).all(-1)
+    assert bool((same | flipped).all())                 # every window: one or the other
+    assert 0 < int(flipped.sum()) < 16                  # and both kinds happen
+
+
+def test_mirror_refuses_an_unknown_channel():
+    data, init, label = _full_batch()
+    data["magnetometer"] = torch.zeros(2, F, 3)
+    with pytest.raises(KeyError, match="magnetometer"):
+        _mirror(data, init, label)
+
+
+def test_mirror_config_is_smooth_plus_one_key():
+    a = dict(_conf("tilt_rotate_smooth").items())
+    b = dict(_conf("tilt_rotate_smooth_mirror").items())
+    assert {k for k in set(a) | set(b) if a.get(k) != b.get(k)} == {"aug_mirror_prob"}
+    assert b["aug_mirror_prob"] == 0.5

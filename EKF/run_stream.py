@@ -26,12 +26,22 @@ With GPS it is used from the outage on, with the 15 s pre-outage bias freeze it 
 trained with; with --no_gt it is used from the start with no freeze.  --imu raw
 (default) feeds the raw IMU.
 
+--pos_sim / --pos_csv / --pos_dir: absolute position fixes (land matching), see
+ekf/landmatch.py.  They go to the EKF arm only, so the table shows what VO + land
+matching do against IMU-only.  A fix arrives late (its matching latency) and the
+filter rewinds to its image time (position_aid.pos_replay_s).  VO is optional
+when fixes are given.
+
 --events_out writes the message log of the FIRST flight; --cpp runs the C++
 ekf_replay on it and checks it matches Python.
 
     python run_stream.py --imu_config ../IMU/configs/exp/UAV/tilt_rotate.conf \
         --splits inference --vo_dir vo_cache --gps_s 60
     python run_stream.py --csv f1_sensor_data.csv f2_sensor_data.csv --vo_sim
+    python run_stream.py --imu_config ../IMU/configs/exp/UAV/tilt_rotate.conf \
+        --splits inference --vo_dir vo_cache --pos_sim --gps_s 60
+    python run_stream.py --csv f1_sensor_data.csv --pos_csv f1_landmatch.csv \
+        --pos_origin 37.123456 127.123456 50.0
 """
 import argparse
 import os
@@ -47,6 +57,8 @@ from ekf import pipeline as PL                                        # noqa: E4
 from ekf import horizons as HZ                                        # noqa: E402
 from ekf.events import build_events, run_stream, stream_from_config, write_events  # noqa: E402
 from ekf.vo import load_vo_csv, simulate_vo                           # noqa: E402
+from ekf.landmatch import read_fixes_csv, simulate_fixes              # noqa: E402
+from ekf.eskf import _CHI2_999                                        # noqa: E402
 from ekf import vo_onnx                                               # noqa: E402
 from ekf import imu_model as IM                                       # noqa: E402
 import run_ekf                                                        # noqa: E402
@@ -103,6 +115,35 @@ def vo_for(a, cfg, fl, root, name):
     return vo_onnx.replay(a.vo_onnx, folder, save_csv=cache, **kw)
 
 
+def pos_for(a, cfg, fl, name, t_from, t_to):
+    """Land-matching fixes for one flight (None: none), NWU m, stamped + arrival time."""
+    pa = cfg.get("position_aid", {})
+    if a.pos_sim:
+        s = dict(cfg.get("pos_sim", {}))
+        for k in ("rate_hz", "std_m", "latency_s"):
+            if getattr(a, "pos_" + k) is not None:
+                s[k] = getattr(a, "pos_" + k)
+        return simulate_fixes(fl["t"], fl["p_gt"], t_from, t_to, rate_hz=s.get("rate_hz", 1.0),
+                              std_m=s.get("std_m", 10.0), bias_std_m=s.get("bias_std_m", 0.0),
+                              tau_s=s.get("tau_s", 60.0), latency_s=s.get("latency_s", 0.5),
+                              outlier_rate=s.get("outlier_rate", 0.0),
+                              outlier_m=s.get("outlier_m", 200.0),
+                              var_scale=pa.get("pos_var_scale", 1.0), seed=s.get("seed", 0))
+    path = a.pos_csv
+    if a.pos_dir:
+        stem = os.path.splitext(name)[0]
+        path = None
+        for cand in (stem + "_pos.csv", stem.replace("_sensor_data", "") + "_pos.csv"):
+            if os.path.isfile(os.path.join(a.pos_dir, cand)):
+                path = os.path.join(a.pos_dir, cand)
+                break
+    if not path:
+        return None
+    return read_fixes_csv(path, origin=a.pos_origin, time_offset=a.pos_time_offset,
+                          latency_s=a.pos_latency_s or 0.0, std_m=pa.get("pos_std_m", 10.0),
+                          var_scale=pa.get("pos_var_scale", 1.0))
+
+
 def score(fl, rows, t_out, h_s, p_offset=None):
     """The five quantities for one flight at h_s seconds into the outage, or None.
     p_offset is added to the estimated position (no-GT runs start at 0)."""
@@ -132,7 +173,7 @@ def main(argv=None):
     ap.add_argument("--data_root", default=None)
     ap.add_argument("--max_flights", type=int, default=None)
     ap.add_argument("--ekf_config", default=os.path.join(HERE, "configs", "ekf_default.json"))
-    vo = ap.add_mutually_exclusive_group(required=True)
+    vo = ap.add_mutually_exclusive_group()
     vo.add_argument("--vo_onnx", help="VO ONNX export folder (with --vo_dataset / --vo_datasets)")
     vo.add_argument("--vo_csv", help="VO predictions CSV (one flight)")
     vo.add_argument("--vo_dir", help="folder of VO CSVs, <flight>_vo.csv")
@@ -160,6 +201,22 @@ def main(argv=None):
     ap.add_argument("--vo_latency_s", type=float, default=0.0,
                     help="extra delay between a VO output's timestamp and its arrival")
     ap.add_argument("--imu_drop", type=float, default=0.0, help="fraction of IMU samples lost")
+    pos = ap.add_mutually_exclusive_group()
+    pos.add_argument("--pos_sim", action="store_true",
+                     help="SIMULATED land-matching fixes from GPS truth (config pos_sim)")
+    pos.add_argument("--pos_csv", help="land-matching fixes CSV (one flight, ekf/landmatch.py)")
+    pos.add_argument("--pos_dir", help="folder of fix CSVs, <flight>_pos.csv")
+    ap.add_argument("--pos_origin", type=float, nargs="+", default=None, metavar="LAT LON [ALT]",
+                    help="origin of the NWU frame for lat/lon fixes: where the filter's "
+                         "position 0 is (the GPS position at the log start)")
+    ap.add_argument("--pos_time_offset", type=float, default=0.0,
+                    help="added to the fix times (if the matcher has another clock)")
+    ap.add_argument("--pos_from", choices=["start", "outage"], default="start",
+                    help="fixes from the filter start (default) or only during the outage")
+    ap.add_argument("--pos_rate_hz", type=float, default=None, help="--pos_sim: fixes per second")
+    ap.add_argument("--pos_std_m", type=float, default=None, help="--pos_sim: error per axis, m")
+    ap.add_argument("--pos_latency_s", type=float, default=None,
+                    help="fix arrival delay (--pos_sim, or a CSV without an arrival column)")
     ap.add_argument("--events_out", default=None, help="message log of the first flight (C++)")
     ap.add_argument("--cpp", default=None, help="path to ekf_replay: run it on the first flight")
     ap.add_argument("--out_csv", default=None, help="one row per (flight, horizon)")
@@ -168,6 +225,15 @@ def main(argv=None):
         ap.error("--vo_csv / --vo_dataset belong to ONE flight: give exactly one --csv")
     if a.vo_onnx and not (a.vo_dataset or a.vo_datasets):
         ap.error("--vo_onnx needs --vo_dataset or --vo_datasets")
+    use_vo = bool(a.vo_onnx or a.vo_csv or a.vo_dir or a.vo_sim)
+    use_pos = bool(a.pos_sim or a.pos_csv or a.pos_dir)
+    if not use_vo and not use_pos:
+        ap.error("give a VO source (--vo_onnx / --vo_csv / --vo_dir / --vo_sim) and/or "
+                 "land-matching fixes (--pos_sim / --pos_csv / --pos_dir)")
+    if a.no_gt and not use_vo:
+        ap.error("--no_gt starts from the first VO sample: it needs a VO source")
+    if a.pos_csv and (not a.csv or len(a.csv) != 1):
+        ap.error("--pos_csv belongs to ONE flight: give exactly one --csv")
 
     if a.gps_s is None:
         a.gps_s = 0.0 if a.no_gt else 60.0
@@ -185,10 +251,11 @@ def main(argv=None):
     hs = sorted(HZ.parse(h, plain="seconds") for h in a.horizons)       # frames
     h_max_s = hs[-1] / HZ.RATE_HZ
     att = cfg["attitude_aid"].get("source") or "gt"
-    rows_out, first_ev, nis_all = [], None, []
+    rows_out, first_ev, nis_all, nis_pos, pos_cnt = [], None, [], [], {}
     flights = flight_list(a)
     print("[stream] %d flight(s) | %s | IMU %s | GPS %.0f s then outage | horizons %s"
-          % (len(flights), "NO GT: start from VO + nav attitude, no reset" if a.no_gt
+          % (len(flights), ("NO GT: start from VO + %s attitude, no reset"
+                            % ("MTi" if att == "mti" else "GPSNavEul")) if a.no_gt
              else "start from the GPS/nav state", a.imu, a.gps_s,
              " ".join(HZ.label(h) for h in hs)))
     for root, name in flights:
@@ -197,8 +264,8 @@ def main(argv=None):
         except Exception as e:                                            # noqa: BLE001
             print("  [skip] %s: %s" % (name, e))
             continue
-        vo = vo_for(a, cfg, fl, root, name)
-        if vo is None:
+        vo = vo_for(a, cfg, fl, root, name) if use_vo else None
+        if use_vo and vo is None:
             print("  [skip] %s: no VO for this flight" % name)
             continue
         t_start = fl["t"][0] + a.start_s
@@ -211,6 +278,13 @@ def main(argv=None):
                   gps_until=t_out if a.gps_s > 0 else None, gps_std=a.gps_std, att_source=att,
                   vo_latency_s=a.vo_latency_s, imu_drop=a.imu_drop, seed=0,
                   init="vo" if a.no_gt else "gt", init_vo=vo)
+        pos = None
+        if use_pos:
+            pos = pos_for(a, cfg, fl, name, t_out if a.pos_from == "outage" else t_start,
+                          kw["t_end"])
+            if pos is None or not len(pos):
+                print("  [skip] %s: no land-matching fixes for this flight" % name)
+                continue
         if corrector is not None:
             freeze, act = None, None
             if a.gps_s > 0:                    # model from the outage, trained-style freeze
@@ -225,7 +299,7 @@ def main(argv=None):
                 return cache[key]
             kw["imu_fn"] = imu_fn
         try:
-            ev = build_events(fl, vo, **kw)
+            ev = build_events(fl, vo, pos=pos, **kw)
         except ValueError as e:
             print("  [skip] %s: %s" % (name, e))
             continue
@@ -238,6 +312,10 @@ def main(argv=None):
         if first_ev is None:
             first_ev = (name, ev, res["ekf"][0])
         nis_all += res["ekf"][1].f.stats["nis_vel"]
+        nis_pos += res["ekf"][1].f.stats["nis_pos"]
+        for k, v in res["ekf"][1].counters.items():
+            if k.startswith("pos"):
+                pos_cnt[k] = pos_cnt.get(k, 0) + v
         i = int(np.searchsorted(res["ekf"][0][:, 0], t_out))
         ba = res["ekf"][0][min(i, len(res["ekf"][0]) - 1), 11:14]
         n_ok = 0
@@ -250,15 +328,17 @@ def main(argv=None):
             for arm in ARMS:
                 r.update({"%s_%s" % (arm, k): float(v) for k, v in per[arm].items()})
             rows_out.append(r)
+        src = " + ".join(x.source[:60] for x in (vo, pos) if x is not None)
         print("  %-40s %5.0f s log | |ba| at outage %.4f m/s^2 | %d horizons fit | %s"
-              % (name[:40], fl["t"][-1] - fl["t"][0], np.linalg.norm(ba), n_ok, vo.source[:60]))
+              % (name[:40], fl["t"][-1] - fl["t"][0], np.linalg.norm(ba), n_ok, src))
 
     if not rows_out:
         print("no flight long enough")
         return 1
-    print("\n=== STREAM%s: %s, over flights; each cell = ekf / imu-only (ratio) ==="
+    aids = " + ".join(n for n, on in (("VO", use_vo), ("land match", use_pos)) if on)
+    print("\n=== STREAM%s: %s, over flights; each cell = ekf (%s) / imu-only (ratio) ==="
           % (" (NO GT, no reset)" if a.no_gt else "",
-             "time since start" if a.no_gt and a.gps_s == 0 else "time into the outage"))
+             "time since start" if a.no_gt and a.gps_s == 0 else "time into the outage", aids))
     head = "%-6s %4s | " % ("horizon", "fl") + " | ".join("%-26s" % n for n, _, _ in PL.SUMMARY)
     print(head)
     print("-" * len(head))
@@ -279,8 +359,20 @@ def main(argv=None):
     if nis_all:
         print("VO NIS mean %.2f (3.0 = VO variance right; >3 raise vo.var_scale, <3 lower it)"
               % np.mean(nis_all))
+    if pos_cnt:
+        dof = 3 if cfg.get("position_aid", {}).get("pos_use_vertical") else 2
+        ok = [n for n in nis_pos if n <= _CHI2_999[dof]]              # accepted fixes only
+        print("land matching: %d fixes | %d gated | %d late (rewound) | %d dropped (older than "
+              "pos_replay_s) | %d position resets | NIS mean of accepted fixes %.2f (%d = "
+              "variance right; >%d raise the fix std, <%d lower it)"
+              % (pos_cnt["pos"], pos_cnt["pos_gated"], pos_cnt["pos_late"],
+                 pos_cnt["pos_dropped"], pos_cnt["pos_reset"],
+                 np.mean(ok) if ok else float("nan"), dof, dof, dof))
     if a.vo_sim:
         print("*** VO IS SIMULATED from GPS truth: a filter test, NOT a VO result.")
+    if a.pos_sim:
+        print("*** LAND-MATCHING FIXES ARE SIMULATED from GPS truth: a filter test, NOT a "
+              "land-matching result.")
 
     if a.out_csv:
         import csv

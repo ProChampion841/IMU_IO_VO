@@ -31,6 +31,9 @@ UPDATES
     attitude (nav / MTi)  z = Log(R_meas R^T)  (WORLD-frame)   H_th = R
                           rows 0-1 = tilt (roll/pitch), row 2 = heading; either can
                           be switched off.
+    position (land match) z = p + R r_lever  (world NWU, m)    H_p = I, H_th = -R [r_lever]x
+                          usually rows 0-1 only (horizontal); r_lever = IMU -> the
+                          point the fix refers to (camera), body FLU.
 Every update is chi-square gated (NIS) and uses the Joseph form.
 """
 from dataclasses import dataclass, field
@@ -85,8 +88,11 @@ class ESKF:
             P0 = np.diag(d ** 2)
         self.P = np.array(P0, dtype=float)
         self.last_gyro = np.zeros(3)
-        self.stats = {"vel": [0, 0], "att": [0, 0], "gps": [0, 0],
-                      "nis_vel": [], "nis_att": [], "nis_gps": []}
+        self.stats = {"vel": [0, 0], "att": [0, 0], "gps": [0, 0], "pos": [0, 0],
+                      "nis_vel": [], "nis_att": [], "nis_gps": [], "nis_pos": []}
+        # False while the stream front end REPLAYS updates it already counted once
+        # (ekf/stream.py, late position fixes): the replay must not count them twice.
+        self.record_stats = True
 
     # ------------------------------------------------------------------ predict
     def predict(self, acc, gyro, dt):
@@ -121,9 +127,11 @@ class ESKF:
         S = H @ self.P @ H.T + Rm
         Si = np.linalg.inv(S)
         nis = float(r @ Si @ r)
-        self.stats["nis_" + kind].append(nis)
+        if self.record_stats:
+            self.stats["nis_" + kind].append(nis)
         if self.prm.gate and nis > _CHI2_999[len(r)]:
-            self.stats[kind][1] += 1
+            if self.record_stats:
+                self.stats[kind][1] += 1
             return False, nis
         K = self.P @ H.T @ Si
         dx = K @ r
@@ -136,7 +144,8 @@ class ESKF:
         self.ba = self.ba + dx[self.IBA]
         self.bg = self.bg + dx[self.IBG]
         # The reset Jacobian I - [dtheta/2]x is ~I for the small corrections here.
-        self.stats[kind][0] += 1
+        if self.record_stats:
+            self.stats[kind][0] += 1
         return True, nis
 
     def update_body_velocity(self, z, var, lever=None):
@@ -169,7 +178,50 @@ class ESKF:
         H[:, self.ITH] = self.R
         return self._update(phi_w[rows], H[rows], np.diag(var), "att")
 
+    def position_residual(self, z, rows=(0, 1), lever=None):
+        """Residual and Jacobian of an absolute position fix (see update_position)."""
+        h = self.p.copy()
+        H = np.zeros((3, 15))
+        H[:, self.IP] = np.eye(3)
+        if lever is not None and np.any(lever):
+            lever = np.asarray(lever, float)
+            h = h + self.R @ lever
+            H[:, self.ITH] = -self.R @ so3.skew(lever)
+        rows = list(rows)
+        return (np.asarray(z, float) - h)[rows], H[rows]
+
+    def update_position(self, z, var, rows=(0, 1), lever=None):
+        """Absolute position fix (land matching), world NWU (m).
+
+        z: position of the point the fix refers to; var: per-axis variance (m^2);
+        rows: which axes to use -- (0, 1) = north/west only, (0, 1, 2) adds height;
+        lever: IMU -> that point (e.g. the camera), body FLU (m)."""
+        r, H = self.position_residual(z, rows, lever)
+        Rm = np.diag(np.asarray(var, float)[list(rows)])
+        return self._update(r, H, Rm, "pos")
+
+    def reset_position(self, z, var, rows=(0, 1), lever=None):
+        """Jump to a position fix: p[rows] from z, its uncertainty = var and no
+        correlation with the rest of the state.  For a filter that has drifted so far
+        that the chi-square gate rejects every good fix (ekf/stream.py decides when)."""
+        rows = list(rows)
+        off = np.zeros(3) if lever is None else self.R @ np.asarray(lever, float)
+        self.p[rows] = (np.asarray(z, float) - off)[rows]
+        self.P[rows, :] = 0.0
+        self.P[:, rows] = 0.0
+        self.P[rows, rows] = np.asarray(var, float)[rows]
+
     # ------------------------------------------------------------------ helpers
+    def snapshot(self):
+        """Everything the filter needs to resume from this point (see restore)."""
+        return (self.p.copy(), self.v.copy(), self.R.copy(), self.ba.copy(), self.bg.copy(),
+                self.P.copy(), self.last_gyro.copy())
+
+    def restore(self, snap):
+        p, v, R, ba, bg, P, g = snap
+        self.p, self.v, self.R = p.copy(), v.copy(), R.copy()
+        self.ba, self.bg, self.P, self.last_gyro = ba.copy(), bg.copy(), P.copy(), g.copy()
+
     def state(self):
         return dict(p=self.p.copy(), v=self.v.copy(), R=self.R.copy(),
                     ba=self.ba.copy(), bg=self.bg.copy(), P=self.P.copy())

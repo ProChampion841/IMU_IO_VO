@@ -35,12 +35,32 @@ class ModelBase(nn.Module):
                 select[k] = data[k][:, start:end]
         return select
     
+    def _gravity_rot_key(self, data):
+        """Which attitude removes gravity when `gtrot: True`.
+
+        `rot_source: gt` (default) -- data['rot'], GPSNavEul: the GPS-AIDED nav
+        attitude.  `rot_source: mti` -- data['mti_rot'], the MTi AHRS attitude, which
+        needs no GPS: the setting for a drone that flies without GPS from take-off.
+        Only the TILT of this attitude matters here (R^T [0,0,g] is yaw-free), so the
+        MTi's drifting heading does not enter.  No silent fallback to GPS."""
+        src = str(self.conf.get("rot_source", "gt"))
+        if src not in ("gt", "mti"):
+            raise ValueError("rot_source must be 'gt' or 'mti', got %r" % (src,))
+        if src == "gt":
+            return "rot"
+        if data.get("mti_rot", None) is None:
+            raise RuntimeError(
+                "rot_source: mti but the batch has no 'mti_rot'. Falling back to "
+                "data['rot'] would use the GPS-aided attitude, so this is an error.")
+        return "mti_rot"
+
     def integrate(self, init_state, data, cov_state):
         B, F = data["corrected_acc"].shape[:2]
         inte_pos, inte_vel, inte_rot, inte_cov = [], [], [], []
         gt_rot = None
+        rot_key = self._gravity_rot_key(data) if self.conf.gtrot else None
         if self.conf.gtrot:
-            gt_rot = data['rot']
+            gt_rot = data[rot_key]
         # `posonly` used to be keyed on the KEY EXISTING, so `posonly: False` still
         # threw the gyro correction away.  It also assigned data['gyro'], which under
         # the padding9 collate is `window_size + 9` long against a `window_size` dt --
@@ -89,7 +109,7 @@ class ModelBase(nn.Module):
                         init_state["cov"] = inte_state["cov"]
 
                 if self.conf.gtrot:
-                    gt_rot = selected_data['rot']
+                    gt_rot = selected_data[rot_key]
                 
                 ## starting point and ending point                
                 inte_state = self.integrator(init_state = init_state, dt = selected_data['dt'], gyro = selected_data['corrected_gyro'],

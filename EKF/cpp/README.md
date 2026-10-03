@@ -25,8 +25,10 @@ cmake --build build -j
 - **Jetson (aarch64):** the stock JetPack gcc works.
 - **Speed:** on x86 it takes about **2.6 µs per message**. At 100 Hz IMU that is
   under 0.1 % of one core.
-- **Memory:** fixed-size arrays only. The one exception is a small queue of
-  pending measurements.
+- **Memory:** fixed-size arrays, plus a small queue of pending measurements and
+  the history kept for late position fixes: about 2 KB per IMU sample over
+  `pos_replay_s`, i.e. about 0.6 MB for 3 s at 100 Hz. Set `pos_replay_s: 0` to
+  keep no history; late fixes are then applied at once.
 
 To use it in your application, link the static library:
 
@@ -68,11 +70,20 @@ ekf.onGpsVelocity(t, velocityFromNed({VnX, VnY, VnZ}), {0.01, 0.01, 0.01});
 // 5. VO: only when a new image pair was delivered (pair_delivered / emitted)
 ekf.onVo(t_vo, frdToFlu(vo_velocity_frd), {exp(lv_x)*s, exp(lv_y)*s, exp(lv_z)*s});
 
+// 6. land matching: absolute position, stamped with the IMAGE time; it may arrive
+//    late (up to position_aid.pos_replay_s) -- the filter rewinds to t_image
+Vec3 p = geodeticToNwu(lat, lon, alt, lat0, lon0, alt0);   // origin = filter position 0
+ekf.onPosition(t_image, p, {std_m * std_m, std_m * std_m, std_m * std_m});
+
 State s = ekf.state();       // s.t, s.p, s.v, s.R (s.q()), s.ba, s.bg, s.P (15x15)
 ```
 
 - **Timestamps:** every message carries its own timestamp, all on the **same
   clock** as the IMU.
+- **Late position fixes:** a fix that arrives after newer IMU samples rewinds the
+  filter to its image time and re-runs the history since (`pos_replay_s`, 3 s).
+  The result is the same as if it had arrived on time. `counters().pos_late`,
+  `pos_gated`, `pos_dropped` and `pos_reset` count what happened to the fixes.
 - **Late measurements:** VO or GPS that arrives after newer IMU samples is
   applied at once. If it is older than `stream.max_meas_age_s` it is dropped.
 - **VO variance:** `s` is `vo.var_scale` from the config. VO variance =

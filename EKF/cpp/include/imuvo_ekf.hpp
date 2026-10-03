@@ -16,15 +16,19 @@
 //   ekf.onVo(t, v_body_flu, var);                // one per delivered image pair
 //   ekf.onAttitude(t, R_nav);                    // nav attitude (every tick is fine)
 //   ekf.onGpsVelocity(t, v_world, var);          // while GPS is up
+//   ekf.onPosition(t_image, p_world, var);       // land-matching fix, NWU m (late is fine)
 //   imuvo::State s = ekf.state();
-// Every call is O(15^3) at most; nothing allocates after construction except the
-// small pending-measurement queue.  Not thread-safe: call from one thread.
+// Every call is O(15^3) at most, except a LATE position fix, which rewinds to its
+// image time and re-runs the history since (pos_replay_s of it at most).  Memory:
+// the small pending-measurement queue plus that history (~2 KB per IMU sample, so
+// ~0.6 MB for 3 s at 100 Hz).  Not thread-safe: call from one thread.
 #pragma once
 
 #include <array>
 #include <cstddef>
 #include <deque>
 #include <string>
+#include <vector>
 
 namespace imuvo {
 
@@ -58,6 +62,12 @@ struct AidParams {
     double max_meas_age_s = 1.0;           // older measurements are dropped
     double max_imu_gap_s = 0.1;            // longer IMU gaps are not integrated
     double gap_acc_std = 2.0;              // m/s^2, uncertainty growth over a gap
+    // absolute position fixes (land matching), see EKF/ekf/stream.py
+    bool pos_use_vertical = false;         // false: north/west only
+    Vec3 pos_lever_arm_m{0.0, 0.0, 0.0};   // IMU -> the point the fix refers to, body FLU
+    double pos_replay_s = 3.0;             // history for late fixes (0 = apply late at once)
+    int pos_reset_after = 3;               // rejected fixes in a row before a reset (0 = never)
+    double pos_reset_agree_sigma = 3.0;    // ... that must agree within this many sigma
 };
 
 // Read the numeric fields of EKF/configs/ekf_default.json (same key names).
@@ -74,7 +84,8 @@ struct State {
 
 struct Counters {
     long imu = 0, imu_gap = 0, vo = 0, vo_late = 0, vo_dropped = 0, att = 0, gps = 0,
-         out_of_order = 0, vo_gated = 0, att_gated = 0, gps_gated = 0;
+         out_of_order = 0, vo_gated = 0, att_gated = 0, gps_gated = 0, pos = 0, pos_gated = 0,
+         pos_late = 0, pos_dropped = 0, pos_reset = 0;
 };
 
 // ---------------------------------------------------------------- filter core
@@ -89,6 +100,15 @@ public:
     bool updateAttitude(const Mat3& R_meas, bool tilt, double std_tilt_deg, bool yaw,
                         double std_yaw_deg, double* nis = nullptr);
     bool updateWorldVelocity(const Vec3& z, const Vec3& var, double* nis = nullptr);
+    // Absolute position fix, world NWU (m): rows north/west (+ up if vertical);
+    // lever = IMU -> the point the fix refers to (body FLU) or nullptr.
+    bool updatePosition(const Vec3& z, const Vec3& var, bool vertical, const Vec3* lever,
+                        double* nis = nullptr);
+    // m = 2 or 3 rows of residual r and Jacobian H (row-major m x 15)
+    void positionResidual(const Vec3& z, bool vertical, const Vec3* lever, double* r, double* H,
+                          int& m) const;
+    // Jump to the fix: position from z, its variance var, no correlation with the rest.
+    void resetPosition(const Vec3& z, const Vec3& var, bool vertical, const Vec3* lever);
 
     Params prm;
     Vec3 p{}, v{}, ba{}, bg{}, last_gyro{};
@@ -116,18 +136,33 @@ public:
     void onVo(double t, const Vec3& v_body_flu, const Vec3& var);
     void onAttitude(double t, const Mat3& R_nav);
     void onGpsVelocity(double t, const Vec3& v_world, const Vec3& var);
+    // Absolute position fix (land matching), world NWU (m) + per-axis variance (m^2),
+    // stamped with the time its IMAGE was taken.  It may arrive late: the filter
+    // rewinds to that time (pos_replay_s), applies it, and re-runs what came after.
+    void onPosition(double t, const Vec3& p_world, const Vec3& var);
 
     State state() const;
     const Counters& counters() const { return cnt_; }
     const ESKF& filter() const { return f_; }
 
 private:
-    enum Kind { GPS = 0, VO = 1, ATT = 2 };
+    // at the same state: position fix first, then GPS velocity, VO, attitude
+    enum Kind { POS = 0, GPS = 1, VO = 2, ATT = 3 };
     struct Meas { double t; Kind kind; Vec3 a; Vec3 b; Mat3 R; };
+    // one filter operation, logged so a late position fix can replay them
+    enum OpType { OP_PREDICT, OP_ADVANCE, OP_VO, OP_ATT, OP_GPS, OP_POS };
+    struct Op { OpType type; double t; double dt; Vec3 a; Vec3 b; Mat3 R; bool reset; };
+    struct Checkpoint { double t; ESKF f; long op_index; };
     void measure(const Meas& m);
     void apply(const Meas& m);
     void flush();
     void advanceTo(double t);
+    bool exec(const Op& op);
+    void checkpoint();
+    void restartHistory();
+    void applyPosition(const Vec3& z, const Vec3& var);
+    void latePosition(const Meas& m);
+    const Vec3* posLever() const;
 
     Params prm_;
     AidParams aid_;
@@ -140,6 +175,11 @@ private:
     std::deque<Meas> pending_;
     long n_att_ = 0;
     Counters cnt_;
+    std::vector<Vec3> rejects_;            // residuals of the fixes rejected in a row
+    std::deque<Checkpoint> cps_;           // state after every IMU step (pos_replay_s)
+    std::deque<Op> ops_;                   // ops since the oldest checkpoint
+    long op_base_ = 0;                     // absolute index of ops_.front()
+    double floor_ = -1e300;                // time of the newest checkpoint trimmed
 };
 
 // ---------------------------------------------------------------- SO(3) helpers
@@ -157,5 +197,9 @@ Vec3 gyroFromLogger(const Vec3& gyro_dps_frd);
 Mat3 attitudeFromNavEuler(double roll, double pitch, double yaw);   // -> R_nwu_flu
 Vec3 velocityFromNed(const Vec3& v_ned);                             // -> NWU
 Vec3 frdToFlu(const Vec3& v);                                        // VO -> EKF
+// Land-matching fix in WGS-84 lat/lon (deg) + height (m) -> world NWU metres about
+// the origin (lat0, lon0, alt0) = where the filter's position 0 is.  Exact (ECEF).
+Vec3 geodeticToNwu(double lat_deg, double lon_deg, double alt_m, double lat0_deg,
+                   double lon0_deg, double alt0_m);
 
 }  // namespace imuvo
