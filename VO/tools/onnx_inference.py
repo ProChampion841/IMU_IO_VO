@@ -114,6 +114,11 @@ class ImagePreprocessor:
         self.size = (height, width)
         self.maps = None
         calibration = meta.get("calibration") or {}
+        # Training refuses a frame whose size is not the calibration's native
+        # size (VisualPairSource._load): the intrinsics, and the undistortion
+        # maps built from them, are only right at that size.
+        native = calibration.get("native_size")
+        self.native_size = None if not native else (int(native[0]), int(native[1]))
         distortion = np.asarray(calibration.get("distortion") or [], dtype=np.float64)
         if distortion.size and np.any(np.abs(distortion) > 0) and not calibration.get("images_rectified"):
             import cv2
@@ -137,6 +142,11 @@ class ImagePreprocessor:
             array = np.asarray(image)
             picture = Image.fromarray(array.astype(np.uint8))
             picture = picture.convert("RGB" if self.color else "L")
+        if self.native_size is not None and picture.size != (self.native_size[1], self.native_size[0]):
+            raise ValueError(
+                f"image is {picture.size[0]}x{picture.size[1]}, but the calibration the model "
+                f"was trained with is {self.native_size[1]}x{self.native_size[0]}"
+            )
         height, width = self.size
         if self.maps is not None:
             import cv2
@@ -227,7 +237,8 @@ class VOOnnxRuntime:
         self.quats: List[np.ndarray] = []
         self.altitudes: List[float] = []
         self.first_telemetry_s: Optional[float] = None
-        self.stats = {"pairs": 0, "delivered": 0, "refused": 0, "rejected_gap": 0}
+        self.stats = {"pairs": 0, "delivered": 0, "refused": 0, "rejected_gap": 0,
+                      "skipped_rows": 0}
 
     # -- inputs ----------------------------------------------------------------
 
@@ -255,6 +266,16 @@ class VOOnnxRuntime:
     ) -> Dict[str, object]:
         """One telemetry row; returns this tick's velocity (and whether it is an output)."""
 
+        if not all(math.isfinite(float(v)) for v in (time_s, roll, pitch, yaw, relative_altitude_m)):
+            # Training refuses a non-finite row outright. Fed through, one would
+            # make the recurrent state NaN for the rest of the flight; skipped,
+            # the next good row carries on as after a dropped sample (and the
+            # telemetry-gap rule refuses pairs captured inside a long hole).
+            self.stats["skipped_rows"] += 1
+            nan = np.full(3, np.nan, dtype=np.float32)
+            return {"time_s": float(time_s), "velocity": nan, "emitted": False,
+                    "output": self.emitted, "pair_delivered": False,
+                    "log_variance": nan, "skipped": True}
         t = float(time_s)
         q = euler_to_quaternion(roll, pitch, yaw)
         if self.quats and float(np.dot(self.quats[-1], q)) < 0.0:
@@ -330,6 +351,7 @@ class VOOnnxRuntime:
             "output": self.emitted,
             "pair_delivered": present,
             "log_variance": result["velocity_log_variance"][0],
+            "skipped": False,
         }
 
     # -- internals -------------------------------------------------------------

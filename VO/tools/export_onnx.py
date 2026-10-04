@@ -339,7 +339,11 @@ def frontend_example(export: nn.Module, channels: int, image_size: Tuple[int, in
     image0, image1 = torch.cat(images0), torch.cat(images1)
     dt = uniform(0.4, 1.1, batch)
     if isinstance(export, PlanarFrontendExport):
-        rotation = axis_angle_to_matrix(uniform(-0.05, 0.05, batch, 3))
+        # Up to ~0.35 rad (20 deg) between the two exposures: a one-second pair
+        # (--frame-gap 20 at 20 Hz) in a 20 deg/s turn. The warp then moves part
+        # of the second image out of frame, so the validity masks are exercised
+        # too, not only the all-valid case a small rotation gives.
+        rotation = axis_angle_to_matrix(uniform(-0.2, 0.2, batch, 3))
         down = torch.cat((uniform(-0.2, 0.2, batch, 2), torch.ones(batch, 1)), dim=1)
         down = down / down.norm(dim=-1, keepdim=True)
         first = uniform(150.0, 250.0, batch)

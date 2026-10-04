@@ -780,3 +780,34 @@ NOT changed - decisions for the user:
       4.6e-5 m/s; and the evaluator against training on the same span with
       overlapping pairs: same pairs, same scored ticks, velocities equal. commands.txt 3c is the run to compare against the 0.5 s
       baseline.
+
+
+22. ONNX EXPORT + RUNTIME CHECKED FOR THE CURRENT SETUP
+--------------------------------------------------------
+22.1  Checked end to end with the setup now being trained: planar, RGB, a 1 s
+      pair every 0.5 s (--frame-gap 20 --pair-stride 10), --random-pair-phase,
+      and yaw from its own column (--attitude-columns NavEulX NavEulY
+      WWMYaw_RAD). Export self-check max |onnx - torch| 2e-5; the standalone
+      runtime replays the flight with delivery ticks identical to PyTorch and
+      velocities within 5e-5 m/s; the yaw column travels in vo_onnx.json, so
+      the runtime and the EKF's VO wrapper read the same column training did.
+22.2  Export self-check widened: it tested relative rotations up to ~0.05 rad,
+      while a 1 s pair in a 20 deg/s turn rotates ~0.35 rad. It now draws up
+      to 0.2 rad per axis, which also exercises the image edges the warp
+      leaves empty.
+22.3  Runtime: a non-finite telemetry row (time, roll, pitch, yaw or altitude)
+      is now skipped and counted (stats["skipped_rows"]). Fed through, it made
+      the recurrent state NaN for the rest of the flight - every later output
+      NaN, and the EKF silently without VO. Training refuses such rows outright.
+22.4  Runtime: a frame whose size is not the calibration's native size is now
+      refused, as training refuses it. Silently resized, it would be matched
+      with intrinsics and undistortion maps that belong to another size.
+22.5  Still true and deliberate: the runtime runs the frontend when a pair is
+      DUE (0.35 s after its second frame), inside the telemetry call. Correct
+      for replay; for a live system run the frontend as soon as the second
+      frame arrives and hand the result over at the due tick, and measure that
+      the frontend fits inside the 0.35 s on the target hardware.
+22.6  Still true: under --velocity-loss simple the exported uncertainty is the
+      untrained constant (sigma 1 m/s; 2 m/s in the EKF with var_scale 4).
+22.7  New tests/test_onnx_runtime.py (4 tests); the two runtime fixes were
+      checked to fail without them.
