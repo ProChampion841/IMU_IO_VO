@@ -811,3 +811,32 @@ NOT changed - decisions for the user:
       untrained constant (sigma 1 m/s; 2 m/s in the EKF with var_scale 4).
 22.7  New tests/test_onnx_runtime.py (4 tests); the two runtime fixes were
       checked to fail without them.
+
+23. ONLINE STREAMING C++ RUNTIME (cpp/)
+---------------------------------------
+23.1  New cpp/: a C++17 port of tools/onnx_inference.py (VOOnnxRuntime) for live
+      use - vo::StreamRuntime (include/vo_stream.hpp): addFrame(image, t) from
+      the camera thread, addTelemetry(t, roll, pitch, yaw, alt) from the
+      telemetry thread, velocity out on every row. Needs ONNX Runtime and
+      OpenCV; build with cmake -S cpp -B build -DONNXRUNTIME_DIR=... .
+23.2  Every rule of the Python runtime is ported line for line (pairing,
+      delivery, frame-gap / telemetry-hole rejection, interpolation, aiding
+      vector, visual age, held velocity, non-finite rows), and the arithmetic
+      that builds the graph inputs operation for operation, including numpy's
+      searchsorted / interp and Pillow's RGB->L and BILINEAR resize.
+      Compiled with -ffp-contract=off (FMA would change the inputs; aarch64
+      contracts by default).
+23.3  Online extras: each pair's frontend runs in a worker thread as soon as
+      its inputs exist, and is re-checked on its due row (identical output to
+      the synchronous path). Frames are preprocessed outside the lock, only
+      when a pair uses them. ONNX Runtime telemetry is off.
+23.4  Verified against the Python runtime by tracing every tensor sent to and
+      returned by ONNX Runtime: bit-identical in every case - four models (RGB
+      stride / gray every-row / frontend batch 2 / flow frontend, plus lens
+      distortion), the test flight, an awkward-input flight, random
+      live-arrival logs with late frames and time going backwards. 850 Pillow
+      image comparisons bit-identical. ASan + UBSan clean.
+      cpp/tests/compare_with_python.py reruns the check on any export.
+23.5  Found on the way: OpenCV 5's remap rounds differently from OpenCV 4 (up
+      to 2 gray levels). Build the C++ runtime against the OpenCV major
+      version used for training (4.x matched bit for bit).
